@@ -23,7 +23,7 @@ var URL_PROXY_LIST = map[string]string{
 	"socks5": "https://www.proxyscan.io/download?type=socks5",
 }
 const URL_API_IP = "http://ip-api.com/json/"
-const WORKERS_PROXY_LIST = 20
+const WORKERS_PROXY_LIST = 50
 
 var FilterByCountry = os.Getenv("COUNTRY")
 
