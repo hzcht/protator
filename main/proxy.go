@@ -17,8 +17,8 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:         host,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  20 * time.Second,
+		WriteTimeout: 60 * time.Second,
 	}
 	httpServer.SetKeepAlivesEnabled(false)
 	proxy2.ProxyList = new(proxy2.ProxyBucket)

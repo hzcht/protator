@@ -87,7 +87,7 @@ func NewTransport (proxy *goproxy.ProxyHttpServer) *http.Transport {
 		IdleConnTimeout:		90 * time.Second,
 		TLSHandshakeTimeout:	10 * time.Second,
 		ExpectContinueTimeout: 	1 * time.Second,
-		MaxIdleConns:			100,
+		MaxIdleConns:			500,
 	}
 }
 
