@@ -1,0 +1,22 @@
+# Special config: test servers + templates of the expected answer.
+#
+# A proxy is accepted only if, after the IP (anonymity) stage passes, at least
+# one [[tests]] entry fully succeeds: GET url through the proxy, then every
+# must_contain template must match the body. Templates are regular
+# expressions; a non-regexp template falls back to plain substring match.
+# httpbin exposes the caller IP in JSON ("origin": "1.2.3.4") and echoes the
+# request URL.
+[[tests]]
+name = "httpbin.org/ip"
+url = "https://httpbin.org/ip"
+must_contain = ['"origin":']
+
+# Content-heavy page proves the tunnel actually carries real web traffic.
+# Kept to two tests: the content stage races all of them through the proxy,
+# and each is a TLS handshake plus a full-page fetch + regex — the checker is
+# CPU-bound, so every test here costs real throughput.
+[[tests]]
+name = "wikipedia.org"
+url = "https://www.wikipedia.org/"
+must_contain = ["Wikipedia"]
+

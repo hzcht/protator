@@ -1,18 +1,24 @@
 module protator
 
-go 1.16
+go 1.26.1
 
 require (
-	github.com/casadosdados/socks v1.0.1
-	github.com/elazarl/goproxy v0.0.0-20210110162100-a92cc753f88e
-	github.com/jaytaylor/html2text v0.0.0-20200412013138-3577fbdbcff7
-	github.com/melbahja/got v0.5.0
-	github.com/microcosm-cc/bluemonday v1.0.15
-	github.com/olekukonko/tablewriter v0.0.5 // indirect
-	github.com/parnurzeal/gorequest v0.2.16
-	github.com/pkg/errors v0.9.1 // indirect
-	github.com/smartystreets/goconvey v1.6.4 // indirect
-	github.com/ssor/bom v0.0.0-20170718123548-6386211fdfcf // indirect
-	h12.io/socks v1.0.2
-	moul.io/http2curl v1.0.0 // indirect
+	github.com/BurntSushi/toml v1.6.0
+	github.com/elazarl/goproxy v1.9.0
+	github.com/mxschmitt/playwright-go v0.6201.1
+	github.com/oschwald/geoip2-golang v1.13.0
+	github.com/refraction-networking/utls v1.8.2
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.59.0
+	h12.io/socks v1.0.3
+)
+
+require (
+	github.com/andybalholm/brotli v1.0.6 // indirect
+	github.com/deckarep/golang-set/v2 v2.8.0 // indirect
+	github.com/go-stack/stack v1.8.1 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
+	github.com/oschwald/maxminddb-golang v1.13.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )

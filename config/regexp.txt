@@ -1,0 +1,202 @@
+# Proxy address extraction patterns — one regex per non-comment line.
+#
+# The extractor always applies the universal patterns first (they do not need
+# to be listed here):
+#   scheme://ip:port  (http/https/socks4/socks5, protocol kept)
+#   bare ip:port      (protocol unknown -> probed later)
+#   [ipv6]:port
+#   spys.one-style JS-obfuscated ports (decoded without a browser)
+#
+# The lines below cover table/markup/positional formats where the address and
+# port are NOT adjacent. Groups are auto-detected: whichever capture group
+# looks like an IP becomes the host, the other becomes the port. IPv4 octets
+# and port ranges are validated in code, so the regexes are intentionally lax.
+
+# <td>1.2.3.4</td><td>8080</td>  (and with attributes / whitespace)
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# 1.2.3.4&nbsp;&nbsp;8080
+([0-9]{1,3}(?:\.[0-9]{1,3}){3})&nbsp;&nbsp;([0-9]{1,5})
+
+# 1.2.3.4 : 8080  /  1.2.3.4 - 8080  / 1.2.3.4   8080
+# Require separator to be whitespace, colon, dash, or semicolon (not arbitrary non-digits)
+# to avoid false positives between adjacent IPs (e.g. href IP then anchor IP)
+([0-9]{1,3}(?:\.[0-9]{1,3}){3})[\s:\-;]{1,6}([0-9]{1,5})
+
+# 1.2.3.4<em>8080</em>  (capture group between markup)
+([0-9]{1,3}(?:\.[0-9]{1,3}){3})<[^>]*>([0-9]{1,5})
+
+# 1.2.3.4 ... port: 8080
+([0-9]{1,3}(?:\.[0-9]{1,3}){3})[^0-9]{0,40}port\s*[=:]\s*([0-9]{1,5})
+
+# <a href="/1.2.3.4/8080">  (path style: ip/port)
+href="?/[^"]*"?([0-9]{1,3}(?:\.[0-9]{1,3}){3})/([0-9]{1,5})
+
+# port-8080\n1.2.3.4  (port BEFORE ip — auto-swapped)
+port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
+
+# JSON: {"ip":"1.2.3.4", ... "port":8080}
+"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^}]{0,120}"port"\s*:\s*([0-9]{1,5})
+
+# Rows where the port cell carries an explicit port class.
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*class="[^"]*port[^"]*"[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# Anchor-wrapped cells: <a ...>1.2.3.4</a> ... <span ...>8080</span>
+<a[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</a>\s*</td>\s*<td>\s*<span[^>]*>\s*([0-9]{1,5})\s*</span>
+
+# proxydb.net style: <a href="/1.2.3.4/8080#https"> (ip+port inside the href)
+<a[^>]*href="/([0-9]{1,3}(?:\.[0-9]{1,3}){3})/([0-9]{1,5})
+
+# ----------------------------------------------------------------
+# Additional patterns for common proxy list sites (geonode, proxynova,
+# free-proxy-list.net, hide.mn, advanced.name, premproxy, premiumproxy,
+# cyber-gateway, ditatompel, aliveproxy, proxyservers, proxy-list.org)
+# ----------------------------------------------------------------
+
+# td with ip/port classes (geonode, free-proxy-list.net, advanced.name, etc.)
+<td[^>]*class="[^"]*ip[^"]*"[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*class="[^"]*port[^"]*"[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# Same but reversed order (port first)
+<td[^>]*class="[^"]*port[^"]*"[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*class="[^"]*ip[^"]*"[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>
+
+# data-ip / data-port attributes (modern sites)
+<td[^>]*data-ip\s*=\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^>]*>\s*.*?<td[^>]*data-port\s*=\s*"([0-9]{1,5})"[^>]*>
+
+# data-ip / data-port in same cell
+<td[^>]*data-ip\s*=\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^>]*data-port\s*=\s*"([0-9]{1,5})"[^>]*>
+
+# Table row with class proxy/proxy-row (proxylist.org, proxy-list.org, premproxy)
+<tr[^>]*class="[^"]*proxy[^"]*"[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# Generic table row with 2+ cells, first two being IP and port (loose)
+<tr[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# IP in <th> (some sites use th for first column)
+<th[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</th>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# Port in a span/div inside the cell (proxynova, hide.mn, premiumproxy)
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*<(?:span|div|b|strong)[^>]*>\s*([0-9]{1,5})\s*</(?:span|div|b|strong)>\s*</td>
+
+# IP in anchor, port in next cell (common)
+<td[^>]*><a[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</a></td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# ProxyNova and other tables that wrap each cell's value in extra markup: the
+# IP sits in a <script>document.write(...)</script> (evaluated by
+# proxy/jswrite.go) inside an <abbr>, and the port is sometimes a "port-NNN"
+# link and sometimes a bare number. Tolerates a handful of tags and whitespace
+# runs on either side of each value, but still requires both values to come
+# from two adjacent cells so rows cannot be paired across each other.
+<td[^>]*>(?:\s*|<[^>]*>\s*){0,8}([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?:\s*|<[^>]*>\s*){0,8}</td>\s*<td[^>]*>(?:\s*|<[^>]*>\s*){0,8}([0-9]{1,5})(?:\s*|<[^>]*>\s*){0,8}</td>
+
+# ProxyNova style: <script>var ips=['1.2.3.4']; var ports=[8080];</script> (simple arrays)
+'([0-9]{1,3}(?:\.[0-9]{1,3}){3})'[^']{0,80}'([0-9]{1,5})'
+
+# ProxyNova / geonode JSON embedded: [{"ip":"1.2.3.4","port":8080},...]
+\[\s*\{\s*"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"port"\s*:\s*([0-9]{1,5})\s*\}
+
+# geonode.com API style: {"data":[{"ip":"1.2.3.4","port":8080,"protocol":"http"}]}
+"data"\s*:\s*\[\s*\{\s*"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"port"\s*:\s*([0-9]{1,5})
+
+# geonode.com live API. The real record lists many keys between "ip" and
+# "port" and quotes the port ("port":"8080"), so the old adjacent-key patterns
+# above never fire. [^}] keeps the two fields inside the same record, and the
+# bound keeps a single object from matching across the whole payload.
+"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^}]{0,300}?"port"\s*:\s*"?([0-9]{1,5})"?
+
+# Same, for payloads that list "port" before "ip"
+"port"\s*:\s*"?([0-9]{1,5})"?[^}]{0,300}?"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"
+
+# hide.mn style: <td>1.2.3.4</td><td>8080</td> with specific parent
+<table[^>]*class="[^"]*proxy[^"]*"[^>]*>.*?<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# free-proxy-list.net style: table with id="proxylisttable" or class
+<table[^>]*(?:id|class)="[^"]*proxy[^"]*"[^>]*>.*?<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# premproxy.com / premiumproxy.net style: numbered list with IP:port in text
+<li[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})\s*</li>
+
+# Table with tbody
+<tbody[^>]*>\s*<tr[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# IPv6 in tables (rare but possible)
+<td[^>]*>\s*\[([0-9a-fA-F:]{2,45})\]\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# Port before IP with "port-" prefix (proxylist.org sometimes)
+port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
+
+# JavaScript object literal: {ip:"1.2.3.4",port:8080}
+\{[^}]*ip\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^}]*port\s*:\s*([0-9]{1,5})[^}]*\}
+
+# SOCKS/HTTP/HTTPS protocol in nearby text (schemaNear will catch, but explicit helps)
+(?:socks?5?|http|https)\s*[:=]\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*[:=]\s*([0-9]{1,5})
+
+# Free proxy world style
+<div[^>]*class="[^"]*proxy[^"]*"[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*[:\-]\s*([0-9]{1,5})\s*</div>
+
+# cyber-gateway.net style
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>\s*\w{2}\s*</td>
+
+# ditatompel.com style
+<tr[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>
+
+# aliveproxy.com style
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>\s*[A-Z]{2}\s*</td>
+
+# proxyservers.pro style
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>\s*(?:http|https|socks4|socks5)
+
+# proxy-list.org style (index.php?p=N)
+<tr[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>
+
+# Best-proxies.ru style
+<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>\s*\w+\s*</td>
+
+# JSON array of objects with IP/port (various sites)
+\[\s*\{\s*"(?:ip|address)"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"(?:port|port_number)"\s*:\s*([0-9]{1,5})\s*\}
+
+# === Additional patterns for 2024-2025 sources ===
+
+# webshare.io style: {"proxy_address":"1.2.3.4:8080","username":"...","password":"..."}
+"proxy_address"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})"
+
+# proxy-list.download style table
+<table[^>]*>\s*<tbody[^>]*>\s*<tr[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+
+# proxyhub.me / proxifly.io style JSON lines (one per line)
+^\s*\{\s*"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"port"\s*:\s*([0-9]{1,5})\s*\}\s*$
+
+# 3proxy/DeleGate config style: "1.2.3.4 8080" or "socks5 1.2.3.4 1080"
+(?:socks?5?|http|https)?\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+([0-9]{1,5})\b
+
+# Shadowsocks/V2Ray/Clash base64 config fragments (decoded bodies)
+# ss://method:pass@1.2.3.4:8080
+ss://[A-Za-z0-9+/=]+@([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})
+# vmess://... (base64 JSON with add/port)
+vmess://[A-Za-z0-9+/=]{20,}
+
+# trojan://pass@1.2.3.4:443
+trojan://[^@]+@([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})
+
+# VLESS: vless://uuid@1.2.3.4:443?...
+vless://[^@]+@([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})
+
+# CSV export: "1.2.3.4","8080","HTTP"
+"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"([0-9]{1,5})"
+
+# Plain text list with protocol prefix: http 1.2.3.4 8080
+^(?:http|https|socks4|socks5)\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+([0-9]{1,5})$
+
+# API returning proxies with "address":"1.2.3.4","port":8080 (generic)
+"address"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"port"\s*:\s*([0-9]{1,5})
+
+# Brightdata/GeoSurf style with country code
+"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^}]{0,100}"port"\s*:\s*([0-9]{1,5})[^}]{0,50}"country"\s*:\s*"[A-Z]{2}"
+
+# scrapers like proxy-gatherer output: "1.2.3.4:8080"
+\b([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})\b
+
+# KDL / RoketPro style: {"host":"1.2.3.4","port":8080}
+"host"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"port"\s*:\s*([0-9]{1,5})
+
+# multiproxy.io style: host:port inside object
+"host:port"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})"

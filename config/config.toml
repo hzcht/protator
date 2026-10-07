@@ -1,0 +1,254 @@
+# Transit proxy collector — main configuration.
+
+[server]
+# Local HTTP forward proxy (also serves HTTPS/CONNECT).
+listen = "0.0.0.0:8888"
+# HTTPS (TLS) forward proxy — separate port, self-signed cert auto-generated
+# unless tls_cert_file + tls_key_file are set.
+listen_https = "0.0.0.0:8443"
+tls_cert_file = ""
+tls_key_file = ""
+# 0 disables a read/write timeout on the client side.
+read_timeout = "60s"
+write_timeout = "120s"
+idle_timeout = "90s"
+# Client-side keep-alives. Keep ON: the browser reuses one TCP connection per
+# host, the ConnKey pin then holds a single (good) upstream proxy for the whole
+# page instead of re-rolling a random pick per resource.
+keep_alives = true
+verbose = false
+# Upper bound of live proxies kept in memory/on disk.
+max_proxies = 2000000
+# CONNECT (HTTPS) hosts to reject outright (regex, host:port form).
+block_connect = [
+  "google.*:443",
+  "zi-scripts.*:443",
+  "pardot.*:443",
+  "zoominfo.*:443",
+  "surveysparrow.*:443",
+]
+# Hosts whose responses should be short-circuited with an empty "Waste" body.
+waste_hosts = [
+  "analytics.google.com",
+  "www.googletagmanager.com",
+  "js.zi-scripts.com",
+  "pi.pardot.com",
+]
+# Request URL path suffixes to block (analytics / tracking pixels).
+block_url_suffixes = [".gif", ".jpg", ".svg", ".woff", ".ttf"]
+# Network tuning for the upstream transport. Tight budgets: a proxy that can't
+# answer within a few seconds is not worth a browser's patience, and failover
+# must finish inside the total budget below.
+dial_timeout = "5s"
+tls_handshake_timeout = "8s"
+response_header_timeout = "10s"
+max_idle_conns = 128
+idle_conn_timeout = "90s"
+# Serving-path resilience: fresh proxy per client request, transparent retry
+# with a distinct proxy on dial failure, eviction after N outright failures.
+serve_retries = 3
+serve_max_fails = 3
+pick_probes = 8
+# How recent a proof of life must be for an entry to count as "proven" when the
+# picker chooses an upstream. The picker aims at proven entries, so these two
+# windows decide what the pool can actually serve.
+#   pick_serve_window  - it carried real client traffic within this window
+#   pick_fresh_window  - it passed a full validation within this window
+# pick_fresh_window MUST outlast storage.revalidate_interval (15m below).
+# Between two revalidation passes the freshly-validated set is all the picker
+# has to aim at; with a shorter window it empties out and every client request
+# falls back to the unverified bulk of the queue, which is the single quietest
+# way to destroy serving stability. The app warns at startup if they conflict.
+pick_serve_window = "90s"
+pick_fresh_window = "20m"
+# Request-level failover: total wall-clock budget across all attempts, and the
+# interstitial/block-page detector (a 200 text/html response in English,
+# Russian or Chinese up to max bytes that matches known blocker markers counts
+# as "no content" and is re-requested through another proxy).
+serve_total_timeout = "25s"
+# CONNECT-tunnel supervision: after the upstream answers "200 Connection
+# established" we wait up to this long for the far target's first byte. If the
+# client is sending data while the tunnel stays silent (a blackholed proxy that
+# dials fine but never forwards anything — invisible to health accounting
+# without this), the proxy is charged as a serving failure and the tunnel is
+# transparently re-established through a different proxy, replaying the early
+# TLS bytes. Set to 0 for plain pass-through (old behavior).
+serve_connect_probe = "3s"
+# Same idea for plain HTTP (non-CONNECT) requests: after the upstream answers
+# the dial, the far side must produce the first response byte within this
+# window or the attempt is abandoned and the request is retried through a
+# different proxy. Without it a blackholed proxy burns the whole
+# response_header_timeout (10s) before failover — most of the request budget.
+# The deadline is cleared by the first byte that arrives, so a slow-but-working
+# proxy is unaffected; only silence is fatal. Applies to the HTTP front-end
+# only, never to SOCKS5 tunnels (they are long-lived). 0 disables.
+serve_response_probe = "3s"
+serve_block_detect = true
+serve_block_max_bytes = 16384
+# Session stickiness: connection pinning pins the upstream per client TCP
+# connection (no latency overhead); max entries caps the pin table. Clients can
+# additionally pin across connections by sending an "X-Sticky-Session" header
+# (stripped before forwarding). Pins expire after serve_pin_ttl of idleness.
+serve_pin_ttl = "10m"
+serve_pin_max = 100000
+# Graceful shutdown: after SIGINT/SIGTERM, in-flight requests get up to this
+# long to finish before the process exits (the queue is saved after the drain).
+shutdown_timeout = "10s"
+# Admin UI + health endpoints, all on one port that answers both HTTP and
+# HTTPS (the first byte of each connection decides, so http:// and https:// on
+# the same address both work). Empty = disabled. No auth — bind to 127.0.0.1
+# unless the host is firewalled.
+#   GET  /             admin page: live proxies, per-source stats, sites.txt editor
+#   GET  /health       queue/pool state as JSON
+#   GET  /ready        200 while the queue has live proxies, 503 otherwise
+#   GET  /api/sources  per-source telemetry (alive, yield, cooldown, last note)
+#   GET  /api/proxies  ?scope=hot|served|checked|all, add &format=text to download
+#   GET/POST/DELETE /api/sites  read and edit sites.txt in place (atomic + .bak)
+admin_listen = "127.0.0.1:9090"
+
+[socks5]
+# Local SOCKS5 front-end; tunnels to a random live proxy.
+enabled = true
+listen = "0.0.0.0:1080"
+dial_timeout = "120s"
+idle_timeout = "5m"
+
+[checker]
+# Services that return the caller's public IP. Used to (a) learn our own IP
+# and (b) verify a proxy is not transparent.
+# Kept short on purpose: every URL here is a TLS handshake (the https ones)
+# plus a full response parse, and the checker is CPU-bound at 100% with the
+# old list of 5. Two cheap http services race for the anonymity verdict; the
+# one https service is what proves CONNECT tunnelling works (viaConnect).
+self_ip_urls = [
+  "http://checkip.amazonaws.com/",
+  "http://ip-api.com/json/",
+  "https://api.ipify.org?format=text",
+]
+# Special config: test servers + expected-answer templates (generated).
+tests_file = "config/checkers.toml"
+workers = 600
+channel_size = 10000
+connect_timeout = "30s"
+# Fast TCP pre-dial before the expensive HTTP checks (rejects dead hosts).
+tcp_timeout = "34s"
+tls_handshake_timeout = "30s"
+response_timeout = "60s"
+total_timeout = "230s"
+# Protocols probed for candidates found without an explicit protocol.
+probe_order = ["http", "socks5", "socks4", "https"]
+# Header-echo endpoints for transparent-leak detection: a proxy that forwards
+# our client IP in X-Forwarded-For / Via headers is rejected. Empty = off.
+leak_probe_urls = ["https://httpbin.org/headers", "https://postman-echo.com/headers"]
+# Reject proxies whose exit IP differs between two consecutive probes
+# (unstable rotators). Off by default in code.
+require_stable_exit = true
+# Final acceptance probe: tunnel through the exact serving dial path
+# (dialProxy) and carry a real GET before accepting the proxy. Off by default.
+e2e_probe = true
+# GeoIP database (MaxMind GeoIP2-City.mmdb) for country/ASN lookup.
+# Download from: https://dev.maxmind.com/geoip/geoip2/geolite2/
+# geoip_db_path = "GeoIP2-City.mmdb"
+
+[collector]
+sites_file = "config/sites.txt"
+regex_file = "config/regexp.txt"
+fetch_workers = 10
+# Number of retry attempts through random live proxies when a direct fetch
+# fails or returns a captcha/challenge page.
+fetch_retries = 5
+http_timeout = "45s"
+page_timeout = "30s"
+use_browser = false
+browser_headless = true
+cycle_sleep = "25m"
+# Failing sites are reduced to cheap direct attempts for this long
+# after this many consecutive failures.
+site_cooldown = "30m"
+site_max_fails = 3
+# Rate limit for feeding the seeded queue back into validation at startup
+# (seeds per second). A 65k seed dump otherwise floods the candidate channel
+# and starves the collector's fresh candidates and the pool re-probe loop.
+revalidate_seed_rate = 200
+# Cap on how many seeds are fed back at startup. The periodic revalidation
+# pass churns the rest; feeding all 65k keeps the checker busy with dead seeds
+# for hours while fresh candidates from the collector wait.
+revalidate_seed_max = 5000
+# Optional directory where candidate hits per site are logged.
+site_log_dir = ""
+# Cap on the persisted candidate pool. The checker churns a few candidates per
+# second, so a pool much larger than this is dead weight: new candidates get
+# dropped once it is full. 200k is ~10x the checker's hourly throughput.
+max_candidates = 200000
+# Persisted-candidate re-probing: every pool_retry_interval the pool
+# re-emits up to pool_retry_batch candidates (oldest first) for another pass.
+# Dead-at-probe-time proxies often come up later, so nothing is ever lost.
+#
+# The rate has to fit inside the checker's throughput. A full check costs ~12
+# requests through the proxy, so 300 workers manage only ~10 candidates/sec;
+# 20k every 3m is 11x that and simply fills the channel, starving the
+# collector's fresh candidates. 1000 every 3m (~5.5/sec) leaves room for the
+# collector while still cycling a 200k pool in ~10h.
+pool_retry_batch = 1000
+pool_retry_interval = "3m"
+# Cap candidates emitted per site per cycle (0 = no cap). Huge auto-generated
+# lists (100k+) otherwise monopolize the pipeline and starve fresh sites; a
+# uniform sample keeps every source's share fair. The pool retry loop re-visits
+# the rest, so nothing is permanently lost.
+#
+# 1000, not 5000: the checker is CPU-bound (~72k candidates/hour), so 60 sites
+# x 5000 = 300k per cycle is 4x the checker's capacity and just fills the
+# channel. 1000 keeps a cycle inside what the checker can actually churn.
+max_candidates_per_site = 1000
+# Cap how many sites are fetched per cycle (0 = all of sites.txt). The
+# collector walks sites in priority order: sources that recently produced live
+# proxies first, then ones it has never fetched, then failing ones on their
+# cooldown. A cap therefore spends the cycle's bandwidth on the sites most
+# likely to yield, and the untouched tail is reached on the following cycles
+# (the order rotates, so nothing starves). Raise it to widen the search, lower
+# it to keep a cycle short.
+#
+# With 232 sources and some pages taking 30s+ (retries, challenges), an
+# uncapped cycle runs longer than cycle_sleep and never completes — so the
+# priority order never gets a full pass and the tail is never reached. 60
+# keeps a cycle inside one interval while still covering the productive head.
+max_sites_per_cycle = 60
+
+[storage]
+queue_file = "data/proxy.lst"
+good_file = "data/good_proxies.last"
+save_interval = "1m"
+revalidate_interval = "15m"
+revalidate_workers = 200
+# Proxies that served a client dial more recently than this are skipped by the
+# periodic revalidation (real traffic = fresher proof of life).
+revalidate_fresh_servers = "15m"
+# Cap rechecked proxies per periodic revalidation pass (0 = no cap). The queue
+# can hold 50k+ entries; a per-pass budget (stalest first) always converges
+# instead of chasing a tail that grows faster than it shrinks.
+revalidate_max_per_pass = 30000
+# Keep the on-disk queue below this many bytes.
+max_bytes = 268435456
+# Found-but-not-yet-validated proxies survive restarts here and are re-probed
+# by later cycles (see collector.pool_retry_*).
+candidates_file = "data/candidates.lst"
+# Debug: rolling window of freshly validated proxies (one URL per line).
+# Point a browser directly at one to tell serving-logic failures from a bad
+# pool. Written on every fresh validation; keep near-zero impact.
+debug_proxies_file = "data/debug_proxies.txt"
+debug_proxies_max = 50
+
+[logging]
+level = "info"
+# File logs with size-based rotation: one file per category under the dir below
+#   collector.log  - list scraping (collector: ...)
+#   checker.log    - validation pipeline (checker: ...)
+#   serve.log      - serving-path dial events (serve: CONNECT ...)
+#   system.log     - everything else (queue, pool, revalidate, listeners, noise)
+# Everything is ALSO mirrored to stderr (console / redirect) as before. Leave
+# dir = "" to disable files and keep stderr-only logging.
+dir = "data/logs"
+# Rotate a category file once it exceeds this many bytes.
+max_bytes = 33554432
+# Keep this many rotated generations per category (.log.1 newest, .log.K oldest).
+keep = 5
