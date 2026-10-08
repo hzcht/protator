@@ -10,7 +10,7 @@ flowchart TB
     COLLECTOR["COLLECTOR<br/>fetch: direct → retry via live proxies → browser fallback<br/>extract: universal regex + regexp.txt + spys XOR decoder"]
     CAND["candidates channel<br/>(buffered, blocking send)"]
     CHECKER["CHECKER (N workers)<br/>pre-dial → anonymity race → content race → CONNECT required<br/>GeoIP lookup (MaxMind MMDB)"]
-    BUCKET[("BUCKET<br/>live queue<br/>health stats per proxy<br/>per-source counts<br/>OnChange hook")]
+    BUCKET[("BUCKET<br/>live queue<br/>health stats per proxy<br/>per-source counts<br/>change subscriptions")]
     DISK[("data/proxy.lst<br/>atomic save every minute<br/>seed on restart")]
     POOL[("data/candidates.lst<br/>persisted failed candidates<br/>re-probed every 3m<br/>source attribution via \\t suffix")]
 
@@ -32,7 +32,7 @@ flowchart TB
     SITES <-->|admin edits the file| ADMIN
     BUCKET -->|per-source counts| ADMIN
     COLLECTOR -->|per-source telemetry| ADMIN
-    BUCKET -.->|OnChange| ADMIN
+    BUCKET -.->|Subscribe| ADMIN
 
     style BUCKET fill:#e8f5e9
     style CHECKER fill:#fff3e0
@@ -166,8 +166,8 @@ For `schema="vless"` the checker:
 
 | Component | File | Role |
 |-----------|------|------|
-| Entrypoint | `main/proxy.go` | Loads config, seeds bucket, starts checker workers, collector, revalidator, saver, stats logger, 3 listeners + admin. Helpers: `buildGoproxy`, `revalidateMany` (stale-first sort), `saveQueue`. |
-| Bucket | `proxy/bucket.go` | Concurrency-safe live queue, dedup by full URL, `Random` (uniform, collectors/retries use it), `PickHealthy` (weighted, serving path uses it), curated `hot` tail plus the cached proven pool (`freshPool`), per-source counts, `LiveList`/`LiveListPage` (hot/served/checked/all), `OnChange` hook. |
+| Entrypoint | `main/proxy.go` | Loads config, seeds bucket, starts checker workers, collector, revalidator, saver, stats logger, 3 listeners + admin. Helpers: `buildGoproxy`, `saveQueue`. The validation pipeline itself (`RunCheckLoop`, `RevalidateSeeded`) lives in `proxy/pipeline.go`. |
+| Bucket | `proxy/bucket.go` | Concurrency-safe live queue, dedup by full URL, `Random` (uniform, collectors/retries use it), `PickHealthy` (weighted, serving path uses it), curated `hot` tail plus the cached proven pool (`freshPool`), per-source counts, `LiveList`/`LiveListPage` (hot/served/checked/all), `Subscribe` change notifications (a subscriber list — the forward dialer and the admin WebSocket both register, neither replaces the other). |
 | ForwardDialer | `proxy/upstream.go` | `DialContext` with failover + passive feedback; `loop` set dials known-proxy addresses directly (anti self-loop); `NewTransport` (no keep-alives). |
 | Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT, optional TLS for `https:` proxies), `socksDialTimeout` (timeout wrapper), `dialVLESS` (uTLS + REALITY + VLESS handshake), `socksDialTimeout` (timeout wrapper that closes late connections). |
 | Checker | `proxy/checker.go` | Section 3. Shared per-check keep-alive client; stamps `MarkAlive` on success; GeoIP lookup via MaxMind MMDB. |
@@ -176,7 +176,7 @@ For `schema="vless"` the checker:
 | Extractor | `proxy/extract.go` | Universal `scheme://ip:port`, bare `ip:port`, `[ipv6]:port`, spys XOR decoder, `document.write` JS reconstruction (`proxy/jswrite.go`), then `regexp.txt` patterns (2 groups either order, or 1 group + `portBefore`). |
 | Proxy model | `proxy/model.go` | `Proxy` + lock-free (`sync/atomic`) health stats: `consecFails`, `okTotal`/`failTotal`, latency EMA, `lastCheck`/`lastOK`, `source`. VLESS fields: `UUID`, `Flow`, `SNI`, `Pbk`, `Sid`, `Spider`. GeoIP: `Country`, `ASN`. `Candidate`, `ParseProxyLine`. |
 | Storage | `proxy/store.go` | `LoadSites` (BOM strip, normalize, dedup), `SiteList` (`LoadSiteList`/`Add`/`Remove`/`Render`/`SaveSiteList` with `.bak` for the admin editor), `ReadQueue`, `LoadRegexLines`, atomic `SaveBucketAtomic`, `AppendGood`. |
-| Candidate Pool | `proxy/pool.go` | Persisted failed candidates with source attribution (`addr\t<source-url>`). Rotating re-probe (`Batch`), `Good()` marks validated entries. Cap at `max_candidates`. |
+| Candidate Pool | `proxy/pool.go` | Persisted failed candidates with source attribution (`addr\t<source-url>`). Rotating re-probe (`Batch`), `Good()` marks validated entries. Caps at `max_candidates`: the oldest line is evicted to make room (never a newly discovered one), the file is trimmed to the tail on load and periodically compacted so it cannot outgrow the cap. |
 | SOCKS5 front | `proxy/socks5_server.go` | Minimal RFC 1928 server, tunnels each session via `ForwardDialer`, idle-deadline relay. Volume-aware verdict (`relayCount`). |
 | TLS | `proxy/tlsutil.go` | Load cert/key from disk or generate ephemeral self-signed. |
 | Browser fallback | `proxy/browser.go` | Lazy headless Chromium via playwright (off by default). |
@@ -189,14 +189,14 @@ For `schema="vless"` the checker:
 ```
 sites.txt → candidates (10-min seenRecently dedup, each tagged with its
           source URL) → validated → bucket (+ good_proxies.last audit)
-          → proxy.lst (atomic rewrite each minute)
+          → proxy.lst (atomic rewrite each minute, only when the queue changed)
           → on restart: ReadQueue → Seed → priority
             revalidation of the old queue while the first collection cycle runs.
 
 Dead proxies leave the queue through three paths:
   - failed revalidation (stale-first, every 15 min)
   - serving-path failure streak (serve_max_fails)
-  - capacity eviction (max_proxies, oldest-ish first, reported via OnChange)
+  - capacity eviction (max_proxies, oldest-ish first, reported to subscribers)
 
 Candidates that fail validation go to candidates.lst (with source attribution).
 Pool re-probe loop emits up to pool_retry_batch every pool_retry_interval,
@@ -226,7 +226,7 @@ plaintext listener. No auth, no proxy traffic — keep it on loopback.
 | `GET/POST/DELETE /api/sites` | Read and edit `sites.txt` in place: validated, normalized, atomic write, `.bak` kept, empty list refused. Bulk delete via `DELETE` with `{"urls": [...]}`. |
 | `POST /api/proxies/revalidate` | Force revalidation of selected proxies: `{"urls": [...], "keys": [...]}`. |
 | `GET /api/stats/history` | 24h stats history (1 sample/min = 1440 points): queue_live, queue_hot, pool_candidates. |
-| `GET /ws` | WebSocket for live updates. Pushes `{"type":"state"|"update", health, proxies, sources, history}` on every bucket change. |
+| `GET /ws` | WebSocket for live updates. Pushes `{"type":"state"|"update", health, proxies, sources, history}`; bucket changes are coalesced into at most one delta per second. |
 
 Liveness definitions are deliberately explicit because "the proxy list said so"
 is not the same as "it works": `hot` is the set the picker actually samples,
@@ -236,13 +236,14 @@ never been proven. `Bucket.LiveList` implements the same scopes for code.
 
 ## 7. Background loops
 
-| Loop | Interval | Purpose |
-|------|----------|---------|
-| `saveLoop` | `storage.save_interval` (1m) | Atomic rewrite of `proxy.lst` |
-| `statsLoop` | 1 min | Log `queue: live proxies = N (hot M)`. After 2 empty minutes → emergency collector wake. |
-| `poolReprobeLoop` | `collector.pool_retry_interval` (3m) | Emit `pool_retry_batch` (1000) candidates from pool, non-blocking, adaptive room check. |
-| `revalidateLoop` | `storage.revalidate_interval` (15m) | Stale-first revalidation of bucket, capped at `revalidate_max_per_pass` (30k). Skips recently-served (`revalidate_fresh_servers`). |
-| `statsRecorder` (admin) | 1 min | Ring buffer of 1440 samples for `/api/stats/history` and WebSocket. |
+| Loop | File | Interval | Purpose |
+|------|------|----------|---------|
+| `saveLoop` | `main/loops.go` | `storage.save_interval` (1m) | Atomic rewrite of `proxy.lst`, only while the queue is dirty (the dirty flag is set by `Add`/`Remove`). |
+| `statsLoop` | `main/loops.go` | 1 min | Log `queue: live proxies = N (hot M)`. After 2 empty minutes → emergency collector wake. |
+| `PoolReprobeLoop` | `proxy/poolloop.go` | `collector.pool_retry_interval` (3m) | Emit `pool_retry_batch` (1000) candidates from pool, non-blocking, adaptive room check. |
+| `RevalidateLoop` | `proxy/revalidate.go` | `storage.revalidate_interval` (15m) | Stale-first revalidation of bucket, capped at `revalidate_max_per_pass` (30k). Skips recently-served (`revalidate_fresh_servers`). |
+| `statsRecorder` (admin) | `main/adminapi.go` | 1 min | Ring buffer of 1440 samples for `/api/stats/history` and WebSocket. |
+| `startWSNotifier` (admin) | `main/adminapi.go` | 1 s tick | Coalesces bucket-change flags into at most one delta broadcast per tick. |
 
 ## 8. Candidate Pool persistence
 
@@ -253,6 +254,16 @@ re-probe so a late validation still credits the real site instead of a fake
 source and stay unattributed — honest, unlike inventing one.
 
 `Good()` matches by proxy key regardless of the suffix.
+
+Capacity: the pool holds up to `collector.max_candidates` entries (and
+`storage.max_bytes` of file). It rotates instead of going dead at the cap —
+the oldest line is evicted to make room for a newly discovered failure, so
+the re-probe always works on a mix of recent candidates rather than a frozen
+set. The file is append-only while rotating; every `8192` evictions (and on
+load, if an older build left the file over the cap) it is rewritten from
+memory (temp + fsync + rename) so disk never drifts ahead of RAM. A
+deliberately oversized production file (391k lines under a 200k cap) loads
+trimmed to its freshest tail instead of refusing every subsequent `Add`.
 
 ## 9. VLESS / REALITY details
 

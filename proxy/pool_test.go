@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -133,5 +135,102 @@ func TestCandidatePoolIgnoresGarbageLines(t *testing.T) {
 	}
 	if !cp.Add(Candidate{Host: "5.5.5.5", Port: 1234, Schema: ""}) {
 		t.Fatal("new add after reload expected true")
+	}
+}
+
+// The pool must stay usable at the cap instead of refusing work: it rotates
+// (oldest evicted, newest kept), and the rotation survives a reload. Dropping
+// the newest entries вЂ” the old behaviour вЂ” threw away exactly the transient
+// failures the pool exists to keep, while the oldest (already re-probed many
+// times) squatted on the capacity forever.
+func TestCandidatePoolRotatesAtCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidates.lst")
+	pool := NewCandidatePool(path, 1<<20, 10)
+	t.Cleanup(func() { pool.Close() })
+	for i := 0; i < 10; i++ {
+		if !pool.Add(Candidate{Host: "10.9.9.9", Port: 1000 + i}) {
+			t.Fatalf("candidate %d rejected before the cap", i)
+		}
+	}
+	if pool.Len() != 10 {
+		t.Fatalf("pool grew to %d, want the cap of 10", pool.Len())
+	}
+
+	// At the cap the newest candidate still lands and the oldest is evicted.
+	if !pool.Add(Candidate{Host: "10.9.9.9", Port: 9999}) {
+		t.Fatal("pool refused a candidate at the cap")
+	}
+	if pool.Len() != 10 {
+		t.Fatalf("Len = %d after rotation, want 10", pool.Len())
+	}
+	keys := map[int]bool{}
+	for _, c := range pool.Batch(20) {
+		keys[c.Port] = true
+	}
+	if keys[1000] {
+		t.Error("oldest candidate survived the rotation")
+	}
+	if !keys[9999] {
+		t.Error("newest candidate missing after the rotation")
+	}
+
+	// The rotation is persisted: a reload must not resurrect the evicted line
+	// and must still accept new candidates (the old build froze forever once
+	// the file exceeded the cap).
+	pool.flush()
+	reloaded := NewCandidatePool(path, 1<<20, 10)
+	t.Cleanup(func() { reloaded.Close() })
+	if reloaded.Len() != 10 {
+		t.Fatalf("reloaded Len = %d, want 10", reloaded.Len())
+	}
+	if !reloaded.Add(Candidate{Host: "10.9.9.9", Port: 1000}) {
+		t.Fatal("reloaded pool refused a candidate it had evicted")
+	}
+}
+
+// A pool file written by an older build (over the cap, e.g. the production
+// 391k-line file under a 200k cap) must not freeze the pool on load: the tail
+// is kept and rewritten, so writes resume immediately.
+func TestCandidatePoolTrimsOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidates.lst")
+	var buf strings.Builder
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&buf, "10.8.8.8:%d\n", 1000+i)
+	}
+	os.WriteFile(path, []byte(buf.String()), 0o644)
+
+	cp := NewCandidatePool(path, 1<<20, 10)
+	t.Cleanup(func() { cp.Close() })
+	if cp.Len() != 10 {
+		t.Fatalf("Len = %d, want the last 10 lines", cp.Len())
+	}
+	b := cp.Batch(10)
+	for _, c := range b {
+		if c.Port < 1020 {
+			t.Fatalf("kept a head line past the tail: %+v", c)
+		}
+	}
+	if !cp.Add(Candidate{Host: "10.7.7.7", Port: 80}) {
+		t.Fatal("oversized file froze the pool: Add was refused")
+	}
+	if lines, _ := readLines(path); len(lines) != 10 {
+		t.Fatalf("file has %d lines after trim, want the compacted 10", len(lines))
+	}
+}
+
+// Rotation must not let the file grow without bound: once enough entries have
+// been evicted, the file is rewritten from memory.
+func TestCandidatePoolCompactsUnderRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidates.lst")
+	pool := NewCandidatePool(path, 1<<20, 10)
+	t.Cleanup(func() { pool.Close() })
+	total := 10 + compactEvictThreshold
+	for i := 0; i < total; i++ {
+		if !pool.Add(Candidate{Host: "10.9.9.9", Port: 1000 + i}) {
+			t.Fatalf("add %d refused", i)
+		}
+	}
+	if lines, _ := readLines(path); len(lines) != 10 {
+		t.Fatalf("file has %d lines, want 10 (compaction did not run)", len(lines))
 	}
 }

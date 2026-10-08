@@ -53,16 +53,19 @@ func main() {
 	// first collection runs in parallel.
 	snap := bucket.Snapshot()
 	log.Printf("queue: revalidating %d seeded proxies while collecting (rate-limited)", len(snap))
-	go revalidateSeeded(ctx, candidates, snap, cfg.Storage.RevalidateSeedRate, cfg.Storage.RevalidateSeedMax)
+	go proxy.RevalidateSeeded(ctx, candidates, snap, cfg.Storage.RevalidateSeedRate, cfg.Storage.RevalidateSeedMax)
 
 	// Shared dialer: every CONNECT/tunnel/direct dial is routed through the
 	// live queue with per-attempt retries and eviction (proxy/upstream.go).
 	fwd := proxy.NewForwardDialer(bucket, cfg)
 	defer saveQueue(cfg, bucket)
+	// Flush the pool's buffered appends on the way out: without this the
+	// last few KB of candidates never reach disk.
+	defer pool.Close()
 
 	shutdown := startServers(ctx, cfg, bucket, fwd, logNoise)
 	collector, wakeCollector := startCollector(ctx, cfg, bucket, candidates)
-	startAdminServer(ctx, cfg, bucket, pool, collector, logNoise)
+	startAdminServer(ctx, cfg, bucket, pool, collector, checker, debug, logNoise)
 	startBackgroundLoops(ctx, cfg, bucket, pool, checker, debug, candidates, wakeCollector)
 
 	<-ctx.Done()
@@ -79,15 +82,23 @@ func main() {
 
 // checkConfig validates the non-daemon requirements of a config without
 // starting listeners: required data files must exist, the log dir is usable.
+//
+// The checks are ordered (not map-driven) so the operator sees one stable
+// failure per run instead of a different one each time several files are
+// missing.
 func checkConfig(cfg *proxy.Config) error {
-	for name, path := range map[string]string{
-		"sites":      cfg.Collector.SitesFile,
-		"regexp":     cfg.Collector.RegexFile,
-		"checkers":   cfg.Checker.TestsFile,
-		"candidates": cfg.Storage.CandidatesFile,
-	} {
-		if _, err := os.Stat(path); err != nil {
-			return fmt.Errorf("%s file %s: %w", name, path, err)
+	required := []struct {
+		name string
+		path string
+	}{
+		{"sites", cfg.Collector.SitesFile},
+		{"regexp", cfg.Collector.RegexFile},
+		{"checkers", cfg.Checker.TestsFile},
+		{"candidates", cfg.Storage.CandidatesFile},
+	}
+	for _, f := range required {
+		if _, err := os.Stat(f.path); err != nil {
+			return fmt.Errorf("%s file %s: %w", f.name, f.path, err)
 		}
 	}
 	if err := os.MkdirAll(cfg.Logging.Dir, 0o755); err != nil {
@@ -101,7 +112,7 @@ func checkConfig(cfg *proxy.Config) error {
 // producer (startup revalidation, collector, pool re-probing) feeds the
 // returned channel; workers persist failures to the pool and move successes
 // into the bucket.
-func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.CandidatePool, *debugProxies, chan proxy.Candidate) {
+func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.CandidatePool, *proxy.DebugProxies, chan proxy.Candidate) {
 	// Seed from the queue file plus the append-only audit of every good
 	// proxy (capped tail: the audit grows without bound). Seed dedups, so
 	// overlap is free and completeness is maximal.
@@ -135,66 +146,13 @@ func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.Can
 
 	// Debug hook: the last N freshly validated proxies, for direct-browser
 	// testing (proves whether the fault is in our logic or in the pool).
-	debug := newDebugProxies(cfg.Storage.DebugProxiesFile, cfg.Storage.DebugProxiesMax)
+	debug := proxy.NewDebugProxies(cfg.Storage.DebugProxiesFile, cfg.Storage.DebugProxiesMax)
 
 	candidates := make(chan proxy.Candidate, cfg.Checker.ChannelSize)
 	for i := 0; i < cfg.Checker.Workers; i++ {
-		go checkLoop(candidates, checker, pool, bucket, debug, cfg)
+		go proxy.RunCheckLoop(candidates, checker, pool, bucket, debug, cfg)
 	}
 	return bucket, checker, pool, debug, candidates
-}
-
-// checkLoop consumes candidates until the channel closes: failed validations
-// go to the persisted pool, successes into the bucket (and the audit file).
-func checkLoop(candidates <-chan proxy.Candidate, checker *proxy.Checker, pool *proxy.CandidatePool, bucket *proxy.Bucket, debug *debugProxies, cfg *proxy.Config) {
-	for cand := range candidates {
-		p, err := checker.Check(cand)
-		if err != nil {
-			if pool.Add(cand) && pool.Len()%1000 == 0 {
-				log.Printf("checker: pool=%d candidates persisted", pool.Len())
-			}
-			continue
-		}
-		pool.Good(cand)
-		debug.Add(p.URL())
-		// Attribute the proxy to the sites.txt entry it came from before it
-		// enters the bucket: the bucket keeps per-source live counts and the
-		// admin page reports them, and the attribution is frozen from here on.
-		p.SetSource(cand.Source)
-		if bucket.Add(p) {
-			proxy.AppendGood(cfg.Storage.GoodFile, p.URL())
-			if bucket.Len()%1000 == 0 {
-				log.Printf("checker: added %s queue=%d", p.URL(), bucket.Len())
-			}
-		}
-	}
-}
-
-// revalidateSeeded feeds the seeded proxies into the validation pipeline once,
-// at a controlled rate and up to a cap. Dumping all 65k seeds into the channel
-// at once floods the checker: the fresh candidates from the collector and the
-// pool re-probe then cannot get through (the re-probe loop sends only what
-// fits and skips the tick otherwise). The seeds are mostly dead anyway — the
-// periodic revalidation pass churns them — so there is no reason to let them
-// starve everything else at startup.
-func revalidateSeeded(ctx context.Context, candidates chan<- proxy.Candidate, snap []*proxy.Proxy, rate, maxSeeds int) {
-	if rate <= 0 {
-		rate = 200 // seeds per second
-	}
-	if maxSeeds > 0 && len(snap) > maxSeeds {
-		snap = snap[:maxSeeds]
-	}
-	interval := time.Second / time.Duration(rate)
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for _, p := range snap {
-		select {
-		case candidates <- proxy.Candidate{Host: p.Host, Port: p.Port, Schema: p.Schema, Source: p.Source()}:
-		case <-ctx.Done():
-			return
-		}
-		<-t.C
-	}
 }
 
 // startCollector launches the scraper; it emits candidates into the

@@ -86,7 +86,11 @@ func NewForwardDialer(bucket *Bucket, cfg *Config) *ForwardDialer {
 		pins:          NewPinPool(cfg.Server.ServePinTTL.Duration, cfg.Server.ServePinMax),
 		loop:          newNetworkSet(),
 	}
-	bucket.OnChange = d.onChange
+	// Subscribe rather than assign: the admin page subscribes too, and a
+	// single-slot callback field lets the later registration silently replace
+	// this one (that is exactly how the loop set and pin release stopped
+	// being notified in production).
+	bucket.Subscribe(d.onChange)
 	for _, p := range bucket.Snapshot() {
 		d.loop.put(p.Addr())
 	}
@@ -182,12 +186,11 @@ func attemptStateFrom(ctx context.Context) *attemptState {
 	return st
 }
 
+// triedFrom builds the already-tried set for a dial. The result is freshly
+// allocated and writable: DialContext records each proxy it burns for the
+// current attempt into it.
 func (d *ForwardDialer) triedFrom(st *attemptState) map[string]struct{} {
-	skip := make(map[string]struct{}, d.serveRetries)
-	for k := range st.snapshot() {
-		skip[k] = struct{}{}
-	}
-	return skip
+	return st.snapshot()
 }
 
 // probeKeyT marks a dial as a plain-HTTP upstream selection, so the
@@ -533,6 +536,17 @@ func (d *ForwardDialer) dialHTTP(ctx context.Context, network, addr string) (net
 }
 
 // NewTransport builds the upstream transport used to forward HTTP traffic.
+//
+// DisableKeepAlives is deliberate, not a leftover: every request must open its
+// own upstream connection so DialContext runs again and picks a fresh proxy.
+// With keep-alives on, a retry reuses the pooled connection to the *same*
+// upstream and a block page / dead tunnel is served again through the very
+// proxy the failover was supposed to move away from.
+//
+// The consequence, which the config comments must make plain, is that
+// server.max_idle_conns and server.idle_conn_timeout have no effect here: with
+// keep-alives disabled the idle pool is never populated. They still govern the
+// checker's and collector's own clients.
 func (d *ForwardDialer) NewTransport() *http.Transport {
 	return &http.Transport{
 		DialContext:           d.dialHTTP,

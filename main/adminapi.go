@@ -22,7 +22,12 @@ type admin struct {
 	bucket    *proxy.Bucket
 	pool      *proxy.CandidatePool
 	collector *proxy.Collector
-	started   time.Time
+	checker   *proxy.Checker
+	debug     *proxy.DebugProxies
+	// ctx is the process lifetime context: the forced-revalidation action
+	// spawns work that must outlive the HTTP request that asked for it.
+	ctx     context.Context
+	started time.Time
 
 	// sitesMu serializes the editor's read-modify-write. Two POSTs racing on
 	// the same file would both read the old list and the second save would
@@ -43,6 +48,10 @@ type admin struct {
 	wsMuPrev    sync.Mutex
 	prevProxies map[string]liveRow // key = proxy URL
 	prevHealth  map[string]int
+
+	// Coalesced change flags from bucket.Subscribe (cap 1: a pending flag is
+	// all startWSNotifier needs).
+	wsNotify chan struct{}
 }
 
 type wsConn struct {
@@ -98,7 +107,7 @@ func (a *admin) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleWebSocket upgrades the connection to a WebSocket for live updates.
+// handleWebSocket upgrades a connection to a WebSocket for live updates.
 func (a *admin) handleWebSocket(ws *websocket.Conn) {
 	c := &wsConn{conn: ws, send: make(chan []byte, 256)}
 	a.wsMu.Lock()
@@ -114,7 +123,12 @@ func (a *admin) handleWebSocket(ws *websocket.Conn) {
 	// Writer goroutine
 	go func() {
 		for msg := range c.send {
-			if c.closed {
+			// closed is only ever written under wsMu (closeWS), so read it
+			// under the same lock instead of racing the writer.
+			a.wsMu.Lock()
+			closed := c.closed
+			a.wsMu.Unlock()
+			if closed {
 				return
 			}
 			if err := websocket.Message.Send(ws, string(msg)); err != nil {
@@ -164,7 +178,7 @@ func (a *admin) sendWSState(c *wsConn) {
 	copy(hist, a.statsHist)
 	a.statsMu.Unlock()
 
-	live, _ := a.live(proxy.AliveChecked, 0, "", "")
+	live := a.liveDelta()
 	sources := a.sources()
 
 	msg := map[string]interface{}{
@@ -181,7 +195,43 @@ func (a *admin) sendWSState(c *wsConn) {
 	}
 }
 
-// notifyWSChanged is called by bucket.OnChange to broadcast updates.
+// requestWSNotify flags the live view as dirty. It is the only work done on
+// the mutation path, so it must stay cheap: no queue scan, no allocation, no
+// blocking (the channel is cap 1, a pending flag is idempotent).
+func (a *admin) requestWSNotify() {
+	if a.wsNotify == nil {
+		return
+	}
+	select {
+	case a.wsNotify <- struct{}{}:
+	default:
+	}
+}
+
+// startWSNotifier turns the per-mutation flags into at most one delta
+// broadcast per tick. The checker adds and revalidation drops arrive in
+// bursts of hundreds per second; recomputing a whole-queue diff for each one
+// inline would put admin bookkeeping in the hot path of every worker.
+func (a *admin) startWSNotifier(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	pending := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.wsNotify:
+			pending = true
+		case <-t.C:
+			if pending {
+				pending = false
+				a.notifyWSChanged()
+			}
+		}
+	}
+}
+
+// notifyWSChanged is called by startWSNotifier to broadcast updates.
 // Sends delta updates: only changed proxies (added/removed/updated) plus health.
 func (a *admin) notifyWSChanged() {
 	a.statsMu.Lock()
@@ -189,7 +239,7 @@ func (a *admin) notifyWSChanged() {
 	copy(hist, a.statsHist)
 	a.statsMu.Unlock()
 
-	live, _ := a.live(proxy.AliveChecked, 0, "", "")
+	live := a.liveDelta()
 	currentProxies := make(map[string]liveRow, len(live))
 	for _, p := range live {
 		currentProxies[p.URL] = p
@@ -237,6 +287,12 @@ func (a *admin) notifyWSChanged() {
 // alive. It is deliberately short: the point of the page is "right now", not
 // "once worked".
 const liveWindow = 15 * time.Minute
+
+// filterScanFactor / filterScanMax bound the over-fetch a country or ASN filter
+// needs: rows are dropped after the ranked scan, so the scan has to look at more
+// than the caller asked for or a filtered page comes back short.
+const filterScanFactor = 100
+const filterScanMax = 200_000
 
 // sourceRow is the JSON shape of one sites.txt entry plus its telemetry.
 type sourceRow struct {
@@ -318,14 +374,65 @@ func (a *admin) sources() []sourceRow {
 	return out
 }
 
+// liveDelta renders the full set the WebSocket diff needs, without ranking it.
+// The diff is a membership test: it ran once per second over a ranked scan of
+// the whole queue, which for a two million entry queue is most of a second of
+// CPU per broadcast.
+func (a *admin) liveDelta() []liveRow {
+	if a.bucket == nil {
+		return nil
+	}
+	proxies := a.bucket.LiveListUnranked(proxy.AliveChecked, liveWindow)
+	now := time.Now()
+	out := make([]liveRow, 0, len(proxies))
+	for _, p := range proxies {
+		served, checked := p.LastServed(), p.LastCheck()
+		age := now.Sub(served)
+		if served.IsZero() || (!checked.IsZero() && checked.After(served)) {
+			age = now.Sub(checked)
+		}
+		out = append(out, liveRow{
+			URL:      p.URL(),
+			Schema:   p.Schema,
+			Host:     p.Host,
+			Port:     p.Port,
+			Source:   p.Source(),
+			Country:  p.GetCountry(),
+			ASN:      p.GetASN(),
+			Latency:  p.Latency().Milliseconds(),
+			OK:       p.OKTotal(),
+			Fails:    p.FailTotal(),
+			Consec:   p.ConsecFails(),
+			Age:      age.Seconds(),
+			Served:   !served.IsZero() && now.Sub(served) <= liveWindow,
+			Checked:  !checked.IsZero() && now.Sub(checked) <= liveWindow,
+			InFlight: p.InFlight(),
+		})
+	}
+	return out
+}
+
 // live renders the page of proxy rows plus the size of the scope itself, so the
 // UI can say "1000 of 41234" instead of implying the page is the whole truth.
 // Returns (filteredRows, unfilteredTotal).
+//
+// limit is handed to LiveListPage (limit <= 0 means "everything"). That is the
+// difference between ranking a bounded page and ranking the whole queue to then
+// throw most of it away. With a country/ASN filter the drop happens after the
+// scan, so the scan is over-fetched by filterScanFactor — the only way a
+// filtered request can fill the page at all.
 func (a *admin) live(scope string, limit int, countryFilter, asnFilter string) ([]liveRow, int) {
 	if a.bucket == nil {
 		return nil, 0
 	}
-	proxies, unfilteredTotal := a.bucket.LiveListPage(scope, liveWindow, 0) // get all for filtering
+	scan := limit
+	if (countryFilter != "" || asnFilter != "") && scan > 0 {
+		scan *= filterScanFactor
+		if scan > filterScanMax {
+			scan = filterScanMax
+		}
+	}
+	proxies, unfilteredTotal := a.bucket.LiveListPage(scope, liveWindow, scan)
 	now := time.Now()
 	out := make([]liveRow, 0, len(proxies))
 	for _, p := range proxies {
@@ -612,8 +719,9 @@ func (a *admin) handleJS(w http.ResponseWriter, r *http.Request) {
 
 // handleProxiesRevalidate forces revalidation of selected proxies.
 // POST body: {"urls": ["scheme://host:port", ...]} or {"keys": ["scheme://host:port", ...]}.
-// The proxies are looked up in the bucket and queued for immediate revalidation
-// through the checker (bypassing the normal revalidate interval).
+// The proxies are re-checked through the checker off the periodic schedule and
+// are dropped only if the re-check fails; live ones stay in the queue with a
+// refreshed stamp.
 func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -632,36 +740,53 @@ func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "urls[] or keys[] required")
 		return
 	}
+	if a.checker == nil || a.debug == nil {
+		writeError(w, http.StatusServiceUnavailable, "revalidation is not wired up")
+		return
+	}
 
-	// Collect proxies from bucket
+	// One scan to resolve the requested identities. A checker pass costs
+	// seconds per proxy, so the handler must not wait for it: the work runs
+	// under the process context and the page sees progress via the live view.
 	targets := make(map[string]*proxy.Proxy)
-	if a.bucket != nil {
-		for _, p := range a.bucket.Snapshot() {
-			targets[p.URL()] = p
+	order := make([]string, 0, len(body.URLs))
+	for _, p := range a.bucket.Snapshot() {
+		if _, dup := targets[p.Key()]; !dup {
 			targets[p.Key()] = p
+			order = append(order, p.Key())
 		}
 	}
 
 	var revalidated int
 	var notFound []string
 	checkList := append(body.URLs, body.Keys...)
+	picked := make([]*proxy.Proxy, 0, len(checkList))
 	for _, key := range checkList {
 		p, ok := targets[key]
 		if !ok {
 			notFound = append(notFound, key)
 			continue
 		}
-		// Mark proxy for revalidation by removing it - it will be re-added if valid
-		// or the collector will re-discover it. The revalidateLoop will also pick it up.
-		a.bucket.Remove(p)
 		revalidated++
+		picked = append(picked, p)
+	}
+	if revalidated > 0 {
+		workers := a.cfg.Storage.RevalidateWorkers
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > revalidated {
+			workers = revalidated
+		}
+		go proxy.RevalidateNow(a.ctx, a.checker, a.bucket, picked, workers, a.debug)
 	}
 
 	writeJSON(w, map[string]interface{}{
 		"ok":          true,
 		"revalidated": revalidated,
 		"not_found":   notFound,
-		"note":        "proxies removed from queue; will be revalidated on next cycle",
+		"resolved":    len(order),
+		"note":        "re-checking now; dead entries are dropped, live ones stay",
 	})
 }
 

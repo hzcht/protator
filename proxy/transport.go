@@ -14,10 +14,14 @@ import (
 // ForwardDialer.DialContext: the set of proxies already tried and the proxy
 // picked for the *current* dial attempt (needed to attribute response-level
 // failures — a proxy that dials fine but never answers).
-// Uses a fixed-size array instead of a map to avoid allocation on the hot path.
+//
+// The tried set is a slice, not a fixed [4]string: serve_retries is
+// configurable and unbounded above, so a fixed array silently dropped every
+// entry past index 3 — the failover sequence then re-picked a proxy it had
+// already burned. Only tried, triedN and the snapshot are per request, and a
+// fresh slice is one allocation instead of a 64-byte array copy.
 type attemptState struct {
-	tried  [4]string // fixed-size array (retries typically ≤ 4)
-	triedN int
+	tried  []string
 	cur    *Proxy
 	connOK bool
 }
@@ -54,19 +58,23 @@ func (s *attemptState) mark(p *Proxy) {
 	if s == nil || p == nil {
 		return
 	}
-	if s.triedN < len(s.tried) {
-		s.tried[s.triedN] = p.Key()
-		s.triedN++
-	}
+	s.tried = append(s.tried, p.Key())
 }
 
+// snapshot returns the tried set as a lookup map, rebuilt per dial attempt.
+// The previous version built the map, copied it into a second map, and handed
+// back two allocations on the hottest path in the process.
+//
+// The map is always non-nil and never the caller's: ForwardDialer.DialContext
+// writes into it as it burns proxies for the current attempt, and an attempt
+// state must not accumulate those writes across attempts.
 func (s *attemptState) snapshot() map[string]struct{} {
-	if s == nil {
+	if s == nil || len(s.tried) == 0 {
 		return map[string]struct{}{}
 	}
-	out := make(map[string]struct{}, s.triedN)
-	for i := 0; i < s.triedN; i++ {
-		out[s.tried[i]] = struct{}{}
+	out := make(map[string]struct{}, len(s.tried))
+	for _, k := range s.tried {
+		out[k] = struct{}{}
 	}
 	return out
 }

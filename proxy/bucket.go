@@ -3,7 +3,7 @@ package proxy
 import (
 	"context"
 	"math/bits"
-	"math/rand"
+	"math/rand/v2" // package-level IntN: lock-free and safe to call while holding the read lock (a shared *rand.Rand was not)
 	"sort"
 	"sync"
 	"time"
@@ -64,15 +64,15 @@ type Bucket struct {
 	// leave through eviction or when the proxy is removed from the bucket.
 	hot    []*Proxy
 	hotIdx map[*Proxy]int
-	rng    *rand.Rand
 	max    int
 	signal chan struct{} // edge-triggered wakeup when queue becomes non-empty
 	dirty  bool          // true when queue changed since last save
 
 	// fresh caches the entries that carry proof of life, so PickHealthy can
 	// aim at the working tail instead of rejection-sampling a queue whose
-	// living fraction is a fraction of a percent. Guarded by its own mutex:
-	// never hold it while taking mu (see freshPool).
+	// living fraction is a fraction of a percent. Guarded by its own mutex
+	// with lock order freshMu -> mu: never take freshMu while holding mu, and
+	// never call freshPool without releasing mu first (see freshPool).
 	freshMu sync.Mutex
 	fresh   []*Proxy
 	freshAt time.Time
@@ -82,8 +82,48 @@ type Bucket struct {
 	serveWindow time.Duration
 	freshWindow time.Duration
 
-	// OnChange, if set, is invoked after every successful add/remove.
-	OnChange func(p *Proxy, added bool)
+	// changeMu guards subs. Subscribers are a list, not a single slot: the
+	// forward dialer (loop set, pin release) and the admin page (WebSocket
+	// deltas) both need the notification, and a one-slot field silently loses
+	// whichever subscriber was registered first.
+	changeMu  sync.Mutex
+	subs      []bucketSub
+	nextSubID uint64
+}
+
+// bucketSub is one registered change listener. The id (not the func value) is
+// the identity: Go function values are only comparable to nil, and
+// reflect.Value.Pointer on a closure yields its code pointer, which is shared
+// by every closure written at the same source location.
+type bucketSub struct {
+	id uint64
+	fn func(p *Proxy, added bool)
+}
+
+// Subscribe registers a listener invoked after every successful add/remove
+// (including evictions) and returns a function that unregisters it. Listeners
+// run outside the bucket's lock, in registration order.
+func (b *Bucket) Subscribe(fn func(p *Proxy, added bool)) func() {
+	if fn == nil {
+		return func() {}
+	}
+	b.changeMu.Lock()
+	b.nextSubID++
+	id := b.nextSubID
+	b.subs = append(b.subs, bucketSub{id: id, fn: fn})
+	b.changeMu.Unlock()
+	return func() {
+		b.changeMu.Lock()
+		defer b.changeMu.Unlock()
+		for i, s := range b.subs {
+			if s.id == id {
+				out := make([]bucketSub, 0, len(b.subs)-1)
+				out = append(out, b.subs[:i]...)
+				b.subs = append(out, b.subs[i+1:]...)
+				return
+			}
+		}
+	}
 }
 
 // SetFreshnessWindows configures how recent a proof of life must be for an
@@ -125,34 +165,33 @@ func (b *Bucket) freshnessRank(now int64, p *Proxy) int64 {
 // freshRebuildInterval. The snapshot is allowed to lag reality by that much: an
 // entry that was removed underneath it costs one failed dial and a retry, and
 // invalidating on every add would turn each pick into an O(queue) scan.
+//
+// Lock order is freshMu -> mu, and no caller may hold mu when calling this:
+// PickHealthy used to take b.mu.RLock and then land here, where the rebuild
+// takes b.mu.RLock again — a recursive read lock, which deadlocks the moment
+// a writer (Add/Remove) queues between the two acquisitions.
+//
+// freshMu is held across the whole rebuild so two goroutines cannot build
+// into b.fresh at the same time (it used to be released before the scan), and
+// every rebuild allocates a NEW slice: previously it recycled the storage
+// under a read lock, writing into a slice that pickers were iterating.
 func (b *Bucket) freshPool(now time.Time) []*Proxy {
 	b.freshMu.Lock()
+	defer b.freshMu.Unlock()
 	if !b.freshAt.IsZero() && now.Sub(b.freshAt) < freshRebuildInterval {
-		out := b.fresh
-		b.freshMu.Unlock()
-		return out
+		return b.fresh
 	}
-	b.freshMu.Unlock()
-
 	b.mu.RLock()
-	// Reuse the existing slice to avoid allocation on every rebuild.
-	if b.fresh == nil {
-		b.fresh = make([]*Proxy, 0, 256)
-	} else {
-		b.fresh = b.fresh[:0]
-	}
 	nowNanos := now.UnixNano()
+	out := make([]*Proxy, 0, 256)
 	for _, p := range b.proxies {
 		if b.freshnessRank(nowNanos, p) != freshStale {
-			b.fresh = append(b.fresh, p)
+			out = append(out, p)
 		}
 	}
+	b.fresh, b.freshAt = out, now
 	b.mu.RUnlock()
-
-	b.freshMu.Lock()
-	b.freshAt = now
-	b.freshMu.Unlock()
-	return b.fresh
+	return out
 }
 
 // hotMax caps the curated proving tail. A few hundred recently-proven proxies
@@ -169,7 +208,6 @@ func NewBucket(max int) *Bucket {
 		index:       make(map[string]int, 1024),
 		bySource:    make(map[string]int, 64),
 		hotIdx:      make(map[*Proxy]int, 1024),
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
 		max:         max,
 		signal:      make(chan struct{}, 1),
 		serveWindow: defaultPickServeWindow,
@@ -215,8 +253,11 @@ func (b *Bucket) Add(p *Proxy) bool {
 }
 
 func (b *Bucket) notify(p *Proxy, added bool) {
-	if b.OnChange != nil {
-		b.OnChange(p, added)
+	b.changeMu.Lock()
+	subs := b.subs
+	b.changeMu.Unlock()
+	for _, s := range subs {
+		s.fn(p, added)
 	}
 }
 
@@ -251,6 +292,7 @@ func (b *Bucket) addLocked(p *Proxy) (added bool, evicted *Proxy) {
 		b.proxies = append(b.proxies, p)
 	}
 	b.countSourceLocked(p, 1)
+	b.markDirty()
 	// A freshly validated candidate (lastCheck just stamped by the checker)
 	// is the strongest possible new proof of life: put it in the serving tail.
 	if b.freshnessRank(time.Now().UnixNano(), p) != freshStale {
@@ -274,6 +316,14 @@ func (b *Bucket) Promote(p *Proxy) {
 
 // promoteLocked moves p to the front of the hot tail (or adds it) if it is
 // still in the bucket. Callers hold mu.
+//
+// Ordering is exact: the front is the most recently proven entry, and pushing
+// a new one in shifts the rest back. Only the allocation was wasted here —
+// `append([]*Proxy{p}, b.hot...)` built a fresh 512-element slice on every
+// promotion, so hundreds of 4 KB allocations per minute of serving traffic.
+// Shifting in place keeps the same order at amortized O(1) for the slice; the
+// hotIdx rebuild is O(len(hot)) either way and only the promotion of a new
+// entry pays it.
 func (b *Bucket) promoteLocked(p *Proxy) {
 	if _, inMain := b.index[p.Key()]; !inMain {
 		return
@@ -283,7 +333,6 @@ func (b *Bucket) promoteLocked(p *Proxy) {
 			return
 		}
 		// Move p to front: shift elements [0:idx] right by 1, then set [0]=p.
-		// Only update indices for the affected range, not the entire map.
 		copy(b.hot[1:idx+1], b.hot[0:idx])
 		b.hot[0] = p
 		for i := 0; i <= idx; i++ {
@@ -292,14 +341,14 @@ func (b *Bucket) promoteLocked(p *Proxy) {
 		return
 	}
 	if len(b.hot) >= hotMax {
-		tail := b.hot[len(b.hot)-1]
-		delete(b.hotIdx, tail)
-		b.hot = b.hot[:len(b.hot)-1]
+		// Full: the last entry is the least recently proven, drop it.
+		delete(b.hotIdx, b.hot[len(b.hot)-1])
+	} else {
+		b.hot = append(b.hot, nil)
 	}
-	// New entry: prepend to hot tail.
-	b.hot = append([]*Proxy{p}, b.hot...)
-	b.hotIdx[p] = 0
-	for i := 1; i < len(b.hot); i++ {
+	copy(b.hot[1:], b.hot[:len(b.hot)-1])
+	b.hot[0] = p
+	for i := 0; i < len(b.hot); i++ {
 		b.hotIdx[b.hot[i]] = i
 	}
 }
@@ -343,6 +392,7 @@ func (b *Bucket) removeLocked(p *Proxy) bool {
 	delete(b.index, key)
 	b.countSourceLocked(p, -1)
 	b.demoteLocked(p)
+	b.markDirty()
 	return true
 }
 
@@ -397,7 +447,10 @@ func (b *Bucket) MarkClean() {
 	b.mu.Unlock()
 }
 
-// markDirty sets the dirty flag when the queue is mutated.
+// markDirty flags the queue as changed so saveLoop persists it on the next
+// tick. Only the persisted member set matters (the file holds plain URLs), so
+// stamp-only updates like the dedup path in addLocked deliberately leave the
+// flag alone. Callers must hold mu.
 func (b *Bucket) markDirty() {
 	b.dirty = true
 }
@@ -415,7 +468,7 @@ func (b *Bucket) Random(ctx context.Context) (*Proxy, error) {
 		b.mu.RLock()
 		n := len(b.proxies)
 		if n > 0 {
-			p := b.proxies[b.rng.Intn(n)]
+			p := b.proxies[rand.IntN(n)]
 			b.mu.RUnlock()
 			return p, nil
 		}
@@ -449,18 +502,17 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 		probes = 1
 	}
 	for {
+		// Read the proven pool BEFORE taking mu: freshPool takes mu.RLock
+		// itself while rebuilding, and a nested RLock is how a serving pick
+		// could wedge against a concurrent Add/Remove. The snapshot is a
+		// pointer, and reheating it is a freshMu fast path, so this is cheap;
+		// the caller below only pays for the scan once per rebuild interval.
+		proven := b.freshPool(time.Now())
 		b.mu.RLock()
-		source := b.proxies
-		switch {
-		case len(b.hot) > 0:
-			source = b.hot
-		default:
-			if proven := b.freshPool(time.Now()); len(proven) > 0 {
-				source = proven
-			}
-		}
-		n := len(source)
-		if n == 0 {
+		// The real queue decides whether there is anything to serve: a stale
+		// proven/hot snapshot must not keep serving entries that are already
+		// gone (both are read before/outside the rebuild interval).
+		if len(b.proxies) == 0 {
 			b.mu.RUnlock()
 			select {
 			case <-ctx.Done():
@@ -471,13 +523,24 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 				continue
 			}
 		}
+		// Pick the preferred tier under the lock. proven is immutable once
+		// handed out (freshPool builds a new slice per rebuild) and only
+		// admits entries that were live at rebuild time; rankPick re-checks
+		// each sample against b.index and skips the ones removed since.
+		now := nowNanos()
+		source := b.proxies
+		switch {
+		case len(b.hot) > 0:
+			source = b.hot
+		case len(proven) > 0:
+			source = proven
+		}
 		// Sample the preferred tier first: the proven entries are a small
 		// minority of a big queue, so searching everything and ranking would
 		// find them only by luck (at 1.5% proven, ~1 pick in 6 misses). The
 		// tiers are disjoint in rank, so a proven entry always outranks a
 		// stale one; the wide search is only for when the tier has nothing
 		// usable, which is what the skip-aware fallback below is for.
-		now := nowNanos()
 		best := b.rankPick(source, probes, skip, now)
 		if best == nil {
 			// Everything in the preferred tier was already tried by this
@@ -490,7 +553,7 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 			// The entire queue is already tried. Reuse an entry anyway:
 			// returning nothing fails the client's request outright, which is
 			// strictly worse than one more attempt at a known proxy.
-			best = source[b.rng.Intn(n)]
+			best = b.proxies[rand.IntN(len(b.proxies))]
 		}
 		b.mu.RUnlock()
 		return best, nil
@@ -499,7 +562,8 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 
 // rankPick samples pool up to probes times and returns the best entry by
 // (proof freshness, consecutive failures, latency, in-flight load), or nil if
-// every sample was in skip. Callers hold at least a read lock.
+// every sample was in skip or no longer in the queue. Callers hold at least a
+// read lock.
 func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, nowNanos int64) *Proxy {
 	n := len(pool)
 	if n == 0 {
@@ -518,8 +582,16 @@ func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, n
 	var best *Proxy
 	var bestFresh, bestFails, bestLat, bestLoad int64
 	for i := 0; i < probes; i++ {
-		p := pool[b.rng.Intn(n)]
-		if _, bad := skip[p.Key()]; bad {
+		p := pool[rand.IntN(n)]
+		// The proven pool and the hot tail are snapshots: freshPool may lag up
+		// to freshRebuildInterval behind, so a removed proxy can still sit in
+		// `pool` here. It must never win a pick — dropping it costs one wasted
+		// sample, serving it costs a failed dial.
+		key := p.Key()
+		if _, live := b.index[key]; !live {
+			continue
+		}
+		if _, bad := skip[key]; bad {
 			continue
 		}
 		f := p.ConsecFails()
@@ -602,10 +674,52 @@ func (b *Bucket) LiveList(scope string, window time.Duration, limit int) []*Prox
 	return rows
 }
 
+// LiveListUnranked returns every entry in the scope that sits inside the
+// window, in queue order. It exists for callers that only need the set — the
+// admin WebSocket delta diffs two of these a second, and ranking a two million
+// entry queue to compute a set difference is almost the entire cost of the
+// broadcast. Order here is meaningless by design.
+func (b *Bucket) LiveListUnranked(scope string, window time.Duration) []*Proxy {
+	now := time.Now()
+	var out []*Proxy
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	src := b.proxies
+	if scope == AliveHot {
+		src = b.hot
+	}
+	for _, p := range src {
+		served := p.LastServed()
+		checked := p.LastCheck()
+		switch {
+		case !served.IsZero() && now.Sub(served) <= window:
+		case !checked.IsZero() && now.Sub(checked) <= window:
+		default:
+			if scope != AliveAll {
+				continue
+			}
+		}
+		if scope == AliveServed && (served.IsZero() || now.Sub(served) > window) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // LiveListPage is LiveList plus the number of entries that qualify before
 // limit is applied. Callers that page through the queue need both: a response
 // that silently stops at the limit reads as "this is all of them", which is how
 // a proxy list ends up lying about how much is alive.
+//
+// Every scope ranks on the same three-level scale — serving proof first, then
+// a validation stamp, then unproven — so the hot tail and the queue scan order
+// identically. (The hot branch used to double the scale, 3 and 2, making a
+// "hot" rank incomparable to a "served" one.)
+//
+// limit <= 0 returns everything that qualifies. A caller with a cap should
+// pass it: ranking a whole huge queue and slicing afterwards is the same work
+// with no bound to stop it.
 func (b *Bucket) LiveListPage(scope string, window time.Duration, limit int) (rows []*Proxy, total int) {
 	now := time.Now()
 	type row struct {
@@ -615,30 +729,14 @@ func (b *Bucket) LiveListPage(scope string, window time.Duration, limit int) (ro
 	}
 	var found []row
 	b.mu.RLock()
+	src := b.proxies
 	if scope == AliveHot {
-		// The hot tail is the smallest set with the best evidence, so it is
-		// already ranked; only the window still has to be applied.
-		for _, p := range b.hot {
-			served, checked := p.LastServed(), p.LastCheck()
-			switch {
-			case !served.IsZero() && now.Sub(served) <= window:
-				found = append(found, row{p: p, rank: 3, stamp: served})
-			case !checked.IsZero() && now.Sub(checked) <= window:
-				found = append(found, row{p: p, rank: 2, stamp: checked})
-			}
-		}
-		b.mu.RUnlock()
-		total = len(found)
-		if limit > 0 && len(found) > limit {
-			found = found[:limit]
-		}
-		out := make([]*Proxy, len(found))
-		for i := range found {
-			out[i] = found[i].p
-		}
-		return out, total
+		// The hot tail is the smallest set with the best evidence, so only the
+		// window still has to be applied. Same rank scale as the queue scan
+		// below: serving proof first, then a validation stamp.
+		src = b.hot
 	}
-	for _, p := range b.proxies {
+	for _, p := range src {
 		served := p.LastServed()
 		checked := p.LastCheck()
 		var rank int

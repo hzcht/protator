@@ -54,14 +54,26 @@ func (s *Socks5Server) ListenAndServe(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	// Accept errors are not rare: fd exhaustion (EMFILE), hitting the
+	// default somaxconn backlog and per-connection nonce exhaustion all show
+	// up here. Looping straight back into Accept on a persistent error spins
+	// the CPU at 100% while the process is already out of descriptors, so
+	// every consecutive failure idles briefly and the backoff caps at 1s.
+	backoff := time.Millisecond
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || s.closed() {
 				return nil
 			}
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > time.Second {
+				backoff = time.Second
+			}
 			continue
 		}
+		backoff = time.Millisecond
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()

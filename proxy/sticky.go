@@ -127,7 +127,7 @@ func (s *PinPool) Del(key string) {
 }
 
 // DropProxy removes every pin that points at the given proxy key. Wired to
-// bucket.OnChange so evicted/revalidated-dead proxies release their pins.
+// bucket.Subscribe so evicted/revalidated-dead proxies release their pins.
 func (s *PinPool) DropProxy(proxyKey string) {
 	s.mu.Lock()
 	for k, e := range s.m {

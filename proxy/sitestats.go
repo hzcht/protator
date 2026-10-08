@@ -187,9 +187,12 @@ func (r *SiteRegistry) SetAlive(counts map[string]int) {
 // sortLocked orders sites best-first. Known-good, high-yield sources lead; sites
 // that have never been fetched get a rotating jitter so each cycle explores a
 // different slice of them instead of starving the same head of the alphabet.
+//
+// The jitter is the same one Order uses (see scoreLocked), so the admin table
+// and the actual fetch order agree.
 func (r *SiteRegistry) sortLocked(out []SiteStat) {
 	for i := range out {
-		out[i].Priority = r.scoreLocked(&out[i])
+		out[i].Priority = r.scoreLocked(&out[i], r.cycle)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {
@@ -213,9 +216,14 @@ const (
 // failing sink to the bottom. Within a band, live output dominates (it is the
 // only number that reflects the checker's verdict), then the last yield, then
 // a penalty for repeated failures.
-func (r *SiteRegistry) scoreLocked(s *SiteStat) int64 {
+//
+// epoch is the current cycle. It fixes the jitter for unproven sources:
+// Order and sortLocked used to jitter them differently (a re-rolled rng.Intn
+// in sortLocked, a hash of the cycle in Order), so the admin page showed a
+// fetch order that the collector never used.
+func (r *SiteRegistry) scoreLocked(s *SiteStat, epoch int64) int64 {
 	if s.Cycles == 0 {
-		return bandUnproven + int64(r.rng.Intn(priorityJitter))
+		return unprovenScore(s.URL, epoch)
 	}
 	yield := int64(8)*int64(r.alive[s.URL]) + int64(s.Emitted) - 4*int64(s.Fails)
 	if s.OK {
@@ -224,8 +232,9 @@ func (r *SiteRegistry) scoreLocked(s *SiteStat) int64 {
 	return bandFailing + yield
 }
 
-// unprovenScore is the deterministic-per-cycle variant used by Order, so the
-// whole list is sorted against one stable jitter instead of a re-rolled one.
+// unprovenScore is the deterministic-per-cycle jitter for sources nobody has
+// fetched, so the whole list is sorted against one stable value instead of a
+// re-rolled one.
 func unprovenScore(url string, epoch int64) int64 {
 	return bandUnproven + int64((hashStr(url)+uint64(epoch)*2654435761)%priorityJitter)
 }
@@ -242,13 +251,8 @@ func (r *SiteRegistry) Order(urls []string) []string {
 		s := r.statLocked(u)
 		out = append(out, s)
 	}
-	// The unproven jitter must not re-roll on every sort of the same cycle.
 	for _, s := range out {
-		if s.Cycles == 0 {
-			s.Priority = unprovenScore(s.URL, epoch)
-		} else {
-			s.Priority = r.scoreLocked(s)
-		}
+		s.Priority = r.scoreLocked(s, epoch)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {

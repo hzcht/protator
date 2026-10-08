@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -96,11 +97,14 @@ func readCONNECTResponse(conn net.Conn) (int, error) {
 			}
 		}
 		if err != nil {
-			if err == net.ErrClosed {
+			if errors.Is(err, net.ErrClosed) {
 				return 0, errors.New("proxy closed during CONNECT")
 			}
 			return 0, err
 		}
+		// n == 0 with err == nil is legal for an io.Reader; the read
+		// deadline set by the caller is the only thing that bounds this
+		// loop, so there is nothing extra to guard here.
 		if len(resp) > 8192 {
 			return 0, errors.New("proxy sent oversized CONNECT reply")
 		}
@@ -286,10 +290,10 @@ func dialVLESSRealty(conn net.Conn, ctx context.Context, timeout time.Duration, 
 		return nil, err
 	}
 
-	// Build custom ClientHello with REALITY encryption
-	// The ClientHello is encrypted with AES-GCM using derived key/iv
-	// and sent as a padded packet
-	if err := sendRealtyClientHello(uconn, key[:], iv[:], flow); err != nil {
+	// Build a Custom ClientHello. The ClientHello is encrypted with AES-GCM
+	// using the derived key/iv and padded before being sent — see
+	// sendRealtyClientHello, which is a stub. REALITY proxies will fail here.
+	if err := sendRealtyClientHello(uconn); err != nil {
 		uconn.Close()
 		return nil, err
 	}
@@ -311,26 +315,17 @@ func dialVLESSRealty(conn net.Conn, ctx context.Context, timeout time.Duration, 
 	return uconn, nil
 }
 
-// sendRealtyClientHello builds and sends an encrypted ClientHello for REALITY.
-func sendRealtyClientHello(uconn *utls.Conn, key, iv []byte, flow string) error {
-	// This is a simplified implementation.
-	// A full implementation would:
-	// 1. Build a ClientHello matching the target fingerprint (Chrome)
-	// 2. Encrypt it with AES-GCM using key/iv
-	// 3. Pad to a random length
-	// 4. Send as a single packet
-
-	// For now, we rely on uTLS to build a proper ClientHello
-	// and the REALITY server will accept it if the fingerprint matches.
-	// The encryption layer is handled by the REALITY server side.
-
-	// Set flow if provided (xtls-rprx-vision, xtls-rprx-direct, etc.)
-	if flow != "" {
-		// Flow is sent as part of VLESS handshake, not TLS
-	}
-
-	// Trigger handshake by writing empty data
-	// uTLS will send the ClientHello on first Write/Handshake
+// sendRealtyClientHello triggers the TLS ClientHello for a REALITY connection.
+//
+// A real REALITY dial does not send a plain ClientHello: the hello has to be
+// AES-GCM encrypted with the derived key/iv, padded to a random length, and
+// sent as one record, so the server can authenticate it as TLS-in-TLS. This
+// implementation does none of that — it relies on uTLS to emit a normal
+// ClientHello and on the server accepting it. It is a stub: the key/iv dialVLESS
+// derives below are unused, and `flow` belongs to the VLESS handshake that
+// follows, not here. REALITY proxies will fail here.
+func sendRealtyClientHello(uconn *utls.Conn) error {
+	// Trigger the handshake: uTLS emits the ClientHello on first Write.
 	_, err := uconn.Write([]byte{})
 	return err
 }
@@ -419,12 +414,8 @@ func parseUUID(s string) ([]byte, error) {
 		return nil, errors.New("invalid UUID length")
 	}
 	var out [16]byte
-	for i := 0; i < 16; i++ {
-		val, err := strconv.ParseUint(string(clean[i*2:i*2+2]), 16, 8)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = byte(val)
+	if _, err := hex.Decode(out[:], clean); err != nil {
+		return nil, err
 	}
 	return out[:], nil
 }

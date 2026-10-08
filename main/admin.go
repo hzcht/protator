@@ -132,11 +132,11 @@ func (a *admin) routes() *http.ServeMux {
 //
 // It carries no proxy traffic and no auth — bind it to 127.0.0.1 unless the
 // machine is firewalled.
-func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, collector *proxy.Collector, logNoise *log.Logger) {
+func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, collector *proxy.Collector, checker *proxy.Checker, debug *proxy.DebugProxies, logNoise *log.Logger) {
 	if cfg.Server.AdminListen == "" {
 		return
 	}
-	a := &admin{cfg: cfg, bucket: bucket, pool: pool, collector: collector, started: time.Now(), prevProxies: make(map[string]liveRow), prevHealth: make(map[string]int)}
+	a := &admin{cfg: cfg, bucket: bucket, pool: pool, collector: collector, checker: checker, debug: debug, ctx: ctx, started: time.Now(), prevProxies: make(map[string]liveRow), prevHealth: make(map[string]int), wsNotify: make(chan struct{}, 1)}
 
 	cert, err := proxy.LoadOrCreateTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
 	var tlsConfig *tls.Config
@@ -153,10 +153,16 @@ func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Buck
 	}
 
 	srv := newAdminServer(a, logNoise)
-	// Wire bucket changes to WebSocket broadcasts
-	bucket.OnChange = func(p *proxy.Proxy, added bool) {
-		a.notifyWSChanged()
-	}
+	// Wire bucket changes to WebSocket broadcasts. The subscriber callback
+	// only flags a pending change: it runs inline on the mutation path (every
+	// checker add, every revalidation drop, every serving-path eviction),
+	// where a full delta computation — whole-queue scan + diff + JSON marshal
+	// — must not run per mutation. startWSNotifier coalesces the flags into
+	// at most one broadcast per tick.
+	bucket.Subscribe(func(p *proxy.Proxy, added bool) {
+		a.requestWSNotify()
+	})
+	go a.startWSNotifier(ctx)
 	a.startStatsRecorder(ctx) // start 24h stats history recorder
 	go func() {
 		log.Printf("admin: ui + health on %s (http and https)", ln.Addr())

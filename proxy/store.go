@@ -339,31 +339,53 @@ func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 }
 
 // AppendGood appends a line to the "good proxies" audit file.
-// Uses a cached buffered writer to avoid open/write/close per call.
-var goodWriterCache sync.Map // path -> *bufio.Writer
+//
+// One cached buffered writer per path, guarded by its own mutex: the writer is
+// shared by every checker worker (hundreds of goroutines), and bufio.Writer is
+// not concurrency-safe — unsynchronized WriteString/Flush calls interleave at
+// the buffer level and garble lines. The mutex is per path, not global, so two
+// audit files never contend with each other.
+var goodWriters sync.Map // path -> *goodWriter
+
+type goodWriter struct {
+	mu sync.Mutex
+	w  *bufio.Writer
+}
 
 func AppendGood(path, line string) {
 	if path == "" {
 		return
 	}
-	var w *bufio.Writer
-	if v, ok := goodWriterCache.Load(path); ok {
-		w = v.(*bufio.Writer)
-	} else {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return
-		}
-		w = bufio.NewWriter(f)
-		actual, _ := goodWriterCache.LoadOrStore(path, w)
-		w = actual.(*bufio.Writer)
+	gw := openGoodWriter(path)
+	if gw == nil {
+		return
 	}
-	w.WriteString(line)
-	w.WriteByte('\n')
-	// Flush every 100 writes to bound memory.
-	if w.Buffered() > 4096 {
-		w.Flush()
+	gw.mu.Lock()
+	gw.w.WriteString(line)
+	gw.w.WriteByte('\n')
+	// Flush past 4 KB to bound memory (and bound loss on a crash).
+	if gw.w.Buffered() > 4096 {
+		gw.w.Flush()
 	}
+	gw.mu.Unlock()
+}
+
+func openGoodWriter(path string) *goodWriter {
+	if v, ok := goodWriters.Load(path); ok {
+		return v.(*goodWriter)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil
+	}
+	gw := &goodWriter{w: bufio.NewWriter(f)}
+	if actual, loaded := goodWriters.LoadOrStore(path, gw); loaded {
+		// Another worker won the race: close our file handle instead of
+		// leaking it (the loser used to keep an orphaned *os.File forever).
+		f.Close()
+		return actual.(*goodWriter)
+	}
+	return gw
 }
 
 // readLines reads a file into non-empty lines.
@@ -381,7 +403,11 @@ func readLines(path string) ([]string, error) {
 	defer f.Close()
 	var lines []string
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	// A 64 KB starting window, grown on demand. Every line read here is a
+	// proxy address or a site URL; the 1 MB fixed buffer used to be allocated
+	// up front on each of the four readers that open at startup, which is
+	// memory spent for a line length that never occurs.
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	for sc.Scan() {
 		l := strings.TrimPrefix(strings.TrimRight(sc.Text(), "\r"), "\ufeff")
 		if strings.TrimSpace(l) == "" {

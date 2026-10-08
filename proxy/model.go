@@ -11,19 +11,100 @@ import (
 
 // ProxyMeta holds cold fields (admin/debug only) — not accessed on the hot serving path.
 // Keeping these separate reduces Proxy size from ~200B to ~120B, reducing GC pressure.
+//
+// Every field is an atomic pointer because Proxy cannot carry a mutex: it is
+// written by a checker goroutine (SetGeoIP / SetVLESS) and read by the admin
+// page, the dialer and revalidation from any other. Plain fields there are a
+// data race that -race would flag immediately and that can also hand a reader
+// a torn UTF-8 string.
 type ProxyMeta struct {
-	// GeoIP fields (populated by checker after successful validation)
-	Country string `json:"country,omitempty"` // ISO 3166-1 alpha-2
-	ASN     string `json:"asn,omitempty"`     // "AS12345 Provider Name"
+	country atomic.Pointer[string] // ISO 3166-1 alpha-2
+	asn     atomic.Pointer[string] // "AS12345 Provider Name"
 
-	// VLESS-specific fields (populated when schema == "vless")
-	VLESSUUID   string `json:"vless_uuid,omitempty"`
-	VLESSFlow   string `json:"vless_flow,omitempty"`
-	VLESSSNI    string `json:"vless_sni,omitempty"`
-	VLESSPbk    string `json:"vless_pbk,omitempty"`    // REALITY public key
-	VLESSSid    string `json:"vless_sid,omitempty"`    // REALITY short ID
-	VLESSSpider string `json:"vless_spider,omitempty"` // spider header (for vision)
+	vlessUUID   atomic.Pointer[string]
+	vlessFlow   atomic.Pointer[string]
+	vlessSNI    atomic.Pointer[string]
+	vlessPbk    atomic.Pointer[string] // REALITY public key
+	vlessSid    atomic.Pointer[string] // REALITY short ID
+	vlessSpider atomic.Pointer[string] // spider header (for vision)
 }
+
+func (p *ProxyMeta) Country() string {
+	if s := p.country.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) ASN() string {
+	if s := p.asn.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) VLESSUUID() string {
+	if s := p.vlessUUID.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) VLESSFlow() string {
+	if s := p.vlessFlow.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) VLESSSNI() string {
+	if s := p.vlessSNI.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) VLESSPbk() string {
+	if s := p.vlessPbk.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) VLESSSid() string {
+	if s := p.vlessSid.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) VLESSSpider() string {
+	if s := p.vlessSpider.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) set(country, asn string) {
+	// Publish empty values too, so a reader never sees the pre-set state of a
+	// field that was explicitly cleared.
+	p.country.Store(ptrTo(country))
+	p.asn.Store(ptrTo(asn))
+}
+
+func (p *ProxyMeta) setVLESS(uuid, flow, sni, pbk, sid, spider string) {
+	// A fresh local slot per field: readers concurrently Load the same
+	// pointer, and an atomic.Pointer cannot be copied, so the value has to be
+	// published through one that outlives this call.
+	p.vlessUUID.Store(ptrTo(uuid))
+	p.vlessFlow.Store(ptrTo(flow))
+	p.vlessSNI.Store(ptrTo(sni))
+	p.vlessPbk.Store(ptrTo(pbk))
+	p.vlessSid.Store(ptrTo(sid))
+	p.vlessSpider.Store(ptrTo(spider))
+}
+
+func ptrTo(s string) *string { return &s }
 
 // Proxy describes a single validated upstream proxy.
 //
@@ -69,7 +150,7 @@ func (p *Proxy) GetCountry() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.Country
+	return p.meta.Country()
 }
 
 // GetASN returns the ASN string (e.g., "AS12345 Provider Name").
@@ -77,71 +158,74 @@ func (p *Proxy) GetASN() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.ASN
+	return p.meta.ASN()
 }
 
 // SetGeoIP sets the country and ASN for the proxy (called by checker after validation).
 func (p *Proxy) SetGeoIP(country, asn string) {
 	p.ensureMeta()
-	p.meta.Country = country
-	p.meta.ASN = asn
+	p.meta.set(country, asn)
 }
 
-// VLESS getters
+// GetVLESSUUID returns the VLESS UUID, or "".
 func (p *Proxy) GetVLESSUUID() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.VLESSUUID
+	return p.meta.VLESSUUID()
 }
 
+// GetVLESSFlow returns the VLESS flow, or "".
 func (p *Proxy) GetVLESSFlow() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.VLESSFlow
+	return p.meta.VLESSFlow()
 }
 
+// GetVLESSSNI returns the VLESS SNI, or "".
 func (p *Proxy) GetVLESSSNI() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.VLESSSNI
+	return p.meta.VLESSSNI()
 }
 
+// GetVLESSPbk returns the REALITY public key, or "".
 func (p *Proxy) GetVLESSPbk() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.VLESSPbk
+	return p.meta.VLESSPbk()
 }
 
+// GetVLESSSid returns the REALITY short ID, or "".
 func (p *Proxy) GetVLESSSid() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.VLESSSid
+	return p.meta.VLESSSid()
 }
 
+// GetVLESSSpider returns the spider header, or "".
 func (p *Proxy) GetVLESSSpider() string {
 	if p.meta == nil {
 		return ""
 	}
-	return p.meta.VLESSSpider
+	return p.meta.VLESSSpider()
 }
 
 // SetVLESS sets VLESS-specific fields (called by checker after validation).
 func (p *Proxy) SetVLESS(uuid, flow, sni, pbk, sid, spider string) {
 	p.ensureMeta()
-	p.meta.VLESSUUID = uuid
-	p.meta.VLESSFlow = flow
-	p.meta.VLESSSNI = sni
-	p.meta.VLESSPbk = pbk
-	p.meta.VLESSSid = sid
-	p.meta.VLESSSpider = spider
+	p.meta.setVLESS(uuid, flow, sni, pbk, sid, spider)
 }
 
-// ensureMeta lazily initializes the meta pointer.
+// ensureMeta lazily initializes the meta pointer. It races if two goroutines
+// call it on the same Proxy concurrently, so in practice it is only reached
+// from the single checker goroutine that just validated the candidate; an
+// already-set pointer is published to other goroutines via the bucket's lock
+// before they can read it.
 func (p *Proxy) ensureMeta() {
 	if p.meta == nil {
 		p.meta = &ProxyMeta{}
@@ -329,11 +413,16 @@ func buildVLESSQuery(p *Proxy) string {
 
 // Key returns a stable identity for deduplication.
 // Uses a cached string to avoid fmt.Sprintf on the hot path.
+//
+// The cache is filled before the proxy is published to other goroutines (the
+// checker sets it, then hands the object to the bucket), so reads never race a
+// write; a caller that somehow gets an un-cached Proxy recomputes the same
+// string rather than writing the shared field.
 func (p *Proxy) Key() string {
-	if p.keyCache == "" {
-		p.keyCache = p.URL()
+	if k := p.keyCache; k != "" {
+		return k
 	}
-	return p.keyCache
+	return p.URL()
 }
 
 // ParseProxyLine parses queue lines into a Proxy.

@@ -177,8 +177,15 @@ func (c *Collector) fetch(ctx context.Context, site string, out chan<- Candidate
 	retries := c.cfg.Collector.FetchRetries
 	if retries > 0 && c.bucket != nil && c.bucket.Len() > 0 {
 		var viaNotes []string
+		// Probe count comes from the same config knob the serving path uses:
+		// a hardcoded 8 here meant pick_probes had no effect on via-proxy
+		// collection, no matter how it was tuned.
+		probes := c.cfg.Server.PickProbes
+		if probes < 1 {
+			probes = 1
+		}
 		for attempt := 0; attempt < retries; attempt++ {
-			p, err := c.bucket.PickHealthy(ctx, 8, nil)
+			p, err := c.bucket.PickHealthy(ctx, probes, nil)
 			if err != nil {
 				break
 			}
@@ -307,9 +314,11 @@ func setBrowserHeaders(req *http.Request) {
 
 // skipContentType reports whether a body is certainly not a proxy list
 // (images, fonts, archives, ...).
+var skipContentTypes = []string{"image/", "audio/", "video/", "font/", "application/pdf", "application/zip"}
+
 func skipContentType(ct string) bool {
 	ct = strings.ToLower(strings.TrimSpace(ct))
-	for _, p := range []string{"image/", "audio/", "video/", "font/", "application/pdf", "application/zip"} {
+	for _, p := range skipContentTypes {
 		if strings.HasPrefix(ct, p) {
 			return true
 		}
@@ -340,15 +349,32 @@ func retryAfterSecs(h string, maxWait time.Duration) time.Duration {
 	return d
 }
 
+// lowerBody returns the first 128 KB of body lowercased. jsHint and
+// isCaptchaBody used to lowercase the same body independently, so every
+// fetched page paid the copy and the ASCII folding twice; sharing one copy
+// halves it. The signature list lives here too, because the two functions
+// also allocated their string slices per call.
+var bodySigs = []string{
+	"captcha", "recaptcha", "cf-browser-verification", "challenge-platform",
+	"hcaptcha", "are you a human", "please verify you are human",
+	"access denied", "403 forbidden", "just a moment...",
+}
+
+const bodyScanLimit = 128 << 10
+
+func lowerBody(body []byte) string {
+	if len(body) > bodyScanLimit {
+		body = body[:bodyScanLimit]
+	}
+	return strings.ToLower(string(body))
+}
+
 // jsHint guesses why a sizable body yielded nothing (for operator logs).
 func jsHint(body []byte) string {
 	if len(body) < 2000 {
 		return ""
 	}
-	if len(body) > 128<<10 {
-		body = body[:128<<10]
-	}
-	lower := strings.ToLower(string(body))
+	lower := lowerBody(body)
 	switch {
 	case strings.Contains(lower, "document.write"):
 		return "js-obfuscated?"
@@ -460,7 +486,7 @@ func (c *Collector) extractViaProxy(site string, p *Proxy) fetchResult {
 	}
 
 	// Use cached transport per proxy address to enable connection reuse.
-	tr := c.getTransport(p, proxyURL, to)
+	tr := c.getTransport(p, proxyURL)
 
 	client := &http.Client{
 		Timeout:   to,
@@ -533,7 +559,11 @@ func (c *Collector) extractViaProxy(site string, p *Proxy) fetchResult {
 
 // getTransport returns a cached http.Transport for the given proxy.
 // Transports are cached per proxy address to enable connection reuse.
-func (c *Collector) getTransport(p *Proxy, proxyURL *url.URL, timeout time.Duration) *http.Transport {
+//
+// timeout is not used: the client that owns this transport sets the whole
+// request budget, and a transport DialContext timeout would double it. Keeping
+// the parameter would leave the impression that it bounds the dial here.
+func (c *Collector) getTransport(p *Proxy, proxyURL *url.URL) *http.Transport {
 	key := p.URL()
 	if tr, ok := c.transportCache.Load(key); ok {
 		return tr.(*http.Transport)
@@ -583,24 +613,8 @@ func isHealthyResponse(resp *http.Response) bool {
 
 // isCaptchaBody inspects a fetched HTML body for known captcha/challenge signatures.
 func isCaptchaBody(body []byte) bool {
-	// Limit to first 128KB to avoid allocating a full lowercase copy of huge bodies.
-	if len(body) > 128<<10 {
-		body = body[:128<<10]
-	}
-	lower := strings.ToLower(string(body))
-	sigs := []string{
-		"captcha",
-		"recaptcha",
-		"cf-browser-verification",
-		"challenge-platform",
-		"hcaptcha",
-		"are you a human",
-		"please verify you are human",
-		"access denied",
-		"403 forbidden",
-		"just a moment...",
-	}
-	for _, s := range sigs {
+	lower := lowerBody(body)
+	for _, s := range bodySigs {
 		if strings.Contains(lower, s) {
 			return true
 		}
@@ -609,8 +623,10 @@ func isCaptchaBody(body []byte) bool {
 }
 
 // seenRecently skips candidates already pushed within the last 10 minutes.
+// The key is built without fmt.Sprintf: the collector emits thousands of
+// candidates per cycle and the format call dominated the dedup path.
 func (c *Collector) seenRecently(cand Candidate) bool {
-	key := fmt.Sprintf("%s://%s:%d", cand.Schema, cand.Host, cand.Port)
+	key := cand.Schema + "://" + cand.Host + ":" + strconv.Itoa(cand.Port)
 	now := time.Now()
 	c.seenMu.Lock()
 	defer c.seenMu.Unlock()

@@ -33,9 +33,9 @@ protator/
 │   ├── debug_proxies.txt   # Last N validated proxies
 │   └── logs/               # Rotating log files
 ├── main/                    # Entrypoint & admin
-│   ├── proxy.go            # main() + wiring
+│   ├── proxy.go            # main() + wiring (buildPipeline, startCollector)
 │   ├── servers.go          # HTTP/HTTPS/SOCKS5 listeners
-│   ├── loops.go            # Background loops (save, stats, pool reprobe, revalidate)
+│   ├── loops.go            # Wiring + housekeeping loops (save, stats)
 │   ├── admin.go            # Admin listener (mixed HTTP/HTTPS)
 │   ├── adminapi.go         # Admin JSON API + WebSocket
 │   ├── adminassets.go      # Embedded UI (HTML/CSS/JS)
@@ -45,13 +45,17 @@ protator/
 │   └── stop.ps1            # Ops: graceful stop
 ├── proxy/                   # Core logic
 │   ├── model.go            # Proxy, Candidate, atomic health stats
-│   ├── bucket.go           # Live queue, PickHealthy, per-source counts, LiveList
+│   ├── bucket.go           # Live queue, PickHealthy, per-source counts, LiveList, Subscribe
+│   ├── pipeline.go         # RunCheckLoop (candidate -> pool/bucket), RevalidateSeeded
+│   ├── revalidate.go       # RevalidateLoop / RevalidateMany (stale-first)
+│   ├── poolloop.go         # PoolReprobeLoop (adaptive re-probe batch)
 │   ├── checker.go          # Validation pipeline + GeoIP
 │   ├── collector.go        # Site scraping + extraction
 │   ├── upstream.go         # ForwardDialer with failover + passive feedback
 │   ├── dial.go             # CONNECT, SOCKS, VLESS (uTLS + REALITY)
 │   ├── extract.go          # Regex + spys XOR + document.write JS
-│   ├── pool.go             # CandidatePool (persisted failed candidates)
+│   ├── pool.go             # CandidatePool (persisted failed candidates, rotating)
+│   ├── debugproxies.go     # Rolling window of freshly validated proxies
 │   ├── sitestats.go        # SiteRegistry (telemetry + cooldown + priority)
 │   ├── config.go           # TOML config structs + fillDefaults
 │   ├── store.go            # File I/O (sites, queue, regex, atomic saves)

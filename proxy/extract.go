@@ -196,10 +196,15 @@ func normScheme(s string) string {
 	return "http"
 }
 
-// validHost checks that an IPv4 is a real address (octets <= 255).
+// validHost checks that host is a literal IPv4 address.
+//
+// This used to call net.ResolveIPAddr, which walks the resolver for anything
+// that is not a literal — a hostname would come back non-nil and pass as a
+// "valid host". What the extractor actually wants is a literal: every match is
+// an IP:port pair served by a proxy list, so a hostname-shaped match is noise.
 func validHost(host string) bool {
-	h, err := net.ResolveIPAddr("ip4", host)
-	return err == nil && h != nil
+	ip := net.ParseIP(host)
+	return ip != nil && ip.To4() != nil
 }
 
 func looksLikeIP(s string) bool {

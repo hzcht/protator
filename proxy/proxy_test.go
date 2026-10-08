@@ -371,11 +371,11 @@ func TestParsePortSingleDigit(t *testing.T) {
 func TestEvictionNotifiesRemoval(t *testing.T) {
 	b := NewBucket(2)
 	var removed []string
-	b.OnChange = func(p *Proxy, added bool) {
+	b.Subscribe(func(p *Proxy, added bool) {
 		if !added {
 			removed = append(removed, p.URL())
 		}
-	}
+	})
 	mk := func(s string) *Proxy { p, _ := ParseProxyLine(s); return p }
 	b.Add(mk("http://1.1.1.1:80"))
 	b.Add(mk("http://2.2.2.2:80"))

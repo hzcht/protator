@@ -75,28 +75,43 @@ func (b *browserPool) text(ctx context.Context, url string) (string, error) {
 	ctx2, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 
-	done := make(chan struct{})
-	var content string
-	var pageErr error
+	// The playwright calls block with no ctx of their own, so the only way to
+	// bound them is b.timeout. Wait for both paths to finish before touching
+	// page/bctx: returning early leaves the fetch goroutine writing content and
+	// calling Close on objects this function has already deferred Close on.
+	type result struct {
+		content string
+		err     error
+	}
+	done := make(chan result, 1)
 	go func() {
-		defer close(done)
+		var r result
 		_, gotoErr := page.Goto(url, playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 			Timeout:   playwright.Float(float64(b.timeout / time.Millisecond)),
 		})
 		if gotoErr != nil {
-			pageErr = gotoErr
-			return
+			r.err = gotoErr
+		} else {
+			r.content, r.err = page.Content()
 		}
-		c, err2 := page.Content()
-		content = c
-		pageErr = err2
+		done <- r
 	}()
 
 	select {
-	case <-done:
+	case r := <-done:
+		return r.content, r.err
 	case <-ctx2.Done():
+		// Playwright's own deadline is b.timeout, which is exactly ctx2's
+		// budget, so the goroutine is already returning. Reap it before
+		// unwinding so page.Close/bctx.Close cannot race it.
+		select {
+		case r := <-done:
+			return r.content, r.err
+		case <-time.After(5 * time.Second):
+			// Never leave the browser wedged; give up on leaking this page
+			// rather than leaking the fetch itself.
+		}
 		return "", ctx2.Err()
 	}
-	return content, pageErr
 }

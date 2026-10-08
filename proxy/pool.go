@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -30,14 +32,28 @@ type CandidatePool struct {
 	bytes  int64
 	cursor int
 
+	// evictions since the file was last rewritten. The file only ever grows
+	// (append-only), while memory stays at the cap, so the two drift apart by
+	// one line per rotation; compaction realigns them.
+	evicted int
+
 	// Buffered writer for appending lines to disk.
 	// Avoids open/write/close syscall per Add.
 	file   *os.File
 	writer *bufio.Writer
 }
 
+// compactEvictThreshold bounds how far the file may drift ahead of memory
+// before it is rewritten: compaction is a full rewrite of the pool (up to
+// maxCount lines), so it must not run per Add, but leaving it forever would
+// let the file grow without bound under rotation.
+const compactEvictThreshold = 8192
+
 // NewCandidatePool loads an existing pool file (invalid/duplicate lines are
-// dropped) and returns a pool that appends to it.
+// dropped) and returns a pool that appends to it. A file that grew past the
+// cap (written by an older build that could not trim) keeps only its tail —
+// the freshest candidates — and is rewritten to match, instead of permanently
+// rejecting every future Add.
 func NewCandidatePool(path string, maxBytes int64, maxCount int) *CandidatePool {
 	if maxBytes <= 0 {
 		maxBytes = 256 << 20
@@ -52,7 +68,12 @@ func NewCandidatePool(path string, maxBytes int64, maxCount int) *CandidatePool 
 		keys:     make(map[string]string),
 		good:     make(map[string]struct{}),
 	}
-	for _, l := range readPoolLines(path) {
+	loaded := readPoolLines(path)
+	if trimmed := len(loaded) - maxCount; trimmed > 0 {
+		loaded = loaded[trimmed:]
+		cp.evicted = compactEvictThreshold // rewrite on first use
+	}
+	for _, l := range loaded {
 		cp.keys[l.key] = l.line
 		cp.lines = append(cp.lines, l.line)
 		cp.bytes += int64(len(l.line) + 1)
@@ -64,6 +85,9 @@ func NewCandidatePool(path string, maxBytes int64, maxCount int) *CandidatePool 
 			cp.file = f
 			cp.writer = bufio.NewWriter(f)
 		}
+	}
+	if cp.evicted >= compactEvictThreshold && len(cp.lines) > 0 {
+		cp.compactLocked()
 	}
 	return cp
 }
@@ -91,6 +115,13 @@ func (cp *CandidatePool) flush() {
 
 // Add persists a new candidate unless it is already known or already good.
 // Returns true if the line was appended.
+//
+// The pool rotates instead of refusing work once full: it exists so "a
+// transient probe failure never loses an address forever", so dropping the
+// newest failures (what the old cap did) throws away exactly the entries the
+// pool is for, while the oldest — already re-probed many times over — squat
+// on the capacity forever. When full, the oldest line is evicted to make room;
+// the file is rewritten periodically so it does not outgrow the cap.
 func (cp *CandidatePool) Add(c Candidate) bool {
 	line := poolPersistLine(c)
 	pl, ok := parsePoolLine(line)
@@ -105,23 +136,90 @@ func (cp *CandidatePool) Add(c Candidate) bool {
 	if _, good := cp.good[pl.key]; good {
 		return false
 	}
-	if len(cp.lines) >= cp.maxCount || cp.bytes+int64(len(line)+1) > cp.maxBytes {
-		return false
+	for len(cp.lines) >= cp.maxCount || cp.bytes+int64(len(line)+1) > cp.maxBytes {
+		if !cp.evictOldestLocked() {
+			return false // empty pool and the line alone exceeds maxBytes
+		}
+		cp.evicted++
 	}
 	cp.keys[pl.key] = line
 	cp.lines = append(cp.lines, line)
 	cp.bytes += int64(len(line) + 1)
-	// Buffered write: append to buffer, flush every 1000 adds.
+	// Buffered write: append to buffer, flush once it holds enough to be
+	// worth the syscall. (A line-count check would misfire under rotation:
+	// len(lines) sits at the cap, so the modulo never advances.)
 	if cp.writer != nil {
 		cp.writer.WriteString(line)
 		cp.writer.WriteByte('\n')
-		if len(cp.lines)%1000 == 0 {
+		if cp.writer.Buffered() > 4096 {
 			cp.writer.Flush()
 		}
 	} else {
 		appendPoolLine(cp.path, line)
 	}
+	if cp.evicted >= compactEvictThreshold {
+		cp.compactLocked()
+	}
 	return true
+}
+
+// evictOldestLocked drops the front entry (insertion order) and returns false
+// when the pool is already empty. Callers hold mu.
+func (cp *CandidatePool) evictOldestLocked() bool {
+	if len(cp.lines) == 0 {
+		return false
+	}
+	line := cp.lines[0]
+	if pl, ok := parsePoolLine(line); ok {
+		delete(cp.keys, pl.key)
+	}
+	cp.lines = cp.lines[1:]
+	cp.bytes -= int64(len(line) + 1)
+	if cp.bytes < 0 {
+		cp.bytes = 0
+	}
+	if cp.cursor > 0 {
+		cp.cursor--
+	}
+	return true
+}
+
+// compactLocked rewrites the pool file from memory (temp + fsync + rename) so
+// the file holds exactly the lines still tracked in RAM. The append handle is
+// closed first: on Windows a rename fails while any handle to the destination
+// is open — including our own. Callers hold mu.
+func (cp *CandidatePool) compactLocked() {
+	evicted := cp.evicted
+	cp.evicted = 0
+	if cp.path == "" || len(cp.lines) == 0 {
+		return
+	}
+	if cp.writer != nil {
+		cp.writer.Flush()
+	}
+	if cp.file != nil {
+		cp.file.Close()
+		cp.file, cp.writer = nil, nil
+	}
+	var buf bytes.Buffer
+	buf.Grow(int(cp.bytes))
+	for _, l := range cp.lines {
+		buf.WriteString(l)
+		buf.WriteByte('\n')
+	}
+	if err := writeFileAtomic(cp.path, buf.Bytes()); err != nil {
+		log.Printf("pool: compact %s: %v", cp.path, err)
+	} else {
+		log.Printf("pool: compacted %s (%d lines, %d evicted)", cp.path, len(cp.lines), evicted)
+	}
+	// Reopen the append handle either way: the appends must continue even if
+	// the rewrite failed.
+	if cp.path != "" {
+		if f, err := os.OpenFile(cp.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			cp.file = f
+			cp.writer = bufio.NewWriter(f)
+		}
+	}
 }
 
 // Good remembers that a candidate validated successfully so Batch stops

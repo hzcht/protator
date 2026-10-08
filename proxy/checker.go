@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oschwald/geoip2-golang"
@@ -41,21 +42,24 @@ import (
 // When a candidate has no explicit protocol the configured probe order tries
 // http, socks5, socks4 (and https) until one passes every stage.
 type Checker struct {
-	cfg    *Config
-	selfIP net.IP
-	tests  []ContentTest
-	ipRe   *regexp.Regexp
-	geoDB  *geoip2.Reader
+	cfg     *Config
+	selfIP  net.IP
+	tests   []ContentTest
+	testsRe [][]*regexp.Regexp // parallel to tests; nil entry = substring match
+	ipRe    *regexp.Regexp
+	geoDB   *geoip2.Reader
 
 	// transportCache caches http.Transport per proxy address to avoid
 	// creating a new transport (and its connection pool) for every check.
 	// Key: "schema://host:port", Value: *http.Transport
 	transportCache sync.Map
-	// transportCacheSize tracks the number of entries for eviction.
-	transportCacheSize int
+	// transportCacheSize tracks the number of entries for eviction. It is
+	// bumped by every checker worker (hundreds of goroutines), so it is an
+	// atomic: a plain int race lets the counter drift, which either evicts
+	// nothing or evicts on every insert.
+	transportCacheSize int64
 	// transportCacheMax bounds the cache size to prevent unbounded memory growth.
-	// When full, the oldest entry is evicted (simple FIFO).
-	transportCacheMax int
+	transportCacheMax int64
 
 	// allowBogon disables the loopback/private filter (integration tests
 	// run everything on 127.0.0.1). Never set in production.
@@ -87,6 +91,22 @@ func NewChecker(cfg *Config) (*Checker, error) {
 		tests, err := LoadTests(cfg.Checker.TestsFile)
 		if err != nil {
 			return nil, err
+		}
+		// Compile the MustContain templates once here. They are matched
+		// against every content-test body of every proxy check, and
+		// regexp.Compile is orders of magnitude more expensive than
+		// MatchString: doing it per match put the compiler in the hot loop
+		// of hundreds of checker workers.
+		for i := range tests {
+			compiled := make([]*regexp.Regexp, 0, len(tests[i].MustContain))
+			for _, pat := range tests[i].MustContain {
+				if re, err := regexp.Compile(pat); err == nil {
+					compiled = append(compiled, re)
+				} else {
+					compiled = append(compiled, nil) // plain-substring pattern
+				}
+			}
+			c.testsRe = append(c.testsRe, compiled)
 		}
 		c.tests = tests
 	} else if cfg.Checker.TestsFile != "" {
@@ -236,8 +256,12 @@ func (c *Checker) preDial(p *Proxy) error {
 }
 
 func (c *Checker) fullCheck(p *Proxy) error {
+	// Use the cached transport, not a throwaway: the whole point of the cache
+	// is reusing this transport's connection pool across checks of the same
+	// proxy. fullCheck used to CloseIdleConnections on the way out, which
+	// tore down the pool it was about to hand back and left the "reuse
+	// connection pools" comment describing behaviour that never happened.
 	tr := c.transportFor(p)
-	defer tr.CloseIdleConnections()
 	client := &http.Client{
 		Transport: tr,
 		Timeout:   c.cfg.Checker.TotalT.Duration,
@@ -251,7 +275,7 @@ func (c *Checker) fullCheck(p *Proxy) error {
 		return err
 	}
 	// IP-stage extras: header-leak must pass before content stage.
-	if err := c.leakCheck(client, p); err != nil {
+	if err := c.leakCheck(client); err != nil {
 		return err
 	}
 	if err := c.e2eProbe(p); err != nil {
@@ -264,7 +288,7 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		confirmErr = c.confirmExitIP(client, p, ip, winURL)
+		confirmErr = c.confirmExitIP(client, ip, winURL)
 	}()
 	go func() {
 		defer wg.Done()
@@ -277,7 +301,13 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	if !contentOK {
 		return errors.New("content check failed")
 	}
-	if needsConnect(p.Schema) && !viaConnect && !testConnect {
+	// CONNECT is proven only when some stage actually tunnelled. Skipping the
+	// check when no evidence could exist at all is not the same as "no
+	// evidence yet": with content tests and https self-IP urls both absent,
+	// viaConnect and testConnect are both false by construction, and this
+	// used to reject every http/https proxy purely for lack of
+	// configuration.
+	if needsConnect(p.Schema) && !viaConnect && !testConnect && c.connectEvidencePossible() {
 		return errors.New("proxy does not support CONNECT")
 	}
 	p.MarkAlive(time.Since(start))
@@ -294,6 +324,25 @@ func (c *Checker) fullCheck(p *Proxy) error {
 // VLESS carries the target address in its handshake, not via CONNECT.
 func needsConnect(schema string) bool {
 	return schema == "http" || schema == "https"
+}
+
+// connectEvidencePossible reports whether this check could ever observe a
+// CONNECT tunnel. The evidence has to come from somewhere: either a content
+// test fetched over https, or an https self-IP url probed for the exit IP.
+// With neither configured there is nothing to observe, and demanding proof
+// turns optional configuration into a blanket rejection.
+func (c *Checker) connectEvidencePossible() bool {
+	for _, t := range c.tests {
+		if viaConnectURL(t.URL) {
+			return true
+		}
+	}
+	for _, u := range c.cfg.Checker.SelfIPURLs {
+		if viaConnectURL(u) {
+			return true
+		}
+	}
+	return false
 }
 
 // viaConnectURL reports whether fetching u through an http(s) proxy uses
@@ -371,14 +420,29 @@ func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := make(chan res, len(c.tests))
-	for _, t := range c.tests {
-		go func(t ContentTest) {
+	for i, t := range c.tests {
+		compiled := []*regexp.Regexp{}
+		if i < len(c.testsRe) {
+			compiled = c.testsRe[i]
+		}
+		patterns := t.MustContain
+		go func(t ContentTest, compiled []*regexp.Regexp, patterns []string) {
 			body, err := getBodyCtx(ctx, client, t.URL)
 			if err != nil {
 				return
 			}
-			for _, pat := range t.MustContain {
-				if !matchesTemplate(pat, body) {
+			for j, pat := range patterns {
+				var re *regexp.Regexp
+				if j < len(compiled) {
+					re = compiled[j]
+				}
+				if re != nil {
+					if !re.MatchString(body) {
+						return
+					}
+					continue
+				}
+				if !strings.Contains(body, pat) {
 					return
 				}
 			}
@@ -386,7 +450,7 @@ func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
 			case ch <- res{viaConnect: needsConnect(p.Schema) && viaConnectURL(t.URL)}:
 			case <-ctx.Done():
 			}
-		}(t)
+		}(t, compiled, patterns)
 	}
 	select {
 	case r := <-ch:
@@ -399,7 +463,10 @@ func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
 // leakCheck rejects proxies that forward the client IP in hop-by-hop headers
 // (X-Forwarded-For, Via, X-Real-IP, ...). A leak verdict is only trusted when
 // the echo endpoint actually responded; service errors never fail a proxy.
-func (c *Checker) leakCheck(client *http.Client, p *Proxy) error {
+//
+// Every request here goes through `client`, which is already bound to the proxy
+// under test, so no proxy identity is needed on the parameters.
+func (c *Checker) leakCheck(client *http.Client) error {
 	urls := c.cfg.Checker.LeakProbeURLs
 	if len(urls) == 0 {
 		return nil
@@ -449,11 +516,15 @@ func (c *Checker) leakCheck(client *http.Client, p *Proxy) error {
 
 // confirmExitIP re-fetches the self-IP URL that won the anonymity race and
 // requires the exit IP to be identical, rejecting unstable rotating proxies.
-func (c *Checker) confirmExitIP(client *http.Client, p *Proxy, first net.IP, u string) error {
+// `first` is the IP that race saw; `p` is not needed because client is already
+// bound to it.
+func (c *Checker) confirmExitIP(client *http.Client, first net.IP, u string) error {
 	if !c.cfg.Checker.RequireStableExit {
 		return nil
 	}
-	body, err := getBodyCtx(context.Background(), client, u)
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Checker.ResponseT.Duration)
+	defer cancel()
+	body, err := getBodyCtx(ctx, client, u)
 	if err != nil {
 		return nil // could not confirm; never fail on a service hiccup
 	}
@@ -530,10 +601,12 @@ func (c *Checker) e2eProbe(p *Proxy) error {
 // transportFor returns a per-check transport routing through p with
 // connection reuse across the check's sub-requests.
 // Transports are cached per proxy address (schema://host:port) to reuse
-// connection pools across checks for the same proxy.
-// The cache is bounded: when full, the oldest entry is evicted (FIFO).
+// connection pools across checks for the same proxy. The cache is bounded;
+// when full, one entry is evicted.
 func (c *Checker) transportFor(p *Proxy) *http.Transport {
-	key := p.URL() // schema://host:port (includes VLESS params)
+	// Probe by the precomputed key rather than URL(): URL() re-formats the
+	// string on every call, which is what the cache exists to avoid.
+	key := p.Key()
 
 	if tr, ok := c.transportCache.Load(key); ok {
 		return tr.(*http.Transport)
@@ -566,17 +639,17 @@ func (c *Checker) transportFor(p *Proxy) *http.Transport {
 		}
 	}
 
-	// Store in cache with eviction when full.
+	// Store in cache with eviction when full. Range has no defined order, so
+	// this is not really FIFO — but the pool of transports is fungible: any
+	// one of them can be dropped at the cost of one fresh connection pool.
 	c.transportCache.Store(key, tr)
-	c.transportCacheSize++
-	if c.transportCacheSize > c.transportCacheMax {
-		// Evict oldest entry (simple FIFO: delete the first key we find).
+	if atomic.AddInt64(&c.transportCacheSize, 1) > c.transportCacheMax {
 		c.transportCache.Range(func(k, v interface{}) bool {
-			c.transportCache.Delete(k)
 			if tr, ok := v.(*http.Transport); ok {
 				tr.CloseIdleConnections()
 			}
-			c.transportCacheSize--
+			c.transportCache.Delete(k)
+			atomic.AddInt64(&c.transportCacheSize, -1)
 			return false // stop after first deletion
 		})
 	}
@@ -617,16 +690,11 @@ func getBodyCtx(ctx context.Context, client *http.Client, u string) (string, err
 	return strings.TrimSpace(string(b)), nil
 }
 
-// lookupGeoIP looks up the country and ASN for the given IP.
-// This is a placeholder implementation that can be extended with a proper
-// GeoIP database (e.g., MaxMind GeoLite2). For production use, replace
-// with a local MMDB lookup or a cached API call.
+// lookupGeoIP looks up the country and ASN for the given IP from the local
+// MaxMind database, if one is configured. The ASN field needs a separate
+// GeoLite2-ASN / GeoIP2-ASN reader, which the config does not provide today, so
+// ASN comes back empty rather than invented.
 func (c *Checker) lookupGeoIP(ip net.IP) (country, asn string) {
-	// Try a simple public API as fallback (rate limited, not for high volume)
-	// This is only called once per successful validation, so it's acceptable.
-	// In production, use a local MMDB file for zero-latency lookups.
-	// Example: https://ipapi.co/<ip>/json/ or http://ip-api.com/json/<ip>
-	// For now, return empty to avoid external dependencies.
 	if c.geoDB == nil {
 		return "", ""
 	}
@@ -634,12 +702,14 @@ func (c *Checker) lookupGeoIP(ip net.IP) (country, asn string) {
 	if err != nil {
 		return "", ""
 	}
-	country = record.Country.IsoCode
-	return country, ""
+	return record.Country.IsoCode, ""
 }
 
 // matchesTemplate matches a template string either as a regexp or, if the
 // string is not a valid expression, as a plain substring.
+//
+// Kept for callers that have no precompiled pattern to hand (tests, tools);
+// the hot path uses the compiled table built in NewChecker.
 func matchesTemplate(template, body string) bool {
 	re, err := regexp.Compile(template)
 	if err == nil {

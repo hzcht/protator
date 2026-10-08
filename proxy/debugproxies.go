@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"os"
@@ -6,7 +6,7 @@ import (
 	"sync"
 )
 
-// debugProxies keeps a small rolling window of freshly validated proxies and
+// DebugProxies keeps a small rolling window of freshly validated proxies and
 // persists it as one URL per line. Every entry survived the full checker
 // pipeline (including the e2e serving-path probe) moments before being added,
 // so it is as close to "guaranteed working" as this codebase can produce.
@@ -15,23 +15,25 @@ import (
 // proxy) — if the page loads, the pool/checker are fine and the failure lives
 // in the serving logic; if it still times out, the "good" proxies themselves
 // are flaky or the experiment needs a different class of proxy.
-type debugProxies struct {
+type DebugProxies struct {
 	mu   sync.Mutex
 	path string
 	max  int
 	ring []string
 }
 
-func newDebugProxies(path string, max int) *debugProxies {
+// NewDebugProxies creates the rolling window; max is the number of URLs kept
+// (a non-positive max falls back to one).
+func NewDebugProxies(path string, max int) *DebugProxies {
 	if max < 1 {
 		max = 1
 	}
-	return &debugProxies{path: path, max: max}
+	return &DebugProxies{path: path, max: max}
 }
 
 // Add records a freshly validated proxy and rewrites the file. The same URL is
 // recorded once per window so repeated revalidations do not flood the file.
-func (d *debugProxies) Add(url string) {
+func (d *DebugProxies) Add(url string) {
 	if d == nil || d.path == "" || url == "" {
 		return
 	}
@@ -49,7 +51,7 @@ func (d *debugProxies) Add(url string) {
 	d.writeLocked()
 }
 
-func (d *debugProxies) writeLocked() {
+func (d *DebugProxies) writeLocked() {
 	dir := filepath.Dir(d.path)
 	tmp := filepath.Join(dir, filepath.Base(d.path)+".tmp")
 	f, err := os.Create(tmp)

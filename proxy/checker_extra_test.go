@@ -51,18 +51,18 @@ func TestLeakCheckRejectsForwardedIP(t *testing.T) {
 	defer client.Transport.(*http.Transport).CloseIdleConnections()
 
 	c.cfg.Checker.LeakProbeURLs = []string{leaky.URL}
-	if err := c.leakCheck(client, p); err == nil {
+	if err := c.leakCheck(client); err == nil {
 		t.Fatal("leaky endpoint accepted")
 	}
 
 	c.cfg.Checker.LeakProbeURLs = []string{clean.URL}
-	if err := c.leakCheck(client, p); err != nil {
+	if err := c.leakCheck(client); err != nil {
 		t.Fatalf("clean endpoint rejected: %v", err)
 	}
 
 	// Disabled config: stage must be skipped entirely.
 	c.cfg.Checker.LeakProbeURLs = nil
-	if err := c.leakCheck(client, p); err != nil {
+	if err := c.leakCheck(client); err != nil {
 		t.Fatalf("disabled leak stage failed: %v", err)
 	}
 }
@@ -85,16 +85,16 @@ func TestConfirmExitIPStability(t *testing.T) {
 	defer client.Transport.(*http.Transport).CloseIdleConnections()
 
 	c.cfg.Checker.RequireStableExit = true
-	if err := c.confirmExitIP(client, p, net.ParseIP("5.6.7.8"), stable.URL); err != nil {
+	if err := c.confirmExitIP(client, net.ParseIP("5.6.7.8"), stable.URL); err != nil {
 		t.Fatalf("stable endpoint rejected: %v", err)
 	}
-	if err := c.confirmExitIP(client, p, net.ParseIP("5.6.7.8"), rotating.URL); err == nil {
+	if err := c.confirmExitIP(client, net.ParseIP("5.6.7.8"), rotating.URL); err == nil {
 		t.Fatal("rotating exit IP accepted")
 	}
 
 	// Gated off: must never reject.
 	c.cfg.Checker.RequireStableExit = false
-	if err := c.confirmExitIP(client, p, net.ParseIP("5.6.7.8"), rotating.URL); err != nil {
+	if err := c.confirmExitIP(client, net.ParseIP("5.6.7.8"), rotating.URL); err != nil {
 		t.Fatalf("disabled stability stage failed: %v", err)
 	}
 }
