@@ -87,11 +87,17 @@ type statsSample struct {
 }
 
 // recordStatsSample adds a sample to the 24h ring buffer (1440 minutes max).
+//
+// The rate window (lastMetrics/lastMetricsAt) is guarded by metricsMu, because
+// countersAndRates rewrites it from the /api/metrics handler goroutine while
+// this runs from the recorder: an unsynchronised read of that map is a
+// concurrent map read/write, which the runtime answers with a panic.
 func (a *admin) recordStatsSample() {
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
 	now := time.Now()
 	rpm, cpm, dpm := 0.0, 0.0, 0.0
+	a.metricsMu.Lock()
 	if a.hasMetricsSample && !a.lastMetricsAt.IsZero() {
 		mins := now.Sub(a.lastMetricsAt).Minutes()
 		if mins > 0 {
@@ -101,6 +107,7 @@ func (a *admin) recordStatsSample() {
 			dpm = deltaPerMin(c["dial_failures_total"], a.lastMetrics["dial_failures_total"], mins)
 		}
 	}
+	a.metricsMu.Unlock()
 	a.statsHist = append(a.statsHist, statsSample{
 		Time:           now,
 		QueueLive:      a.bucket.Len(),
@@ -491,22 +498,19 @@ func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// One scan to resolve the requested identities. A checker pass costs
+	// Resolve the requested identities one lookup each. A checker pass costs
 	// seconds per proxy, so the handler must not wait for it: the work runs
 	// under the process context and the page sees progress via the live view.
-	targets := make(map[string]*proxy.Proxy)
-	for _, p := range a.bucket.Snapshot() {
-		if _, dup := targets[p.Key()]; !dup {
-			targets[p.Key()] = p
-		}
-	}
-
+	//
+	// Resolving by lookup, not by indexing a snapshot: the snapshot built a map
+	// with an entry per live proxy (two million entries, a million Key() calls)
+	// to answer at most a few hundred lookups - one click that cost hundreds of
+	// megabytes and seconds of CPU on the largest queue.
 	var revalidated int
 	var notFound []string
-	checkList := append(append([]string{}, body.URLs...), body.Keys...)
-	picked := make([]*proxy.Proxy, 0, len(checkList))
-	for _, key := range checkList {
-		if p, ok := targets[key]; ok {
+	picked := make([]*proxy.Proxy, 0, len(body.URLs)+len(body.Keys))
+	for _, key := range append(append([]string{}, body.URLs...), body.Keys...) {
+		if p := a.bucket.Get(key); p != nil {
 			revalidated++
 			picked = append(picked, p)
 			continue
@@ -528,7 +532,6 @@ func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) 
 		"ok":          true,
 		"revalidated": revalidated,
 		"not_found":   notFound,
-		"resolved":    len(targets),
 		"note":        "re-checking now; dead entries are dropped, live ones stay",
 	})
 }

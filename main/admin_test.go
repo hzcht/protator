@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -646,5 +647,35 @@ func TestAdminActionEndpoints(t *testing.T) {
 	// Method discipline on the mutating endpoints.
 	if status, _ := doJSON(t, a, http.MethodGet, "/api/collector/wake", ""); status != http.StatusMethodNotAllowed {
 		t.Errorf("GET on wake: status %d, want 405", status)
+	}
+}
+
+// Bucket.Get resolves one identity per lookup. The revalidate action used to
+// index a snapshot of the whole queue to answer a handful of lookups: a
+// two-million-entry map and a million Key() calls per click.
+func TestAdminRevalidateResolvesByLookup(t *testing.T) {
+	a, bucket, _ := newTestAdmin(t)
+	live, _ := proxy.ParseProxyLine("http://1.2.3.4:8080")
+	bucket.Add(live)
+
+	// The action path needs a checker handle; the re-check itself is off the
+	// request goroutine and is not what this asserts.
+	a.checker = &proxy.Checker{}
+	a.debug = proxy.NewDebugProxies(filepath.Join(t.TempDir(), "dbg.txt"), 5)
+	a.ctx = context.Background()
+
+	body, err := json.Marshal(map[string][]string{
+		"urls": {"http://1.2.3.4:8080", "http://9.9.9.9:1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out := doJSON(t, a, http.MethodPost, "/api/proxies/revalidate", string(body))
+	if out["revalidated"].(float64) != 1 {
+		t.Fatalf("revalidated = %v, want 1", out["revalidated"])
+	}
+	notFound := out["not_found"].([]interface{})
+	if len(notFound) != 1 || notFound[0].(string) != "http://9.9.9.9:1" {
+		t.Fatalf("not_found = %v, want the unresolvable URL", notFound)
 	}
 }

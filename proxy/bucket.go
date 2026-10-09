@@ -388,6 +388,22 @@ func (b *Bucket) MarkClean() {
 	b.mu.Unlock()
 }
 
+// Get returns the queue entry for the given full URL ("schema://host:port"),
+// or nil when it is not in the queue.
+//
+// Admin actions use it to resolve the identifiers an operator pasted: the
+// alternative — snapshot the queue and index it — allocates a map with one
+// entry per live proxy (a two-million-entry map and a million Key() calls)
+// to answer a handful of lookups.
+func (b *Bucket) Get(key string) *Proxy {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if i, ok := b.index[key]; ok {
+		return b.proxies[i]
+	}
+	return nil
+}
+
 // markDirty flags the queue as changed so saveLoop persists it on the next
 // tick. Only the persisted member set matters (the file holds plain URLs), so
 // stamp-only updates like the dedup path in addLocked deliberately leave the
