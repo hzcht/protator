@@ -33,3 +33,14 @@ is unreachable (so a CI job or a supervisor can tell "broken" from "not
 running").
 
 `curl` is the only dependency (ships with Windows 10+ and every Linux).
+
+### Two curl flags that are easy to get wrong
+
+- **HTTPS proxy**: `-k` only relaxes verification of the *target*. The proxy's
+  own self-signed certificate needs `--proxy-insecure`. Without it every request
+  through the HTTPS front fails with `SEC_E_UNTRUSTED_ROOT` (curl exit 52/56) —
+  the scripts pass both.
+- **HTTPS proxy support at all** requires curl >= 7.52. On a box with an older
+  curl, the `https` front is untestable: use the `http` front or SOCKS5.
+  (`curl --version` tells you; PowerShell 5.1 users note that `curl` alone is an
+  alias for `Invoke-WebRequest`, so run `curl.exe` or the scripts.)

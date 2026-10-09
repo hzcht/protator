@@ -306,6 +306,12 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 		defer cancel()
 	}
 
+	// One counter per client CONNECT, and one per upstream dial attempt. This
+	// path does not go through DialContext (it dials the target itself so it
+	// can supervise the tunnel), so without these the majority of real traffic
+	// - every HTTPS request a browser makes - is invisible to the metrics.
+	Stats.Requests.Add(1)
+
 	skip := make(map[string]struct{}, d.serveRetries)
 	replay := bytes.NewBuffer(nil)
 	sent200 := false
@@ -313,6 +319,7 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 	markFailed := func(p *Proxy) {
 		if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 			d.bucket.Remove(p)
+			Stats.Evictions.Add(1)
 		}
 	}
 
@@ -326,8 +333,10 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 		}
 		skip[p.Key()] = struct{}{}
 		start := time.Now()
+		Stats.DialAttempts.Add(1)
 		conn, err := dialProxy(p, d.dialTimeout, total, network, addr)
 		if err != nil {
+			Stats.DialFailures.Add(1)
 			log.Printf("serve: CONNECT %s via %s dial failed: %v", addr, p.URL(), err)
 			markFailed(p)
 			continue

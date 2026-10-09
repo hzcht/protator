@@ -35,11 +35,15 @@ record() {
 # fetch FRONT URL -> echoes "code<TAB>ms<TAB>body" (body on one line)
 fetch() {
     local front="$1" url="$2"
-    local args=(-s -o "$TMP/body" -w '%{http_code} %{time_total}'
+    local args=(-s -A 'servertest/1.0' -o "$TMP/body" -w '%{http_code} %{time_total}'
                 --max-time "$TIMEOUT" --connect-timeout 10)
     case "$front" in
         http)   args+=(-x "$HTTP_FRONT") ;;
-        https)  args+=(-k -x "$HTTPS_FRONT") ;;
+        # An HTTPS *proxy* needs two separate flags: -k for the target and
+        # --proxy-insecure for the proxy's own self-signed certificate. curl
+        # verifies the two chains independently, and skipping the second one
+        # fails every request with SEC_E_UNTRUSTED_ROOT (exit 52/56).
+        https)  args+=(-k --proxy-insecure -x "$HTTPS_FRONT") ;;
         socks5) args+=(-k --socks5-hostname "$SOCKS") ;;
         direct) args+=(--noproxy '*') ;;
     esac
@@ -94,7 +98,9 @@ EOF
             contains) printf '%s' "$lower" | grep -qiF "$(printf '%s' "$want" | tr 'A-Z' 'a-z')" && ok=1
                       why="contains '$want': $([ $ok -eq 1 ] && echo yes || echo no)" ;;
             regex)    printf '%s' "$body" | grep -qE "$want" && ok=1; why="matches /$want/: $([ $ok -eq 1 ] && echo yes || echo no)" ;;
-            ip)       printf '%s' "$body" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && ok=1; why="body '$body'" ;;
+            # IPv4 or IPv6: what matters is "this request left through another
+            # network", and some exits answer with their AAAA address.
+            ip)       printf '%s' "$body" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]*:[0-9a-fA-F:]*$' && ok=1; why="body '$body'" ;;
             ipjson)   printf '%s' "$body" | grep -qE '"ip"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.){3}[0-9]{1,3}"' && ok=1
                       why="ip field: $([ $ok -eq 1 ] && echo yes || echo no)" ;;
             nonempty) [ -n "$body" ] && ok=1; why="${#body} bytes" ;;
@@ -121,7 +127,7 @@ while [ $i -lt "$RUNS" ]; do
     IFS=$'\t' read -r code ms rc body <<EOF
 $(fetch http "https://api.ipify.org")
 EOF
-    if [ "$code" = "200" ] && printf '%s' "$body" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    if [ "$code" = "200" ] && printf '%s' "$body" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]*:[0-9a-fA-F:]*$'; then
         case "$seen" in *"$body"*) ;; *) seen="$seen $body" ;; esac
         lat_total=$((lat_total + ms)); lat_n=$((lat_n + 1))
         [ "$ms" -gt "$lat_max" ] && lat_max=$ms
@@ -141,8 +147,11 @@ fi
 # --- 3. front-end rules ---
 echo
 echo "-- rules (config: waste_hosts / block_connect) --"
+# Plain HTTP on purpose: waste_hosts is an absolute-URI request rule, it never
+# sees a CONNECT. Asking over https:// would tunnel to the real site and prove
+# nothing about the rule.
 IFS=$'\t' read -r code ms rc body <<EOF
-$(fetch http "https://analytics.google.com/")
+$(fetch http "http://analytics.google.com/")
 EOF
 if [ "$body" = "Waste" ] || printf '%s' "$body" | grep -q '^Waste'; then
     record PASS "waste_hosts" "short-circuited with 'Waste'"

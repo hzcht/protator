@@ -13,7 +13,7 @@ param(
     [string]$HttpFront = "http://127.0.0.1:8888",
     [string]$HttpsFront = "https://127.0.0.1:8443",
     [string]$Socks = "127.0.0.1:1080",
-    [string]$UrlsFile = (Join-Path $PSScriptRoot "urls.txt"),
+    [string]$UrlsFile = "",
     [int]$Runs = 8,                 # rotation samples against the echo endpoint
     [int]$TimeoutSec = 25,
     [string[]]$Fronts = @("http", "https", "socks5")
@@ -21,6 +21,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+# urls.txt lives next to this script; resolve it whether the script is run with
+# -File (no $PSScriptRoot) or dot-sourced, and from any working directory.
+if (-not $UrlsFile) {
+    $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if (-not $dir) { $dir = "servertest" }
+    $UrlsFile = Join-Path $dir "urls.txt"
+}
+if (-not (Test-Path -LiteralPath $UrlsFile)) {
+    throw "urls.txt not found (looked in $UrlsFile); pass -UrlsFile explicitly"
+}
 
 $script:pass = 0
 $script:warn = 0
@@ -41,17 +52,23 @@ function Record([string]$verdict, [string]$name, [string]$detail, [double]$ms) {
 }
 
 # Runs one curl invocation through a front and returns @{code; body; ms; err}.
-function Fetch([string]$front, [string]$url, [string]$extraArgs) {
+# Args are passed as an array: an HTTPS *proxy* needs -k for the target AND
+# --proxy-insecure for the proxy's own self-signed certificate, because curl
+# verifies those two chains separately. Missing the second one fails every
+# request with SEC_E_UNTRUSTED_ROOT (curl exit 52/56), which is exactly what a
+# plain "-k -x https://host" test does.
+function Fetch([string]$front, [string]$url, [string[]]$extraArgs) {
     $body = [System.IO.Path]::GetTempFileName()
     try {
-        $meta = [System.IO.Path]::GetTempFileName()
-        $args = @("-s", "-o", $body, "-w", "%{http_code} %{time_total}",
-                  "--max-time", "$TimeoutSec", "--connect-timeout", "10")
-        if ($extraArgs) { $args += ($extraArgs -split "\s+(\?=[-/])" | Where-Object { $_ -ne "" }) }
-        $args += $url
+        # NB: not $args - that is a PowerShell automatic variable and assigning
+        # to it silently misbehaves.
+        $curlArgs = @("-s", "-A", "servertest/1.0", "-o", $body, "-w", "%{http_code} %{time_total}",
+                      "--max-time", "$TimeoutSec", "--connect-timeout", "10")
+        if ($extraArgs) { $curlArgs += $extraArgs }
+        $curlArgs += $url
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "curl"
-        $psi.Arguments = ($args | ForEach-Object { '"' + $_ + '"' }) -join " "
+        $psi.Arguments = ($curlArgs | ForEach-Object { '"' + $_ + '"' }) -join " "
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $psi.UseShellExecute = $false
@@ -68,17 +85,17 @@ function Fetch([string]$front, [string]$url, [string]$extraArgs) {
         if ($null -eq $text) { $text = "" }
         return @{ code = $code; body = $text.Trim(); ms = $ms; err = $p.ExitCode }
     } finally {
-        Remove-Item $body, $meta -Force -ErrorAction SilentlyContinue
+        Remove-Item $body -Force -ErrorAction SilentlyContinue
     }
 }
 
 function ProxyArgs([string]$front) {
     switch ($front) {
-        "http"   { return "-x `"$HttpFront`"" }
-        "https"  { return "-k -x `"$HttpsFront`"" }   # self-signed cert on our front
-        "socks5" { return "-k --socks5-hostname `"$Socks`"" }
+        "http"   { return @("-x", $HttpFront) }
+        "https"  { return @("-k", "--proxy-insecure", "-x", $HttpsFront) } # self-signed front cert
+        "socks5" { return @("-k", "--socks5-hostname", $Socks) }
     }
-    return ""
+    return @()
 }
 
 function DirectArgs() { return "--noproxy *" }
@@ -87,7 +104,7 @@ Write-Host "servertest: fronts http=$HttpFront https=$HttpsFront socks5=$Socks" 
 Write-Host ""
 
 # --- 0. where do we sit from here? (for the exit-IP and leak comparisons) ---
-$direct = Fetch "direct" "https://api.ipify.org" "--noproxy *"
+$direct = Fetch "direct" "https://api.ipify.org" @("--noproxy", "*")
 $myIp = ($direct.body -split "[^0-9.]" | Where-Object { $_ -match "^\d+\.\d+\.\d+\.\d+$" } | Select-Object -First 1)
 if ($direct.code -ne 200 -or -not $myIp) {
     Write-Host "cannot reach the internet directly ($($direct.code)); running the tests but the" -ForegroundColor Yellow
@@ -110,7 +127,7 @@ foreach ($front in $Fronts) {
         $r = Fetch $front $url (ProxyArgs $front)
         $name = "$front $($url -replace '^https?://', '')"
         if ($r.err -ne 0 -and $r.code -eq 0) {
-            Record "FAIL" $name "curl exit $($r.err) (dial/tunnel failed)"
+            Record "FAIL" $name "curl exit $($r.err) (dial/tunnel failed)" ([int]$r.ms)
             continue
         }
         $body = $r.body
@@ -120,21 +137,23 @@ foreach ($front in $Fronts) {
             "status"   { $ok = ($r.code -eq [int]$want); $why = "status $($r.code), want $want" }
             "contains" { $ok = ($body -match [regex]::Escape($want)); $why = "contains '$want': $ok" }
             "regex"    { $ok = ($body -match $want); $why = "matches /$want/: $ok" }
-            "ip"       { $ok = ($body -match "^\d{1,3}(\.\d{1,3}){3}$"); $why = "body '$body'" }
+            # IPv4 or IPv6: what matters is "this request left through another
+            # network", and some exits answer with their AAAA address.
+            "ip"       { $ok = ($body -match "^([0-9]{1,3}(\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:]*)$"); $why = "body '$body'" }
             "ipjson"   { $ok = ($body -match '"ip"\s*:\s*"\d{1,3}(\.\d{1,3}){3}"'); $why = "ip field: $ok" }
             "nonempty" { $ok = ($body.Length -gt 0); $why = "$($body.Length) bytes" }
             "noleak"   {
-                if ($myIp -eq "") { Record "WARN" $name "leak check skipped (no direct IP)"; continue }
+                if ($myIp -eq "") { Record "WARN" $name "leak check skipped (no direct IP)" ([int]$r.ms); continue }
                 $ok = ($body -notmatch [regex]::Escape($myIp))
                 $why = if ($ok) { "our IP not present" } else { "OUR IP $myIp LEAKED in the response" }
             }
         }
         if (-not $ok -and $r.code -eq 200) {
-            Record "FAIL" $name "$why; body starts: $($body.Substring(0, [Math]::Min(80, $body.Length)))"
+            Record "FAIL" $name "$why; body starts: $($body.Substring(0, [Math]::Min(80, $body.Length)))" ([int]$r.ms)
         } elseif (-not $ok) {
-            Record "FAIL" $name $why
+            Record "FAIL" $name $why ([int]$r.ms)
         } else {
-            Record "PASS" $name $why
+            Record "PASS" $name $why ([int]$r.ms)
         }
     }
 }
@@ -146,7 +165,7 @@ $seen = @{}
 $latencies = @()
 for ($i = 0; $i -lt $Runs; $i++) {
     $r = Fetch "http" "https://api.ipify.org" (ProxyArgs "http")
-    if ($r.code -eq 200 -and $r.body -match "^\d{1,3}(\.\d{1,3}){3}$") {
+    if ($r.code -eq 200 -and $r.body -match "^([0-9]{1,3}(\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:]*)$") {
         $seen[$r.body] = $true
         $latencies += $r.ms
     }
@@ -167,7 +186,10 @@ if ($latencies.Count -gt 1) {
 # --- 3. the front-end rules must still be applied ---
 Write-Host ""
 Write-Host "-- rules (config: waste_hosts / block_connect) --" -ForegroundColor Cyan
-$r = Fetch "http" "https://analytics.google.com/" (ProxyArgs "http")
+# Plain HTTP on purpose: waste_hosts is an absolute-URI request rule, it never
+# sees a CONNECT. Asking over https:// would tunnel to the real site and prove
+# nothing about the rule.
+$r = Fetch "http" "http://analytics.google.com/" (ProxyArgs "http")
 if ($r.body -match "^Waste") {
     Record "PASS" "waste_hosts" "short-circuited with 'Waste'"
 } else {
