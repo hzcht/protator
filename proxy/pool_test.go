@@ -140,7 +140,7 @@ func TestCandidatePoolIgnoresGarbageLines(t *testing.T) {
 
 // The pool must stay usable at the cap instead of refusing work: it rotates
 // (oldest evicted, newest kept), and the rotation survives a reload. Dropping
-// the newest entries вЂ” the old behaviour вЂ” threw away exactly the transient
+// the newest entries — the old behaviour — threw away exactly the transient
 // failures the pool exists to keep, while the oldest (already re-probed many
 // times) squatted on the capacity forever.
 func TestCandidatePoolRotatesAtCap(t *testing.T) {
@@ -230,6 +230,10 @@ func TestCandidatePoolCompactsUnderRotation(t *testing.T) {
 			t.Fatalf("add %d refused", i)
 		}
 	}
+	// Compaction is asynchronous (it rewrites and fsyncs the whole file, which
+	// must not run under the mutex that hundreds of checker workers share), so
+	// close the pool and let its final compaction finish before reading.
+	pool.Close()
 	if lines, _ := readLines(path); len(lines) != 10 {
 		t.Fatalf("file has %d lines, want 10 (compaction did not run)", len(lines))
 	}

@@ -36,16 +36,23 @@ protator/
 │   ├── proxy.go            # main() + wiring (buildPipeline, startCollector)
 │   ├── servers.go          # HTTP/HTTPS/SOCKS5 listeners
 │   ├── loops.go            # Wiring + housekeeping loops (save, stats)
-│   ├── admin.go            # Admin listener (mixed HTTP/HTTPS)
-│   ├── adminapi.go         # Admin JSON API + WebSocket
-│   ├── adminassets.go      # Embedded UI (HTML/CSS/JS)
-│   ├── logfiles.go         # Per-category rotating log sinks
+│   ├── workers.go          # checkerWorkers: validation pool + supervisor
+│   ├── beats.go            # Subsystem heartbeats (last cycle/pass/save) + exposure warning
+│   ├── admin.go            # Admin listener (mixed HTTP/HTTPS) + routes
+│   ├── adminapi.go         # Admin JSON handlers + shared admin struct
+│   ├── adminhealth.go      # /health, /ready, /api/metrics, /api/logs, /api/config, token
+│   ├── adminlive.go        # liveRow, live page, delta, CSV/text exporters
+│   ├── adminws.go          # wsHub: WebSocket connections, diff, coalesced notifier
+│   ├── adminassets.go      # //go:embed of adminweb/{index.html,admin.css,admin.js}
+│   ├── adminweb/           # The real UI files (HTML/CSS/JS)
+│   ├── logfiles.go         # Per-category rotating log sinks + in-memory tail
 │   ├── logging.go          # noiseWriter (TLS noise filter + goproxy WARN coalesce)
 │   ├── start.ps1           # Ops: start/restart
 │   └── stop.ps1            # Ops: graceful stop
 ├── proxy/                   # Core logic
 │   ├── model.go            # Proxy, Candidate, atomic health stats
-│   ├── bucket.go           # Live queue, PickHealthy, per-source counts, LiveList, Subscribe
+│   ├── bucket.go           # Live queue, hot tail, LiveList, Subscribe
+│   ├── pick.go             # Serving-path policy: proof tiers, rankPick, PickHealthy
 │   ├── pipeline.go         # RunCheckLoop (candidate -> pool/bucket), RevalidateSeeded
 │   ├── revalidate.go       # RevalidateLoop / RevalidateMany (stale-first)
 │   ├── poolloop.go         # PoolReprobeLoop (adaptive re-probe batch)
@@ -53,19 +60,21 @@ protator/
 │   ├── collector.go        # Site scraping + extraction
 │   ├── upstream.go         # ForwardDialer with failover + passive feedback
 │   ├── dial.go             # CONNECT, SOCKS, VLESS (uTLS + REALITY)
-│   ├── extract.go          # Regex + spys XOR + document.write JS
-│   ├── pool.go             # CandidatePool (persisted failed candidates, rotating)
+│   ├── extract.go          # Regex + spys XOR + document.write JS + whole-body base64
+│   ├── pool.go             # CandidatePool (rotating, async compaction)
 │   ├── debugproxies.go     # Rolling window of freshly validated proxies
 │   ├── sitestats.go        # SiteRegistry (telemetry + cooldown + priority)
+│   ├── stats.go            # Process-wide counter registry (proxy.Stats)
+│   ├── guard.go            # RecoverPanic / GuardedSend (panic -> log + counter)
 │   ├── config.go           # TOML config structs + fillDefaults
 │   ├── store.go            # File I/O (sites, queue, regex, atomic saves)
 │   ├── socks5_server.go    # RFC 1928 SOCKS5 front-end
 │   ├── tlsutil.go          # Cert loading / self-signed generation
 │   ├── browser.go          # Playwright headless fallback
-│   ├── sticky.go           # Connection/session pinning
+│   ├── sticky.go           # Connection/session pinning (LRU pool)
 │   └── transport.go        # ProxyTransport (request-level failover + block detection)
 ├── util/                    # Legacy stub (keep as-is)
-└── docs/                    # Architecture, Developer guide
+└── docs/                    # Architecture, Developer guide, extractor/regex notes
 ```
 
 ## 3. Key Design Principles
@@ -175,16 +184,43 @@ max_candidates_per_site = 1000
 | Shorten `pick_fresh_window` below `revalidate_interval` | Picker falls back to unproven bulk | Keep `pick_fresh_window > revalidate_interval` |
 | Bypass `noiseWriter` for admin listener | TLS handshake noise floods logs | Use `newAdminServer(a, logNoise)` |
 | Modify `CandidatePool` lines directly | Breaks source attribution | Use `Add`/`Batch`/`Good` methods |
+| Put the worker stop channel in `buildPipeline`'s defers | Every worker exits before the first request | Stop them from `main` (`checkerWorkers.stopAndWait`) |
+| Add `default:` to `RunCheckLoop`'s select | Idle workers spin the CPU at 100% | Let the select block; regression-test asserts it |
+| Move the pool rewrite back under `mu` | Checker stalls for every fsync | Use `compactAsync` (snapshot → write → flush) |
+| Call `log.Fatalf` outside a bind path | Skips every defer: no queue save | Log and keep serving |
+| Read `Len()` in `/ready` | Supervisor keeps a dead proxy in rotation | Use `Bucket.ProvenCount` |
 | Hardcode ports in tests | Flaky on CI | Use `net.Listen("tcp", "127.0.0.1:0")` |
 
 ## 9. Debugging
 
 ### Live proxy for manual testing
 ```powershell
-# debug_proxies.txt has last 50 validated proxies
-Get-Content main/debug_proxies.txt | Select-Object -Last 5
+# config/data/debug_proxies.txt has the last 50 validated proxies
+Get-Content data/debug_proxies.txt | Select-Object -Last 5
 # Copy one URL, test in browser:
 # curl -x socks5://1.2.3.4:1080 https://httpbin.org/ip
+```
+
+### Metrics
+```powershell
+# Counters + per-second rates + gauges (call twice for a rate window)
+Invoke-RestMethod http://127.0.0.1:9090/api/metrics
+
+# Prometheus text format
+Invoke-WebRequest http://127.0.0.1:9090/api/metrics?format=text
+
+# Per-category log tail, no SSH
+Invoke-RestMethod "http://127.0.0.1:9090/api/logs?category=collector&limit=50"
+```
+Every counter lives in `proxy/stats.go`; a loop or failure mode with no
+counter is invisible during an incident, so add one when you add a subsystem.
+The 1-minute `queue:` line already prints the rates (serve, dial-fail,
+eviction, checks) alongside the queue counts.
+
+### Profiling
+```powershell
+# CPU profile, 30s (pprof is served on the admin port, behind admin_token)
+go tool pprof http://127.0.0.1:9090/debug/pprof/profile?seconds=30
 ```
 
 ### Admin API inspection
@@ -192,7 +228,19 @@ Get-Content main/debug_proxies.txt | Select-Object -Last 5
 Invoke-RestMethod http://127.0.0.1:9090/health
 Invoke-RestMethod "http://127.0.0.1:9090/api/proxies?scope=hot&format=text"
 Invoke-RestMethod http://127.0.0.1:9090/api/sources
+Invoke-RestMethod http://127.0.0.1:9090/api/config
 ```
+
+### Benchmarks
+
+```powershell
+go test ./proxy/ -run XXX -bench . -benchtime 200x
+```
+
+`pick_bench_test.go` covers the five hot paths (pick, live page, queue save,
+pool add, pin set). `LiveListPage` once spent 146k allocations per admin
+request because the sort comparator called `Key(); never build a URL inside a
+comparator.
 
 ### Log categories
 ```
@@ -277,8 +325,11 @@ gofmt -l main proxy util
 # Single test with race detector (requires gcc - won't work here)
 # go test -race ./proxy/ -run TestName
 
-# Profile checker (requires running instance)
+# Profile the running process (served on the admin port, behind admin_token)
 go tool pprof http://127.0.0.1:9090/debug/pprof/profile?seconds=30
+
+# Counters and rates (Prometheus scrape format)
+curl -s "http://127.0.0.1:9090/api/metrics?format=text"
 
 # Check config without starting
 go run ./main -config config/config.toml -check

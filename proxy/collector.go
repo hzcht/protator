@@ -28,11 +28,25 @@ type Collector struct {
 	stats   *SiteRegistry
 	seen    map[string]time.Time
 	seenMu  sync.Mutex
+	// seenSwept is when the last expiry sweep of seen ran, so the sweep is
+	// amortized over time instead of running on every candidate once the map
+	// is over its cap (see seenRecently).
+	seenSwept time.Time
 
-	// transportCache caches http.Transport per proxy address for via-proxy fetches.
-	// Key: "schema://host:port", Value: *http.Transport
+	// transportCache caches http.Transport per proxy address for via-proxy
+	// fetches. Key: "schema://host:port", Value: *http.Transport
 	transportCache sync.Map
+	// transportCacheSize tracks the entries above so the cache can be bounded.
+	// The via-proxy fallback tries a different upstream on every failure, so
+	// this grew with the number of distinct upstreams ever used — with no
+	// limit on idle connections per transport, each one pinned its sockets to
+	// a dead proxy for the life of the process.
+	transportCacheSize int64
 }
+
+// collectorTransportCacheMax bounds the via-proxy transport cache. Matches the
+// checker's own cap.
+const collectorTransportCacheMax = 1000
 
 var defaultUAs = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -130,6 +144,10 @@ func (c *Collector) cycle(ctx context.Context, sites []string, out chan<- Candid
 		go func(url string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// Per site: this parses arbitrary scraped HTML and browser output.
+			// A panic here would otherwise exit the process, and wg.Wait below
+			// would never return, so the recovery has to come after wg.Done.
+			defer RecoverPanic("collector: site " + url)
 			if n := c.fetch(ctx, url, out); n >= 0 {
 				atomic.AddInt64(&okSites, 1)
 				atomic.AddInt64(&totalCands, int64(n))
@@ -140,6 +158,10 @@ func (c *Collector) cycle(ctx context.Context, sites []string, out chan<- Candid
 	}
 	wg.Wait()
 	c.stats.SetAlive(c.aliveBySource())
+	Stats.CollectorCycles.Add(1)
+	Stats.CollectorSitesOK.Add(okSites)
+	Stats.CollectorSitesFailed.Add(failSites)
+	Stats.CandidatesEmitted.Add(totalCands)
 	log.Printf("collector: cycle done (%d sites: %d ok, %d failed, %d candidates)",
 		len(sites), okSites, failSites, totalCands)
 }
@@ -560,11 +582,12 @@ func (c *Collector) extractViaProxy(site string, p *Proxy) fetchResult {
 // getTransport returns a cached http.Transport for the given proxy.
 // Transports are cached per proxy address to enable connection reuse.
 //
-// timeout is not used: the client that owns this transport sets the whole
-// request budget, and a transport DialContext timeout would double it. Keeping
-// the parameter would leave the impression that it bounds the dial here.
+// The transport has real idle limits: keep-alives are on here (unlike the
+// serving transport), so without them each cached transport holds its sockets
+// to a dead upstream forever. The cache is bounded and eviction closes the
+// idle connections it drops.
 func (c *Collector) getTransport(p *Proxy, proxyURL *url.URL) *http.Transport {
-	key := p.URL()
+	key := p.Key()
 	if tr, ok := c.transportCache.Load(key); ok {
 		return tr.(*http.Transport)
 	}
@@ -572,10 +595,49 @@ func (c *Collector) getTransport(p *Proxy, proxyURL *url.URL) *http.Transport {
 		Proxy: http.ProxyURL(proxyURL),
 		// https-schema proxies routinely present IP-SAN-less certs; the pool
 		// self-validates them elsewhere, this fetch must not fail on that.
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          4,
+		MaxIdleConnsPerHost:   2,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
-	actual, _ := c.transportCache.LoadOrStore(key, tr)
-	return actual.(*http.Transport)
+	actual, loaded := c.transportCache.LoadOrStore(key, tr)
+	if loaded {
+		tr.CloseIdleConnections() // lost the race; do not leak this handle
+		return actual.(*http.Transport)
+	}
+	if atomic.AddInt64(&c.transportCacheSize, 1) > collectorTransportCacheMax {
+		// Evict one entry, and never the one just inserted: sync.Map.Range
+		// order is undefined, so it can hand back `key` itself, and the
+		// transport would then be uncached despite having been stored.
+		c.transportCache.Range(func(k, v interface{}) bool {
+			if kk, _ := k.(string); kk == key {
+				return true // keep looking
+			}
+			if old, ok := v.(*http.Transport); ok {
+				old.CloseIdleConnections()
+			}
+			c.transportCache.Delete(k)
+			atomic.AddInt64(&c.transportCacheSize, -1)
+			return false
+		})
+	}
+	return tr
+}
+
+// CloseTransportCache drops every cached via-proxy transport and its idle
+// connections. Called on shutdown so the fetcher does not hold sockets open
+// past exit.
+func (c *Collector) CloseTransportCache() {
+	c.transportCache.Range(func(k, v interface{}) bool {
+		if tr, ok := v.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+		c.transportCache.Delete(k)
+		atomic.AddInt64(&c.transportCacheSize, -1)
+		return true
+	})
 }
 
 // shortErr trims verbose network errors for one-line logs.
@@ -622,20 +684,35 @@ func isCaptchaBody(body []byte) bool {
 	return false
 }
 
-// seenRecently skips candidates already pushed within the last 10 minutes.
+// seenCap bounds the dedup map, and seenSweepInterval is how often expiry is
+// actually run once it is full.
+const (
+	seenCap           = 100000
+	seenWindow        = 10 * time.Minute
+	seenSweepInterval = 1 * time.Minute
+)
+
+// seenRecently skips candidates already pushed inside seenWindow.
 // The key is built without fmt.Sprintf: the collector emits thousands of
 // candidates per cycle and the format call dominated the dedup path.
+//
+// The expiry sweep is rate-limited by seenSwept. Gating it on len(seen) alone
+// made it run on *every* candidate once the map was over the cap — which is
+// this collector's normal operating rate, since more than a hundred thousand
+// candidates inside ten minutes is the rule, not the exception. Every emit
+// then walked the whole map under seenMu.
 func (c *Collector) seenRecently(cand Candidate) bool {
 	key := cand.Schema + "://" + cand.Host + ":" + strconv.Itoa(cand.Port)
 	now := time.Now()
 	c.seenMu.Lock()
 	defer c.seenMu.Unlock()
-	if t, ok := c.seen[key]; ok && now.Sub(t) < 10*time.Minute {
+	if t, ok := c.seen[key]; ok && now.Sub(t) < seenWindow {
 		return true
 	}
-	if len(c.seen) > 100000 {
+	if len(c.seen) > seenCap && now.Sub(c.seenSwept) > seenSweepInterval {
+		c.seenSwept = now
 		for k, t := range c.seen {
-			if now.Sub(t) > 10*time.Minute {
+			if now.Sub(t) > seenWindow {
 				delete(c.seen, k)
 			}
 		}

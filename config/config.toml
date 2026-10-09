@@ -96,15 +96,27 @@ serve_pin_max = 100000
 shutdown_timeout = "10s"
 # Admin UI + health endpoints, all on one port that answers both HTTP and
 # HTTPS (the first byte of each connection decides, so http:// and https:// on
-# the same address both work). Empty = disabled. No auth — bind to 127.0.0.1
-# unless the host is firewalled.
-#   GET  /             admin page: live proxies, per-source stats, sites.txt editor
-#   GET  /health       queue/pool state as JSON
-#   GET  /ready        200 while the queue has live proxies, 503 otherwise
+# the same address both work). Empty = disabled.
+#   GET  /             admin page: live proxies, per-source stats, 24h graph, sites.txt editor
+#   GET  /health       counters + loop heartbeats + gauges (always open)
+#   GET  /ready        200 while the queue has *proven* proxies, 503 otherwise (always open)
+#   GET  /api/metrics  counters + per-second rates; &format=text for Prometheus
+#   GET  /api/logs     in-memory log tail: ?category=collector|checker|serve|system&limit=200
+#   GET  /api/config   effective config, secrets redacted
 #   GET  /api/sources  per-source telemetry (alive, yield, cooldown, last note)
-#   GET  /api/proxies  ?scope=hot|served|checked|all, add &format=text to download
+#   POST /api/sources/cooldown   clear a source's failure cooldown
+#   POST /api/collector/wake     force a collector cycle now
 #   GET/POST/DELETE /api/sites  read and edit sites.txt in place (atomic + .bak)
+#   GET  /api/proxies  ?scope=hot|served|checked|all, format=text|csv|jsonl to download
+#   POST /api/proxies/revalidate  re-check the given proxies through the full checker
+#   WebSocket /ws      live health/proxy/source deltas
+# Everything except /health and /ready needs admin_token when it is set (a
+# Bearer header, or ?token= on the URL). The page remembers a token given on the
+# URL, so https://host:9090/?token=... works as a login link. Leave empty on a
+# loopback bind; the process warns loudly when a non-loopback listener has no
+# token, because the page can edit sites.txt and drop proxies.
 admin_listen = "127.0.0.1:9090"
+# admin_token = "change-me"
 
 [socks5]
 # Local SOCKS5 front-end; tunnels to a random live proxy.

@@ -305,3 +305,35 @@ https://raw.githubusercontent.com/stormsia/proxy-list/refs/heads/main/working_pr
 https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.csv
 https://raw.githubusercontent.com/ebrasha/abdal-proxy-hub/refs/heads/main/https-proxy-list-by-EbraSha.txt
 https://raw.githubusercontent.com/mzyui/proxy-list/refs/heads/main/output/all.json
+# ---- API-style endpoints: no HTML, so the extractor cost is one JSON parse ----
+# These are the most valuable additions in a long time: they answer in
+# milliseconds, carry structured records, and put no scraping pressure on a
+# human-readable page. emoji-free by design (a source list is data, not chat).
+https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all
+https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all
+https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_format=protocolipport&format=text&protocol=http
+https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_format=protocolipport&format=text&protocol=socks5
+https://www.proxy-list.download/api/v1/get?type=http
+https://www.proxy-list.download/api/v1/get?type=socks5
+https://api.openproxylist.xyz/http.txt
+https://api.openproxylist.xyz/socks5.txt
+https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc
+https://openproxy.space/list/http
+https://openproxy.space/list/socks5
+https://proxylist.icu/api/proxies?limit=200&page=1
+https://pubproxy.com/api/proxy?limit=20&format=txt&type=http
+https://multiproxy.org/txt_all/proxy.txt
+https://raw.githubusercontent.com/zloi-user/hideip.me/master/http.txt
+https://raw.githubusercontent.com/zloi-user/hideip.me/master/socks5.txt
+https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt
+https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt
+https://raw.githubusercontent.com/sunny9577/proxy-scraper/main/proxies.txt
+https://raw.githubusercontent.com/proxylist/to/proxy/list/all.txt
+https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt
+https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt
+
+# ---- Telegram channel mirrors (t.me/s/... renders without an API key) ----
+# High churn: fresh, dead fast, cheap to try. The cooldown logic keeps them
+# from being a problem when they 404.
+https://t.me/s/proxylist
+https://t.me/s/proxy_list

@@ -3,31 +3,55 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/net/websocket"
 	"protator/proxy"
 )
 
 // admin holds the live handles the HTTP surface reads from. Everything here
-// is read-only except the sites editor, and nothing holds a lock while
+// is read-only except the sites editor and the two action endpoints (forced
+// revalidation, source cooldown reset), and nothing holds a lock while
 // rendering: the bucket, pool and registry each hand out copies.
+//
+// The three mutex-protected concerns are deliberately narrow:
+//   - sitesMu serializes the editor's read-modify-write of sites.txt;
+//   - statsMu guards the 24h history ring;
+//   - metricsMu guards the two metrics samples a rate is computed from.
+//
+// WebSocket state is not here: it lives in wsHub (adminws.go), because four
+// mutexes on one struct is how a connection set ends up guarded by the lock
+// that also protects the stats history.
 type admin struct {
 	cfg       *proxy.Config
+	cfgPath   string
 	bucket    *proxy.Bucket
 	pool      *proxy.CandidatePool
 	collector *proxy.Collector
 	checker   *proxy.Checker
 	debug     *proxy.DebugProxies
+	sink      *fileLogSink
+	beats     *beats
+	workers   *checkerWorkers
+	// candidates is the validation channel; only its depth is read, for the
+	// health view. nil in tests.
+	candidates <-chan proxy.Candidate
+
+	// tlsConfigured records whether the mixed listener has a certificate. The
+	// WebSocket frame carries no TLS state, so the live updates report the
+	// listener's.
+	tlsConfigured bool
 	// ctx is the process lifetime context: the forced-revalidation action
 	// spawns work that must outlive the HTTP request that asked for it.
 	ctx     context.Context
 	started time.Time
+
+	// wakeCollector is the emergency-cycle kick: the same channel the
+	// empty-queue watchdog uses. Set by startAdminServer; nil in tests.
+	wakeCollector chan<- struct{}
 
 	// sitesMu serializes the editor's read-modify-write. Two POSTs racing on
 	// the same file would both read the old list and the second save would
@@ -35,29 +59,18 @@ type admin struct {
 	// need to, because the save is an atomic rename.
 	sitesMu sync.Mutex
 
-	// stats history ring buffer for 24h graph (1 sample per minute = 1440 entries)
-	statsMu    sync.Mutex
-	statsHist  []statsSample
-	statsTimer *time.Timer
+	// statsMu guards the 24h history ring (1 sample per minute = 1440 entries).
+	statsMu   sync.Mutex
+	statsHist []statsSample
 
-	// WebSocket connections for live updates
-	wsMu    sync.Mutex
-	wsConns map[*wsConn]struct{}
+	ws *wsHub
 
-	// Delta WS updates: track previous proxy state to send incremental updates.
-	wsMuPrev    sync.Mutex
-	prevProxies map[string]liveRow // key = proxy URL
-	prevHealth  map[string]int
-
-	// Coalesced change flags from bucket.Subscribe (cap 1: a pending flag is
-	// all startWSNotifier needs).
-	wsNotify chan struct{}
-}
-
-type wsConn struct {
-	conn   *websocket.Conn
-	send   chan []byte
-	closed bool
+	// metricsMu guards lastMetrics/lastMetricsAt: the pair the rate window is
+	// computed from, so two concurrent /api/metrics calls must not interleave.
+	metricsMu        sync.Mutex
+	lastMetrics      map[string]int64
+	lastMetricsAt    time.Time
+	hasMetricsSample bool
 }
 
 type statsSample struct {
@@ -65,234 +78,84 @@ type statsSample struct {
 	QueueLive      int       `json:"queue_live"`
 	QueueHot       int       `json:"queue_hot"`
 	PoolCandidates int       `json:"pool_candidates"`
+	// Serving and validation rates in the minute that produced the sample:
+	// the queue lengths say how big the pool is, these say whether it is
+	// getting better or worse.
+	RequestsPerMin float64 `json:"requests_per_min"`
+	ChecksPerMin   float64 `json:"checks_per_min"`
+	DialFailPerMin float64 `json:"dial_fail_per_min"`
 }
 
 // recordStatsSample adds a sample to the 24h ring buffer (1440 minutes max).
 func (a *admin) recordStatsSample() {
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
-	s := statsSample{
-		Time:           time.Now(),
+	now := time.Now()
+	rpm, cpm, dpm := 0.0, 0.0, 0.0
+	if a.hasMetricsSample && !a.lastMetricsAt.IsZero() {
+		mins := now.Sub(a.lastMetricsAt).Minutes()
+		if mins > 0 {
+			c := proxy.Stats.Snapshot()
+			rpm = deltaPerMin(c["requests_total"], a.lastMetrics["requests_total"], mins)
+			cpm = deltaPerMin(c["checks_total"], a.lastMetrics["checks_total"], mins)
+			dpm = deltaPerMin(c["dial_failures_total"], a.lastMetrics["dial_failures_total"], mins)
+		}
+	}
+	a.statsHist = append(a.statsHist, statsSample{
+		Time:           now,
 		QueueLive:      a.bucket.Len(),
 		QueueHot:       a.bucket.HotLen(),
 		PoolCandidates: a.pool.Len(),
-	}
-	a.statsHist = append(a.statsHist, s)
+		RequestsPerMin: rpm,
+		ChecksPerMin:   cpm,
+		DialFailPerMin: dpm,
+	})
 	if len(a.statsHist) > 1440 {
-		// Keep only last 24h (1440 minutes)
+		// Keep only the last 24h (1440 minutes).
 		copy(a.statsHist, a.statsHist[len(a.statsHist)-1440:])
 		a.statsHist = a.statsHist[:1440]
 	}
 }
 
-// startStatsRecorder begins recording stats every minute.
-func (a *admin) startStatsRecorder(ctx context.Context) {
-	a.statsTimer = time.AfterFunc(time.Minute, func() {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			a.recordStatsSample()
-			a.startStatsRecorder(ctx)
-		}
-	})
+// deltaPerMin turns a counter delta over minutes into a per-minute rate.
+func deltaPerMin(now, prev int64, mins float64) float64 {
+	if now <= prev {
+		return 0
+	}
+	return float64(now-prev) / mins
 }
 
-// handleStatsHistory returns the 24h stats history for graphing.
-func (a *admin) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
+// startStatsRecorder begins recording stats every minute. It re-arms itself
+// with AfterFunc so a slow sample cannot pile up ticks behind it, and it stops
+// when the process context is done.
+func (a *admin) startStatsRecorder(ctx context.Context) {
+	var arm func()
+	arm = func() {
+		time.AfterFunc(time.Minute, func() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				a.recordStatsSample()
+				arm()
+			}
+		})
+	}
+	arm()
+}
+
+// statsHistory returns a copy of the 24h ring.
+func (a *admin) statsHistory() []statsSample {
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
-	writeJSON(w, map[string]interface{}{
-		"samples": a.statsHist,
-	})
+	out := make([]statsSample, len(a.statsHist))
+	copy(out, a.statsHist)
+	return out
 }
 
-// handleWebSocket upgrades a connection to a WebSocket for live updates.
-func (a *admin) handleWebSocket(ws *websocket.Conn) {
-	c := &wsConn{conn: ws, send: make(chan []byte, 256)}
-	a.wsMu.Lock()
-	if a.wsConns == nil {
-		a.wsConns = make(map[*wsConn]struct{})
-	}
-	a.wsConns[c] = struct{}{}
-	a.wsMu.Unlock()
-
-	// Send initial state
-	a.sendWSState(c)
-
-	// Writer goroutine
-	go func() {
-		for msg := range c.send {
-			// closed is only ever written under wsMu (closeWS), so read it
-			// under the same lock instead of racing the writer.
-			a.wsMu.Lock()
-			closed := c.closed
-			a.wsMu.Unlock()
-			if closed {
-				return
-			}
-			if err := websocket.Message.Send(ws, string(msg)); err != nil {
-				a.closeWS(c)
-				return
-			}
-		}
-	}()
-
-	// Reader: keep alive, ignore messages
-	var msg string
-	for {
-		if err := websocket.Message.Receive(ws, &msg); err != nil {
-			a.closeWS(c)
-			return
-		}
-	}
+func (a *admin) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]interface{}{"samples": a.statsHistory()})
 }
-
-func (a *admin) closeWS(c *wsConn) {
-	a.wsMu.Lock()
-	if !c.closed {
-		c.closed = true
-		close(c.send)
-		delete(a.wsConns, c)
-	}
-	a.wsMu.Unlock()
-}
-
-// broadcastWS sends a message to all connected WebSocket clients.
-func (a *admin) broadcastWS(msg []byte) {
-	a.wsMu.Lock()
-	for c := range a.wsConns {
-		select {
-		case c.send <- msg:
-		default:
-			// Client buffer full, drop
-		}
-	}
-	a.wsMu.Unlock()
-}
-
-// sendWSState sends the current state to a newly connected client.
-func (a *admin) sendWSState(c *wsConn) {
-	a.statsMu.Lock()
-	hist := make([]statsSample, len(a.statsHist))
-	copy(hist, a.statsHist)
-	a.statsMu.Unlock()
-
-	live := a.liveDelta()
-	sources := a.sources()
-
-	msg := map[string]interface{}{
-		"type":    "state",
-		"health":  map[string]interface{}{"queue_live": a.bucket.Len(), "queue_hot": a.bucket.HotLen(), "pool_candidates": a.pool.Len()},
-		"proxies": live,
-		"sources": sources,
-		"history": hist,
-	}
-	data, _ := json.Marshal(msg)
-	select {
-	case c.send <- data:
-	default:
-	}
-}
-
-// requestWSNotify flags the live view as dirty. It is the only work done on
-// the mutation path, so it must stay cheap: no queue scan, no allocation, no
-// blocking (the channel is cap 1, a pending flag is idempotent).
-func (a *admin) requestWSNotify() {
-	if a.wsNotify == nil {
-		return
-	}
-	select {
-	case a.wsNotify <- struct{}{}:
-	default:
-	}
-}
-
-// startWSNotifier turns the per-mutation flags into at most one delta
-// broadcast per tick. The checker adds and revalidation drops arrive in
-// bursts of hundreds per second; recomputing a whole-queue diff for each one
-// inline would put admin bookkeeping in the hot path of every worker.
-func (a *admin) startWSNotifier(ctx context.Context) {
-	t := time.NewTicker(time.Second)
-	defer t.Stop()
-	pending := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.wsNotify:
-			pending = true
-		case <-t.C:
-			if pending {
-				pending = false
-				a.notifyWSChanged()
-			}
-		}
-	}
-}
-
-// notifyWSChanged is called by startWSNotifier to broadcast updates.
-// Sends delta updates: only changed proxies (added/removed/updated) plus health.
-func (a *admin) notifyWSChanged() {
-	a.statsMu.Lock()
-	hist := make([]statsSample, len(a.statsHist))
-	copy(hist, a.statsHist)
-	a.statsMu.Unlock()
-
-	live := a.liveDelta()
-	currentProxies := make(map[string]liveRow, len(live))
-	for _, p := range live {
-		currentProxies[p.URL] = p
-	}
-
-	// Compute delta
-	a.wsMuPrev.Lock()
-	added := make([]liveRow, 0)
-	removed := make([]string, 0)
-	updated := make([]liveRow, 0)
-
-	for url, p := range currentProxies {
-		if prev, ok := a.prevProxies[url]; !ok {
-			added = append(added, p)
-		} else if prev.Latency != p.Latency || prev.Consec != p.Consec || prev.InFlight != p.InFlight || prev.Served != p.Served || prev.Checked != p.Checked {
-			updated = append(updated, p)
-		}
-	}
-	for url := range a.prevProxies {
-		if _, ok := currentProxies[url]; !ok {
-			removed = append(removed, url)
-		}
-	}
-
-	// Update previous state
-	a.prevProxies = currentProxies
-	prevHealth := map[string]int{"queue_live": a.bucket.Len(), "queue_hot": a.bucket.HotLen(), "pool_candidates": a.pool.Len()}
-	a.prevHealth = prevHealth
-	a.wsMuPrev.Unlock()
-
-	// Build delta message
-	msg := map[string]interface{}{
-		"type":    "delta",
-		"health":  prevHealth,
-		"added":   added,
-		"removed": removed,
-		"updated": updated,
-		"history": hist,
-	}
-	data, _ := json.Marshal(msg)
-	a.broadcastWS(data)
-}
-
-// liveWindow is how recent a proof of life must be for a proxy to be listed as
-// alive. It is deliberately short: the point of the page is "right now", not
-// "once worked".
-const liveWindow = 15 * time.Minute
-
-// filterScanFactor / filterScanMax bound the over-fetch a country or ASN filter
-// needs: rows are dropped after the ranked scan, so the scan has to look at more
-// than the caller asked for or a filtered page comes back short.
-const filterScanFactor = 100
-const filterScanMax = 200_000
 
 // sourceRow is the JSON shape of one sites.txt entry plus its telemetry.
 type sourceRow struct {
@@ -315,25 +178,6 @@ type sourceRow struct {
 	// Unproven marks sources the collector has never fetched yet, so the UI can
 	// show them apart from the ones that already have a verdict.
 	Unproven bool `json:"unproven"`
-}
-
-// liveRow is one entry of the "really alive" proxy table.
-type liveRow struct {
-	URL      string  `json:"url"`
-	Schema   string  `json:"schema"`
-	Host     string  `json:"host"`
-	Port     int     `json:"port"`
-	Source   string  `json:"source,omitempty"`
-	Country  string  `json:"country,omitempty"`
-	ASN      string  `json:"asn,omitempty"`
-	Latency  int64   `json:"latency_ms"`
-	OK       int64   `json:"ok_total"`
-	Fails    int64   `json:"fail_total"`
-	Consec   int64   `json:"consec_fails"`
-	Age      float64 `json:"proof_age_s"`
-	Served   bool    `json:"served"`
-	Checked  bool    `json:"checked"`
-	InFlight int64   `json:"in_flight"`
 }
 
 func (a *admin) sources() []sourceRow {
@@ -374,137 +218,6 @@ func (a *admin) sources() []sourceRow {
 	return out
 }
 
-// liveDelta renders the full set the WebSocket diff needs, without ranking it.
-// The diff is a membership test: it ran once per second over a ranked scan of
-// the whole queue, which for a two million entry queue is most of a second of
-// CPU per broadcast.
-func (a *admin) liveDelta() []liveRow {
-	if a.bucket == nil {
-		return nil
-	}
-	proxies := a.bucket.LiveListUnranked(proxy.AliveChecked, liveWindow)
-	now := time.Now()
-	out := make([]liveRow, 0, len(proxies))
-	for _, p := range proxies {
-		served, checked := p.LastServed(), p.LastCheck()
-		age := now.Sub(served)
-		if served.IsZero() || (!checked.IsZero() && checked.After(served)) {
-			age = now.Sub(checked)
-		}
-		out = append(out, liveRow{
-			URL:      p.URL(),
-			Schema:   p.Schema,
-			Host:     p.Host,
-			Port:     p.Port,
-			Source:   p.Source(),
-			Country:  p.GetCountry(),
-			ASN:      p.GetASN(),
-			Latency:  p.Latency().Milliseconds(),
-			OK:       p.OKTotal(),
-			Fails:    p.FailTotal(),
-			Consec:   p.ConsecFails(),
-			Age:      age.Seconds(),
-			Served:   !served.IsZero() && now.Sub(served) <= liveWindow,
-			Checked:  !checked.IsZero() && now.Sub(checked) <= liveWindow,
-			InFlight: p.InFlight(),
-		})
-	}
-	return out
-}
-
-// live renders the page of proxy rows plus the size of the scope itself, so the
-// UI can say "1000 of 41234" instead of implying the page is the whole truth.
-// Returns (filteredRows, unfilteredTotal).
-//
-// limit is handed to LiveListPage (limit <= 0 means "everything"). That is the
-// difference between ranking a bounded page and ranking the whole queue to then
-// throw most of it away. With a country/ASN filter the drop happens after the
-// scan, so the scan is over-fetched by filterScanFactor — the only way a
-// filtered request can fill the page at all.
-func (a *admin) live(scope string, limit int, countryFilter, asnFilter string) ([]liveRow, int) {
-	if a.bucket == nil {
-		return nil, 0
-	}
-	scan := limit
-	if (countryFilter != "" || asnFilter != "") && scan > 0 {
-		scan *= filterScanFactor
-		if scan > filterScanMax {
-			scan = filterScanMax
-		}
-	}
-	proxies, unfilteredTotal := a.bucket.LiveListPage(scope, liveWindow, scan)
-	now := time.Now()
-	out := make([]liveRow, 0, len(proxies))
-	for _, p := range proxies {
-		if countryFilter != "" && !strings.EqualFold(p.GetCountry(), countryFilter) {
-			continue
-		}
-		if asnFilter != "" && !strings.Contains(strings.ToLower(p.GetASN()), strings.ToLower(asnFilter)) {
-			continue
-		}
-		served, checked := p.LastServed(), p.LastCheck()
-		age := now.Sub(served)
-		if served.IsZero() || (!checked.IsZero() && checked.After(served)) {
-			age = now.Sub(checked)
-		}
-		out = append(out, liveRow{
-			URL:      p.URL(),
-			Schema:   p.Schema,
-			Host:     p.Host,
-			Port:     p.Port,
-			Source:   p.Source(),
-			Country:  p.GetCountry(),
-			ASN:      p.GetASN(),
-			Latency:  p.Latency().Milliseconds(),
-			OK:       p.OKTotal(),
-			Fails:    p.FailTotal(),
-			Consec:   p.ConsecFails(),
-			Age:      age.Seconds(),
-			Served:   !served.IsZero() && now.Sub(served) <= liveWindow,
-			Checked:  !checked.IsZero() && now.Sub(checked) <= liveWindow,
-			InFlight: p.InFlight(),
-		})
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out, unfilteredTotal
-}
-
-func (a *admin) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(indexHTML))
-}
-
-func (a *admin) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]interface{}{
-		"uptime_seconds":  int(time.Since(a.started).Seconds()),
-		"queue_live":      a.bucket.Len(),
-		"queue_hot":       a.bucket.HotLen(),
-		"pool_candidates": a.pool.Len(),
-		"tls":             r.TLS != nil,
-	})
-}
-
-// handleReady is the probe a supervisor watches: 200 only while the queue can
-// actually serve a client. JSON in both cases so the reason is machine-readable.
-func (a *admin) handleReady(w http.ResponseWriter, r *http.Request) {
-	if n := a.bucket.Len(); n > 0 {
-		w.WriteHeader(http.StatusOK)
-		writeJSON(w, map[string]interface{}{"ok": true, "queue_live": n})
-		return
-	}
-	w.WriteHeader(http.StatusServiceUnavailable)
-	writeJSON(w, map[string]interface{}{
-		"ok": false, "error": "no live proxies in the queue", "queue_live": 0,
-	})
-}
-
 func (a *admin) handleSources(w http.ResponseWriter, r *http.Request) {
 	rows := a.sources()
 	total := 0
@@ -528,6 +241,73 @@ func (a *admin) handleSources(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSourceResetCooldown clears a source's failure cooldown so the next
+// cycle fetches it in full. The operator's "I fixed the thing, retry now"
+// button: waiting out site_cooldown is half an hour per fix otherwise.
+func (a *admin) handleSourceResetCooldown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	var body struct {
+		URL  string   `json:"url"`
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	urls := body.URLs
+	if body.URL != "" {
+		urls = append(urls, body.URL)
+	}
+	if len(urls) == 0 {
+		writeError(w, http.StatusBadRequest, "url or urls[] required")
+		return
+	}
+	if a.collector == nil {
+		writeError(w, http.StatusServiceUnavailable, "collector is not wired up")
+		return
+	}
+	reg := a.collector.Stats()
+	reset := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if reg.ResetCooldown(u) {
+			reset = append(reset, u)
+		}
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "reset": reset, "requested": len(urls),
+		"note": "the next collector cycle fetches these in full",
+	})
+}
+
+// handleCollectorWake forces an immediate collector cycle. It uses the same
+// channel the empty-queue watchdog uses, so a cycle started this way obeys
+// every existing rule (the site list is re-read, the priority order still
+// applies) — it is a nudge, not a second collection mode.
+func (a *admin) handleCollectorWake(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	if a.wakeCollector == nil {
+		writeError(w, http.StatusServiceUnavailable, "collector is not wired up")
+		return
+	}
+	select {
+	case a.wakeCollector <- struct{}{}:
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "note": "emergency collector cycle started",
+		})
+	default:
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "note": "a cycle is already pending",
+		})
+	}
+}
 func (a *admin) handleSites(w http.ResponseWriter, r *http.Request) {
 	path := a.cfg.Collector.SitesFile
 	switch r.Method {
@@ -578,7 +358,7 @@ func (a *admin) handleSites(w http.ResponseWriter, r *http.Request) {
 			"entries": len(list.URLs()), "note": "picked up on the next collector cycle",
 		})
 	case http.MethodDelete:
-		// Support both single URL and bulk delete (array of URLs)
+		// Support both single URL and bulk delete (array of URLs).
 		var body struct {
 			URL  string   `json:"url"`
 			URLs []string `json:"urls"`
@@ -632,13 +412,6 @@ func (a *admin) handleSites(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// jsonRowCap bounds a single JSON response. The queue can hold two million
-// entries and the page only ever shows the first pageful, so an unbounded
-// "scope=all" would build a multi-hundred-megabyte response out of a stray
-// click. The text download is left uncapped on purpose: exporting the list is
-// the one thing an operator asks for a lot of rows.
-const jsonRowCap = 1000
-
 func (a *admin) handleProxies(w http.ResponseWriter, r *http.Request) {
 	scope := r.URL.Query().Get("scope")
 	switch scope {
@@ -664,57 +437,30 @@ func (a *admin) handleProxies(w http.ResponseWriter, r *http.Request) {
 		limit = jsonRowCap
 	}
 	rows, total := a.live(scope, limit, countryFilter, asnFilter)
-	if text {
+	switch {
+	case text:
 		// Plain scheme://host:port per line: paste straight into curl, a
 		// config file, or another tool.
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="live-proxies.txt"`)
-		var sb strings.Builder
-		for _, row := range rows {
-			sb.WriteString(row.URL)
-			sb.WriteByte('\n')
-		}
-		_, _ = w.Write([]byte(sb.String()))
-		return
-	}
-	if csv {
+		_, _ = w.Write(exportText(rows))
+	case csv:
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="live-proxies.csv"`)
-		var sb strings.Builder
-		sb.WriteString("url,schema,host,port,source,country,asn,latency_ms,ok_total,fail_total,consec_fails,proof_age_s,served,checked,in_flight\n")
-		for _, row := range rows {
-			fmt.Fprintf(&sb, "%s,%s,%s,%d,%s,%s,%s,%d,%d,%d,%d,%.3f,%v,%v,%d\n",
-				row.URL, row.Schema, row.Host, row.Port, row.Source, row.Country, row.ASN,
-				row.Latency, row.OK, row.Fails, row.Consec, row.Age, row.Served, row.Checked, row.InFlight)
-		}
-		_, _ = w.Write([]byte(sb.String()))
-		return
-	}
-	if jsonl {
+		_, _ = w.Write(exportCSV(rows))
+	case jsonl:
 		w.Header().Set("Content-Type", "application/jsonl; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="live-proxies.jsonl"`)
 		enc := json.NewEncoder(w)
 		for _, row := range rows {
 			_ = enc.Encode(row)
 		}
-		return
+	default:
+		writeJSON(w, map[string]interface{}{
+			"scope": scope, "window_seconds": int(liveWindow.Seconds()),
+			"count": len(rows), "total": total, "proxies": rows,
+		})
 	}
-	writeJSON(w, map[string]interface{}{
-		"scope": scope, "window_seconds": int(liveWindow.Seconds()),
-		"count": len(rows), "total": total, "proxies": rows,
-	})
-}
-
-func (a *admin) handleCSS(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.Header().Set("Cache-Control", "max-age=60")
-	_, _ = w.Write([]byte(adminCSS))
-}
-
-func (a *admin) handleJS(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(adminJS))
 }
 
 // handleProxiesRevalidate forces revalidation of selected proxies.
@@ -749,26 +495,23 @@ func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) 
 	// seconds per proxy, so the handler must not wait for it: the work runs
 	// under the process context and the page sees progress via the live view.
 	targets := make(map[string]*proxy.Proxy)
-	order := make([]string, 0, len(body.URLs))
 	for _, p := range a.bucket.Snapshot() {
 		if _, dup := targets[p.Key()]; !dup {
 			targets[p.Key()] = p
-			order = append(order, p.Key())
 		}
 	}
 
 	var revalidated int
 	var notFound []string
-	checkList := append(body.URLs, body.Keys...)
+	checkList := append(append([]string{}, body.URLs...), body.Keys...)
 	picked := make([]*proxy.Proxy, 0, len(checkList))
 	for _, key := range checkList {
-		p, ok := targets[key]
-		if !ok {
-			notFound = append(notFound, key)
+		if p, ok := targets[key]; ok {
+			revalidated++
+			picked = append(picked, p)
 			continue
 		}
-		revalidated++
-		picked = append(picked, p)
+		notFound = append(notFound, key)
 	}
 	if revalidated > 0 {
 		workers := a.cfg.Storage.RevalidateWorkers
@@ -785,9 +528,31 @@ func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) 
 		"ok":          true,
 		"revalidated": revalidated,
 		"not_found":   notFound,
-		"resolved":    len(order),
+		"resolved":    len(targets),
 		"note":        "re-checking now; dead entries are dropped, live ones stay",
 	})
+}
+
+func (a *admin) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(indexHTML))
+}
+
+func (a *admin) handleCSS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "max-age=60")
+	_, _ = w.Write([]byte(adminCSS))
+}
+
+func (a *admin) handleJS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(adminJS))
 }
 
 func countComments(l *proxy.SiteList) int {
@@ -813,4 +578,17 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	writeJSON(w, map[string]interface{}{"ok": false, "error": msg, "code": code})
+}
+
+// pprofPaths are the profiling endpoints served on the admin listener, behind
+// the same token as everything else. Profiling a process that also serves
+// client traffic is a routine debugging step ("the proxy is slow" is a flame
+// chart question long before it is anything else), and an admin listener that
+// cannot answer it sends the developer back to SSH-ing into a production box.
+var pprofHandlers = map[string]http.HandlerFunc{
+	"/debug/pprof/":        pprof.Index,
+	"/debug/pprof/cmdline": pprof.Cmdline,
+	"/debug/pprof/profile": pprof.Profile,
+	"/debug/pprof/symbol":  pprof.Symbol,
+	"/debug/pprof/trace":   pprof.Trace,
 }

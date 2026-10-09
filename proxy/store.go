@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"fmt"
+	"log"
 	neturl "net/url"
 	"os"
 	"path/filepath"
@@ -287,7 +288,8 @@ func LoadRegexLines(path string) ([]string, error) {
 }
 
 // SaveBucketAtomic writes the queue atomically: temp file in the same dir,
-// fsync, rename. Oversized queues are truncated to keep the file bounded.
+// fsync, rename. An oversized queue is trimmed to the budget, keeping its
+// newest entries.
 func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
@@ -307,18 +309,64 @@ func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 		}
 	}()
 
+	// Over budget, keep the tail. The slice is in insertion order, so the head
+	// is the oldest entries and the tail the most recently validated ones — and
+	// on a restart only the tail is worth anything. Keeping the head instead
+	// re-seeds every restart with the stalest proxies in the queue and silently
+	// drops the freshest, which is the opposite of what the file is for. The
+	// candidate pool already rotates at its cap and keeps its newest, and the
+	// two halves of the system must agree on which end survives.
+	//
+	// Measure first, render second. URLLen is the same number as URL() without
+	// building the string, so the size pass over a multi-million-entry queue
+	// costs no allocation at all; only the surviving tail is ever rendered.
+	// (Rendering every entry up front allocated the whole queue — tens of
+	// megabytes of short-lived strings on every save.)
+	var total int64
+	for _, p := range proxies {
+		total += int64(p.URLLen()) + 1
+	}
+	if total > maxBytes {
+		// Walk backwards until the suffix stops fitting; O(n), and it stops at
+		// the budget instead of measuring the whole queue.
+		lo, kept := len(proxies), int64(0)
+		for i := len(proxies) - 1; i >= 0; i-- {
+			kept += int64(proxies[i].URLLen()) + 1
+			if kept > maxBytes {
+				break
+			}
+			lo = i
+		}
+		// A budget smaller than a single entry leaves nothing worth keeping;
+		// writing the newest one beats writing an empty file, which would seed
+		// an empty queue on the next start.
+		if lo == len(proxies) && len(proxies) > 0 {
+			lo = len(proxies) - 1
+		}
+		log.Printf("save: queue is %d bytes over the %d limit; keeping the newest %d of %d entries",
+			total-maxBytes, maxBytes, len(proxies)-lo, len(proxies))
+		proxies = proxies[lo:]
+	}
+
 	bw := bufio.NewWriterSize(tmp, 1<<20)
 	var size int64
+	// One reusable buffer for the whole save: the URL is built straight into
+	// the writer, so a multi-million-entry save allocates nothing per entry.
+	line := make([]byte, 0, 128)
 	for _, p := range proxies {
-		line := p.URL() + "\n"
-		if size+int64(len(line)) > maxBytes {
+		line = p.AppendURL(line[:0])
+		if size+int64(len(line))+1 > maxBytes {
 			break
 		}
-		if _, err := bw.WriteString(line); err != nil {
+		if _, err := bw.Write(line); err != nil {
 			tmp.Close()
 			return err
 		}
-		size += int64(len(line))
+		if err := bw.WriteByte('\n'); err != nil {
+			tmp.Close()
+			return err
+		}
+		size += int64(len(line)) + 1
 	}
 	if err := bw.Flush(); err != nil {
 		tmp.Close()
@@ -345,11 +393,17 @@ func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 // not concurrency-safe — unsynchronized WriteString/Flush calls interleave at
 // the buffer level and garble lines. The mutex is per path, not global, so two
 // audit files never contend with each other.
+//
+// Write and flush errors are logged. This is the only record of what validated,
+// so a full disk that silently drops it leaves no trace — the queue save is a
+// reconstruction, not a substitute.
 var goodWriters sync.Map // path -> *goodWriter
 
 type goodWriter struct {
-	mu sync.Mutex
-	w  *bufio.Writer
+	path string
+	mu   sync.Mutex
+	w    *bufio.Writer
+	f    *os.File
 }
 
 func AppendGood(path, line string) {
@@ -361,13 +415,36 @@ func AppendGood(path, line string) {
 		return
 	}
 	gw.mu.Lock()
-	gw.w.WriteString(line)
-	gw.w.WriteByte('\n')
+	defer gw.mu.Unlock()
+	if _, err := gw.w.WriteString(line + "\n"); err != nil {
+		log.Printf("good: write %s: %v", path, err)
+		return
+	}
 	// Flush past 4 KB to bound memory (and bound loss on a crash).
 	if gw.w.Buffered() > 4096 {
-		gw.w.Flush()
+		if err := gw.w.Flush(); err != nil {
+			log.Printf("good: flush %s: %v", path, err)
+		}
 	}
-	gw.mu.Unlock()
+}
+
+// CloseGoodWriters flushes and closes every cached audit file, then forgets
+// them. Called on shutdown: the buffer only reaches disk past 4 KB, so the tail
+// — exactly the newly-found set — would otherwise be lost on every exit.
+func CloseGoodWriters() {
+	goodWriters.Range(func(k, v interface{}) bool {
+		gw := v.(*goodWriter)
+		gw.mu.Lock()
+		if err := gw.w.Flush(); err != nil {
+			log.Printf("good: final flush %s: %v", gw.path, err)
+		}
+		if err := gw.f.Close(); err != nil {
+			log.Printf("good: close %s: %v", gw.path, err)
+		}
+		gw.mu.Unlock()
+		goodWriters.Delete(k)
+		return true
+	})
 }
 
 func openGoodWriter(path string) *goodWriter {
@@ -376,9 +453,10 @@ func openGoodWriter(path string) *goodWriter {
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		log.Printf("good: open %s for append: %v (the audit trail is disabled)", path, err)
 		return nil
 	}
-	gw := &goodWriter{w: bufio.NewWriter(f)}
+	gw := &goodWriter{path: path, w: bufio.NewWriter(f), f: f}
 	if actual, loaded := goodWriters.LoadOrStore(path, gw); loaded {
 		// Another worker won the race: close our file handle instead of
 		// leaking it (the loser used to keep an orphaned *os.File forever).

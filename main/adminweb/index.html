@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>protator admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<header>
+  <h1>protator</h1>
+  <div id="tiles" class="tiles"></div>
+  <button id="wake" type="button" title="Force a collector cycle now (the site list is re-read)">Collect now</button>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="proxies" type="button">Live proxies</button>
+  <button class="tab" data-tab="sources" type="button">Sources</button>
+  <button class="tab" data-tab="graph" type="button">24h history</button>
+  <button class="tab" data-tab="sites" type="button">sites.txt</button>
+</nav>
+
+<section id="proxies" class="panel active">
+  <div class="bar">
+    <label>Definition
+      <select id="scope">
+        <option value="hot" selected>hot tail (best evidence)</option>
+        <option value="served">served traffic</option>
+        <option value="checked">validated recently</option>
+        <option value="all">whole queue</option>
+      </select>
+    </label>
+    <label>Country <input id="country" type="text" size="4" spellcheck="false" placeholder="any"></label>
+    <span id="proxyCount" class="muted"></span>
+    <button id="retestShown" type="button" title="Re-check everything currently listed through the full checker">Retest shown</button>
+    <a id="download" class="button" href="/api/proxies?format=text">Download .txt</a>
+    <a id="downloadCsv" class="button" href="/api/proxies?format=csv">.csv</a>
+  </div>
+  <p class="hint">Four definitions, from strongest evidence to weakest:
+    <b>hot tail</b> is the curated set the picker samples, so it is what is
+    working right now; <b>served traffic</b> is the strict subset that carried a
+    real client request in the window; <b>validated recently</b> adds proxies
+    that only passed a check; <b>whole queue</b> also lists unproven entries,
+    which is a diagnostic view, not a list to use.</p>
+  <table id="proxyTable">
+    <thead><tr>
+      <th>proxy</th><th>schema</th><th>latency</th><th>ok/fail</th>
+      <th>proof age</th><th>proof</th><th>source</th><th></th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="sources" class="panel">
+  <div class="bar">
+    <span id="sourceCount" class="muted"></span>
+  </div>
+  <p class="hint">Every entry of sites.txt with the verdict of the checker on
+    what it produced. Yield is the share of that source's candidates still
+    alive; it is the number that decides whether a source earns its place.
+    The collector fetches the highest-priority sources first, so a source at
+    the top is one that recently delivered working proxies. "Retry now" clears
+    a source's failure cooldown so the next cycle fetches it in full.</p>
+  <table id="sourceTable">
+    <thead><tr>
+      <th>source</th><th>alive</th><th>yield</th><th>emitted</th>
+      <th>found</th><th>cycles</th><th>fails</th><th>state</th><th>last note</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="graph" class="panel">
+  <div class="bar">
+    <span id="graphCount" class="muted"></span>
+  </div>
+  <p class="hint">One sample per minute, 24 hours kept. The queue sizes show how
+    big the pool is; the rates show whether it is getting better or worse —
+    a queue that stays flat while its dial-failure rate climbs is dying.</p>
+  <canvas id="chart" width="960" height="320"></canvas>
+  <div id="chartLegend" class="legend"></div>
+</section>
+
+<section id="sites" class="panel">
+  <div class="bar">
+    <span id="siteCount" class="muted"></span>
+    <form id="addForm" class="inline">
+      <input id="siteUrl" type="text" placeholder="https://example.com/proxy-list.txt" size="52" spellcheck="false">
+      <button type="submit">Add</button>
+    </form>
+  </div>
+  <p class="hint">Edits are written to <code id="sitePath"></code> atomically,
+    with the previous contents kept as <code>.bak</code>. The collector re-reads
+    the file at the start of every cycle, so a change takes effect then; there
+    is no restart. The list is never allowed to become empty.</p>
+  <table id="siteTable">
+    <thead><tr><th>#</th><th>url</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<div id="toast" class="toast"></div>
+<script src="/static/admin.js"></script>
+</body>
+</html>

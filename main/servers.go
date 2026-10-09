@@ -25,10 +25,14 @@ func startServers(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, 
 	var socks *proxy.Socks5Server
 	if cfg.Socks5.Enabled {
 		socks = proxy.NewSocks5Server(cfg, fwd)
+		// Same rule as the HTTP fronts: ListenAndServe logs its own error and
+		// returns. Calling log.Fatalf from a goroutine here would exit without
+		// running main's defers, so a transient accept failure (fd exhaustion)
+		// would cost the unsaved queue — exactly what the HTTP change avoids.
 		go func() {
 			log.Printf("socks5: proxy listening on %s", cfg.Socks5.Listen)
 			if err := socks.ListenAndServe(ctx); err != nil {
-				log.Fatalf("socks5: %v", err)
+				log.Printf("socks5: serve stopped on %s: %v", cfg.Socks5.Listen, err)
 			}
 		}()
 	}
@@ -63,13 +67,31 @@ func startHTTPServer(cfg *proxy.Config, fwd *proxy.ForwardDialer, logNoise *log.
 		IdleTimeout:       cfg.Server.IdleTimeout.Duration,
 	}
 	srv.SetKeepAlivesEnabled(cfg.Server.KeepAlives)
-	go func() {
-		log.Printf("http:  proxy listening on %s", cfg.Server.Listen)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http:  %v", err)
-		}
-	}()
+	// Bind synchronously so a failed bind is still fatal, then serve in the
+	// background. Splitting the two means a *runtime* accept failure no longer
+	// calls log.Fatalf: log.Fatalf would exit without running main's defers,
+	// so saveQueue, pool.Close and CloseGoodWriters would all be skipped and
+	// the last queue change lost from disk.
+	ln, err := net.Listen("tcp", cfg.Server.Listen)
+	if err != nil {
+		log.Fatalf("http:  listen %s: %v", cfg.Server.Listen, err)
+	}
+	log.Printf("http:  proxy listening on %s", cfg.Server.Listen)
+	go serveListener(srv, ln, "http", cfg.Server.Listen)
 	return srv
+}
+
+// serveListener runs an accept loop that logs failures instead of exiting.
+// Bind errors are fatal and happen before this is called; everything after
+// that is a runtime condition (descriptor exhaustion, a listener closed
+// unexpectedly) and must not take the process down with an unsaved queue.
+// Logged before Serve is called rather than inside the goroutine, so the
+// "all listeners ready" summary in startServers cannot print first and make
+// the startup banner lie about what is listening.
+func serveListener(srv *http.Server, ln net.Listener, name, addr string) {
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Printf("%s: serve stopped on %s: %v", name, addr, err)
+	}
 }
 
 // startHTTPSServer launches the TLS forward proxy with the generated
@@ -93,12 +115,19 @@ func startHTTPSServer(cfg *proxy.Config, fwd *proxy.ForwardDialer, logNoise *log
 		IdleTimeout:       cfg.Server.IdleTimeout.Duration,
 	}
 	srv.SetKeepAlivesEnabled(cfg.Server.KeepAlives)
-	go func() {
-		log.Printf("https: proxy listening on %s", cfg.Server.ListenHTTPS)
-		if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("https: %v", err)
-		}
-	}()
+	// Same split as the plaintext front: bind synchronously (fatal on failure),
+	// then serve with a loop that logs runtime errors instead of exiting.
+	ln, err := net.Listen("tcp", cfg.Server.ListenHTTPS)
+	if err != nil {
+		log.Fatalf("https: listen %s: %v", cfg.Server.ListenHTTPS, err)
+	}
+	// NextProtos explicitly: ListenAndServeTLS used to configure HTTP/2 + ALPN
+	// for us, and Serve does not — with TLSConfig.NextProtos empty the
+	// shouldConfigureHTTP2_Serve check fails, so the front would stop
+	// advertising ALPN and never negotiate h2.
+	srv.TLSConfig.NextProtos = []string{"http/1.1"}
+	log.Printf("https: proxy listening on %s", cfg.Server.ListenHTTPS)
+	go serveListener(srv, tls.NewListener(ln, srv.TLSConfig), "https", cfg.Server.ListenHTTPS)
 	return srv
 }
 

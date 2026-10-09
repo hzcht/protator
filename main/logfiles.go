@@ -14,15 +14,72 @@ import (
 // fileLogSink routes every log line to a per-category file under Dir with
 // size-based rotation, mirroring everything to os.Stderr so console /
 // instance_err.log workflows keep working unchanged.
+//
+// It also keeps a small in-memory tail per category (logTailLines). The admin
+// page serves it on /api/logs: reading a rotated log over SSH is the first
+// thing an operator does during an incident, and this makes it one page
+// refresh. The tail is bounded, so it costs a fixed amount of memory.
 type fileLogSink struct {
 	cfg      proxy.LoggingConfig
 	mu       sync.Mutex
 	files    map[string]*rotatingFile
+	tail     map[string]*logTail
 	disabled bool
 }
 
+// logTailLines is how many recent lines per category are kept in memory. 300
+// is about a screenful of a collector cycle and a few KB per file.
+const logTailLines = 300
+
+// logTail is a fixed-size ring of recent lines, newest last.
+type logTail struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (t *logTail) add(line string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lines = append(t.lines, line)
+	if len(t.lines) > logTailLines {
+		// Drop from the front in blocks: the buffer is only ever read whole,
+		// so a per-line shift is wasted work.
+		t.lines = append(t.lines[:0], t.lines[len(t.lines)-logTailLines/2:]...)
+	}
+}
+
+// last returns the most recent n lines, oldest first.
+func (t *logTail) last(n int) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n <= 0 || n > len(t.lines) {
+		n = len(t.lines)
+	}
+	out := make([]string, n)
+	copy(out, t.lines[len(t.lines)-n:])
+	return out
+}
+
 func newFileLogSink(cfg proxy.LoggingConfig) *fileLogSink {
-	return &fileLogSink{cfg: cfg, files: make(map[string]*rotatingFile)}
+	return &fileLogSink{cfg: cfg, files: make(map[string]*rotatingFile), tail: make(map[string]*logTail)}
+}
+
+// Tail returns recent log lines for a category (see the categories the Write
+// routing picks: collector, checker, serve, system). It never opens a file, so
+// it works even when file logging is disabled.
+func (s *fileLogSink) Tail(category string, n int) []string {
+	s.mu.Lock()
+	t := s.tail[category]
+	s.mu.Unlock()
+	if t == nil {
+		t = &logTail{}
+		s.mu.Lock()
+		s.tail[category] = t
+		s.mu.Unlock()
+	}
+	// The ring lives per category, so a lookup that misses must not lose the
+	// lines already buffered: register it once, then read.
+	return t.last(n)
 }
 
 // Write implements io.Writer for the stdlib log package. The logger emits one
@@ -51,6 +108,8 @@ func (s *fileLogSink) Write(p []byte) (int, error) {
 		cat = "serve"
 	}
 
+	s.recordTail(cat, line)
+
 	if _, err := os.Stderr.Write(p); err != nil {
 		return len(p), err
 	}
@@ -60,6 +119,19 @@ func (s *fileLogSink) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// recordTail appends one line to the category's in-memory ring. The ring is
+// created on first use so an idle category costs nothing.
+func (s *fileLogSink) recordTail(cat, line string) {
+	s.mu.Lock()
+	t := s.tail[cat]
+	if t == nil {
+		t = &logTail{}
+		s.tail[cat] = t
+	}
+	s.mu.Unlock()
+	t.add(strings.TrimRight(line, "\r\n"))
 }
 
 // Close closes every open category file. Tests call this so tempdirs can be

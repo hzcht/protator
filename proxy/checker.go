@@ -132,16 +132,20 @@ func (c *Checker) resolveSelfIP() (net.IP, error) {
 	ch := make(chan res, len(urls))
 	for _, u := range urls {
 		go func(u string) {
+			// Recovered per sub-probe: the caller reads a fixed number of
+			// results, so a panic here would leave it blocked forever on a
+			// receive that never comes.
+			defer RecoverPanic("checker: self-ip " + u)
 			body, err := getBodyCtx(ctx, client, u)
 			if err != nil {
-				ch <- res{err: err}
+				GuardedSend(ch, res{err: err})
 				return
 			}
 			if ip := c.firstIP(body); ip != nil {
-				ch <- res{ip: ip}
+				GuardedSend(ch, res{ip: ip})
 				return
 			}
-			ch <- res{err: errors.New("no IP in service response")}
+			GuardedSend(ch, res{err: errors.New("no IP in service response")})
 		}(u)
 	}
 	var lastErr error
@@ -160,22 +164,28 @@ func (c *Checker) resolveSelfIP() (net.IP, error) {
 
 // Check validates a candidate and returns the working Proxy.
 func (c *Checker) Check(cand Candidate) (*Proxy, error) {
+	Stats.Checks.Add(1)
 	if cand.Port < 1 || cand.Port > 65535 {
+		Stats.ChecksFailed.Add(1)
 		return nil, errors.New("bad port")
 	}
 	if !c.allowBogon {
 		if err := rejectBogon(cand.Host, c.selfIP); err != nil {
+			Stats.ChecksFailed.Add(1)
 			return nil, err
 		}
 	}
 	if cand.Schema != "" && validSchema(cand.Schema) {
 		p := &Proxy{Schema: cand.Schema, Host: cand.Host, Port: cand.Port}
 		if err := c.preDial(p); err != nil {
+			Stats.ChecksFailed.Add(1)
 			return nil, err
 		}
 		if err := c.fullCheck(p); err != nil {
+			Stats.ChecksFailed.Add(1)
 			return nil, err
 		}
+		Stats.ChecksPassed.Add(1)
 		return p, nil
 	}
 	// A candidate with no explicit schema gets the configured probe order,
@@ -192,9 +202,11 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 			continue
 		}
 		if err := c.fullCheck(p); err == nil {
+			Stats.ChecksPassed.Add(1)
 			return p, nil
 		}
 	}
+	Stats.ChecksFailed.Add(1)
 	return nil, errors.New("no protocol works")
 }
 
@@ -288,17 +300,24 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		// Recovered per branch: without it a panic here kills the worker and,
+		// with hundreds of them, the process. wg.Done must be deferred first so
+		// the sibling is never left waiting on a WaitGroup that never completes.
+		defer RecoverPanic("checker: confirmExitIP")
 		confirmErr = c.confirmExitIP(client, ip, winURL)
 	}()
 	go func() {
 		defer wg.Done()
+		defer RecoverPanic("checker: contentPass")
 		contentOK, testConnect = c.contentPass(client, p)
 	}()
 	wg.Wait()
 	if confirmErr != nil {
 		return confirmErr
 	}
-	if !contentOK {
+	// A recovered panic in contentPass leaves the zero values, which read as a
+	// clean pass. Fail closed instead of admitting an unchecked proxy.
+	if !contentOK && len(c.tests) > 0 {
 		return errors.New("content check failed")
 	}
 	// CONNECT is proven only when some stage actually tunnelled. Skipping the
@@ -427,6 +446,10 @@ func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
 		}
 		patterns := t.MustContain
 		go func(t ContentTest, compiled []*regexp.Regexp, patterns []string) {
+			// No send is expected on the failure paths, so recovery here only
+			// has to keep the process alive; the select below carries the
+			// success value out under a ctx guard.
+			defer RecoverPanic("checker: content test " + t.URL)
 			body, err := getBodyCtx(ctx, client, t.URL)
 			if err != nil {
 				return
@@ -478,14 +501,17 @@ func (c *Checker) leakCheck(client *http.Client) error {
 	ch := make(chan res, len(urls))
 	for _, u := range urls {
 		go func(u string) {
+			// Recovered per probe: the loop below reads one result per url, so
+			// a panic without this leaves it blocked forever.
+			defer RecoverPanic("checker: leak probe " + u)
 			req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 			if err != nil {
-				ch <- res{}
+				GuardedSend(ch, res{})
 				return
 			}
 			resp, err := client.Do(req)
 			if err != nil {
-				ch <- res{}
+				GuardedSend(ch, res{})
 				return
 			}
 			defer resp.Body.Close()
@@ -503,7 +529,7 @@ func (c *Checker) leakCheck(client *http.Client) error {
 					leaked = true
 				}
 			}
-			ch <- res{leaked}
+			GuardedSend(ch, res{leaked})
 		}(u)
 	}
 	for range urls {
@@ -644,13 +670,18 @@ func (c *Checker) transportFor(p *Proxy) *http.Transport {
 	// one of them can be dropped at the cost of one fresh connection pool.
 	c.transportCache.Store(key, tr)
 	if atomic.AddInt64(&c.transportCacheSize, 1) > c.transportCacheMax {
+		// Never evict the entry just inserted: Range order is undefined, so it
+		// can return `key` itself, leaving the new transport uncached.
 		c.transportCache.Range(func(k, v interface{}) bool {
-			if tr, ok := v.(*http.Transport); ok {
-				tr.CloseIdleConnections()
+			if kk, _ := k.(string); kk == key {
+				return true // keep looking
+			}
+			if old, ok := v.(*http.Transport); ok {
+				old.CloseIdleConnections()
 			}
 			c.transportCache.Delete(k)
 			atomic.AddInt64(&c.transportCacheSize, -1)
-			return false // stop after first deletion
+			return false
 		})
 	}
 	return tr

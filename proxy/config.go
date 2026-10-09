@@ -96,8 +96,17 @@ type ServerConfig struct {
 	ShutdownTimeout Duration `toml:"shutdown_timeout"`
 	// Admin/health endpoint (JSON metrics + /ready), empty = disabled.
 	// Listening on 127.0.0.1 (or "localhost:port") recommended; the port
-	// carries no proxy traffic and no auth.
+	// carries no proxy traffic and no auth by default.
+	//
+	// admin_token, when set, is required on every request but /health and
+	// /ready, either as "Authorization: Bearer <token>" or as a ?token= query
+	// parameter. It exists for the case admin_listen leaves the loopback
+	// interface: the page edits sites.txt and can drop proxies from the queue,
+	// so an unauthenticated listener on a routable address is a remote kill
+	// switch. Empty token + non-loopback address is a loud startup warning,
+	// not a refusal — firewalled deployments are legitimate.
 	AdminListen string `toml:"admin_listen"`
+	AdminToken  string `toml:"admin_token"`
 }
 
 // Socks5Config controls the local SOCKS5 forward proxy.
@@ -238,7 +247,16 @@ type Config struct {
 	Collector CollectorConfig `toml:"collector"`
 	Storage   StorageConfig   `toml:"storage"`
 	Logging   LoggingConfig   `toml:"logging"`
+
+	// path is where this config was loaded from. It is not a config field: it
+	// is the answer to "which file is this instance running", which the admin
+	// page shows next to the effective values, and which -check exists to
+	// validate.
+	path string
 }
+
+// Path returns the config file this instance was loaded from.
+func (c *Config) Path() string { return c.path }
 
 func validSchema(s string) bool {
 	switch s {
@@ -250,7 +268,7 @@ func validSchema(s string) bool {
 
 // LoadConfig reads and validates a TOML config file.
 func LoadConfig(path string) (*Config, error) {
-	cfg := &Config{}
+	cfg := &Config{path: path}
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
 		return nil, fmt.Errorf("decode config %s: %w", path, err)
 	}

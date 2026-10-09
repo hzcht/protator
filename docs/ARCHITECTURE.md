@@ -166,10 +166,10 @@ For `schema="vless"` the checker:
 
 | Component | File | Role |
 |-----------|------|------|
-| Entrypoint | `main/proxy.go` | Loads config, seeds bucket, starts checker workers, collector, revalidator, saver, stats logger, 3 listeners + admin. Helpers: `buildGoproxy`, `saveQueue`. The validation pipeline itself (`RunCheckLoop`, `RevalidateSeeded`) lives in `proxy/pipeline.go`. |
-| Bucket | `proxy/bucket.go` | Concurrency-safe live queue, dedup by full URL, `Random` (uniform, collectors/retries use it), `PickHealthy` (weighted, serving path uses it), curated `hot` tail plus the cached proven pool (`freshPool`), per-source counts, `LiveList`/`LiveListPage` (hot/served/checked/all), `Subscribe` change notifications (a subscriber list — the forward dialer and the admin WebSocket both register, neither replaces the other). |
+| Entrypoint | `main/proxy.go` | Loads config, seeds bucket, starts the supervised checker worker pool, collector, revalidator, saver, stats logger, 3 listeners + admin. Helpers: `buildGoproxy`, `saveQueue`. The validation pipeline itself (`RunCheckLoop`, `RevalidateSeeded`) lives in `proxy/pipeline.go`. |
+| Bucket | `proxy/bucket.go` + `proxy/pick.go` | Concurrency-safe live queue (dedup by full URL, `Random`, `LiveList`), plus the serving-path policy in `pick.go`: proof tiers, `rankPick`, `PickHealthy`.etries use it), `PickHealthy` (weighted, serving path uses it), curated `hot` tail plus the cached proven pool (`freshPool`), per-source counts, `LiveList`/`LiveListPage` (hot/served/checked/all), `Subscribe` change notifications (a subscriber list — the forward dialer and the admin WebSocket both register, neither replaces the other). |
 | ForwardDialer | `proxy/upstream.go` | `DialContext` with failover + passive feedback; `loop` set dials known-proxy addresses directly (anti self-loop); `NewTransport` (no keep-alives). |
-| Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT, optional TLS for `https:` proxies), `socksDialTimeout` (timeout wrapper), `dialVLESS` (uTLS + REALITY + VLESS handshake), `socksDialTimeout` (timeout wrapper that closes late connections). |
+| Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT, optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections), `dialVLESS` (uTLS + REALITY + VLESS handshake). |
 | Checker | `proxy/checker.go` | Section 3. Shared per-check keep-alive client; stamps `MarkAlive` on success; GeoIP lookup via MaxMind MMDB. |
 | Collector | `proxy/collector.go` | Section 1 left side. Cookie jar, browser-grade headers, 429/503 + `Retry-After`, binary content-type guard, per-site cooldown, priority-ordered site walk with `max_sites_per_cycle` / `max_candidates_per_site` caps, JS-protection hints in logs, blocking `emit`. |
 | Site telemetry | `proxy/sitestats.go` | `SiteRegistry`: per-source emitted/found/alive/fails, cooldown, deterministic rotation of untried sources, bounded to 200k tracked URLs. |
@@ -180,7 +180,7 @@ For `schema="vless"` the checker:
 | SOCKS5 front | `proxy/socks5_server.go` | Minimal RFC 1928 server, tunnels each session via `ForwardDialer`, idle-deadline relay. Volume-aware verdict (`relayCount`). |
 | TLS | `proxy/tlsutil.go` | Load cert/key from disk or generate ephemeral self-signed. |
 | Browser fallback | `proxy/browser.go` | Lazy headless Chromium via playwright (off by default). |
-| Admin | `main/admin.go`, `main/adminapi.go`, `main/adminassets.go` | `mixedListener` (0x16 sniffing, one port for HTTP and HTTPS), `routes`, source/live/site handlers, embedded page, WebSocket `/ws`. |
+| Admin | `main/admin.go`, `main/adminapi.go`, `main/adminhealth.go`, `main/adminlive.go`, `main/adminws.go`, `main/adminassets.go` (embed of `adminweb/`) | `mixedListener` (0x16 sniffing, one port for HTTP and HTTPS), `routes`, source/live/site handlers, embedded page, WebSocket `/ws`. |
 | Logging | `main/logfiles.go`, `main/logging.go` | Per-category rotating sinks + `noiseWriter` (drops stdlib TLS-handshake noise, coalesces the goproxy dial-warn flood). `fileLogSink` backstop drops TLS handshake noise. |
 | Config | `proxy/config.go` | TOML structs + `fillDefaults` + `LoadTests`. |
 
@@ -214,18 +214,26 @@ One port (`server.admin_listen`, `127.0.0.1:9090` by default) answers **both**
 HTTP and HTTPS: `mixedListener` reads the first byte of every connection and
 wraps it in `tls.Server` when it is `0x16`. That is the fix for a browser
 pointed at `https://127.0.0.1:9090/` getting `ERR_SSL_RECORD_TOO_LONG` from a
-plaintext listener. No auth, no proxy traffic — keep it on loopback.
+plaintext listener. `server.admin_token` gates everything except `/health` and
+`/ready` (Bearer header or `?token=`); without a token a non-loopback bind logs
+a loud warning, because the page can edit `sites.txt` and drop proxies.
 
 | Route | Purpose |
 |-------|---------|
-| `GET /` | Page with three tabs: live proxies, per-source stats, `sites.txt` editor. |
-| `GET /health` | Queue/pool counters as JSON, plus whether the request came in over TLS. |
-| `GET /ready` | 200 while the queue can serve, 503 otherwise. |
+| `GET /` | Page with four tabs: live proxies (+ retest), per-source stats (+ cooldown reset), 24h history graphs, `sites.txt` editor. Header: `Collect now` and metric tiles. |
+| `GET /health` | Counters + loop heartbeats (last collector cycle / revalidation pass / queue save) + gauges (queue, proven, pool, channel depth, goroutines, WS clients) as JSON. |
+| `GET /ready` | 200 while the queue has **proven** proxies (`Bucket.ProvenCount`), 503 otherwise. Never on `Len()`: an unverified queue must not report healthy. |
 | `GET /api/sources` | One row per tracked source: alive, yield %, emitted, found, cycles, fails, cooldown, last note. |
 | `GET /api/proxies?scope=…` | `hot` (curated tail), `served` (carried real traffic), `checked` (validated recently), `all` (whole queue). `&format=text|csv|jsonl`, `&country=US`, `&asn=AS12345`. |
 | `GET/POST/DELETE /api/sites` | Read and edit `sites.txt` in place: validated, normalized, atomic write, `.bak` kept, empty list refused. Bulk delete via `DELETE` with `{"urls": [...]}`. |
 | `POST /api/proxies/revalidate` | Force revalidation of selected proxies: `{"urls": [...], "keys": [...]}`. |
-| `GET /api/stats/history` | 24h stats history (1 sample/min = 1440 points): queue_live, queue_hot, pool_candidates. |
+| `POST /api/sources/cooldown` | Clear a source's failure cooldown, so the next cycle fetches it in full. |
+| `POST /api/collector/wake` | Force a collector cycle now (the same channel the empty-queue watchdog uses). |
+| `GET /api/metrics` | `proxy.Stats` counters + per-second rates + gauges; `&format=text` for Prometheus. |
+| `GET /api/logs?category=...` | In-memory tail (300 lines per category) of `collector`/`checker`/`serve`/`system` — no SSH needed during an incident. |
+| `GET /api/config` | Effective config, reflection-driven, secrets (`*token*`, `*key_file*`) redacted. |
+| `/debug/pprof/...` | CPU/heap/block/goroutine profiles, behind `admin_token`. |
+| `GET /api/stats/history` | 24h stats history (1 sample/min = 1440 points): queue_live, queue_hot, pool_candidates + the per-minute rates. |
 | `GET /ws` | WebSocket for live updates. Pushes `{"type":"state"|"update", health, proxies, sources, history}`; bucket changes are coalesced into at most one delta per second. |
 
 Liveness definitions are deliberately explicit because "the proxy list said so"
@@ -239,10 +247,12 @@ never been proven. `Bucket.LiveList` implements the same scopes for code.
 | Loop | File | Interval | Purpose |
 |------|------|----------|---------|
 | `saveLoop` | `main/loops.go` | `storage.save_interval` (1m) | Atomic rewrite of `proxy.lst`, only while the queue is dirty (the dirty flag is set by `Add`/`Remove`). |
-| `statsLoop` | `main/loops.go` | 1 min | Log `queue: live proxies = N (hot M)`. After 2 empty minutes → emergency collector wake. |
+| `statsLoop` | `main/loops.go` | 1 min | Log the queue counts **and** the per-second rates (serve, dial-fail, eviction, checks) from `proxy.Stats`. After 2 empty minutes → emergency collector wake. |
 | `PoolReprobeLoop` | `proxy/poolloop.go` | `collector.pool_retry_interval` (3m) | Emit `pool_retry_batch` (1000) candidates from pool, non-blocking, adaptive room check. |
 | `RevalidateLoop` | `proxy/revalidate.go` | `storage.revalidate_interval` (15m) | Stale-first revalidation of bucket, capped at `revalidate_max_per_pass` (30k). Skips recently-served (`revalidate_fresh_servers`). |
-| `statsRecorder` (admin) | `main/adminapi.go` | 1 min | Ring buffer of 1440 samples for `/api/stats/history` and WebSocket. |
+| `statsRecorder` (admin) | `main/adminapi.go` | 1 min | Ring buffer of 1440 samples (queue counts + rates) for `/api/stats/history`, the 24h graph and the WebSocket state message. |
+| `beatTracker` | `main/beats.go` | 5s | Stamps the last time each subsystem made progress, from its counter delta. |
+| `startWSNotifier` | `main/adminws.go` | 1s | Coalesced WebSocket delta: at most one broadcast per tick, skipped entirely when no client is connected. |
 | `startWSNotifier` (admin) | `main/adminapi.go` | 1 s tick | Coalesces bucket-change flags into at most one delta broadcast per tick. |
 
 ## 8. Candidate Pool persistence

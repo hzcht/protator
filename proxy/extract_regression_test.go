@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -63,5 +65,40 @@ func TestExtractGeonodeDoesNotCrossRecords(t *testing.T) {
 		if got[h] != p {
 			t.Errorf("%s: got port %d, want %d", h, got[h], p)
 		}
+	}
+}
+
+// A whole-body base64 blob is a real publishing format for proxy lists (it
+// dodges content sniffing), so the extractor must decode it before giving up.
+// The padded and unpadded variants both have to work.
+func TestExtractBase64Body(t *testing.T) {
+	plain := "1.2.3.4:8080" + "\n" + "5.6.7.8:3128" + "\n" + "9.9.9.9:1080" + "\n" + "10.1.2.3:80" + "\n"
+	e, err := NewExtractor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, body string }{
+		{"padded", base64.StdEncoding.EncodeToString([]byte(plain))},
+		{"unpadded", strings.TrimRight(base64.StdEncoding.EncodeToString([]byte(plain)), "=")},
+	} {
+		cands := e.Extract([]byte(tc.body))
+		if len(cands) != 4 {
+			t.Errorf("%s: got %d candidates, want 4 (%+v)", tc.name, len(cands), cands)
+		}
+	}
+
+	// A page that merely *looks* like base64 (plain text) must not be decoded:
+	// the plain-text pass already owns it, and decoding would double the work.
+	got := e.Extract([]byte(plain))
+	if len(got) != 4 {
+		t.Fatalf("plain body: got %d candidates, want 4", len(got))
+	}
+	// A real HTML page with base64-ish fragments stays untouched: the stray
+	// markup means the plain-text pass owns it, and the shipped per-site
+	// patterns still find the table row.
+	html := "<html><body><table><tr><td>1.2.3.4</td><td>8080</td></tr></table></body></html>abcABC+/="
+	e2 := liveExtractor(t)
+	if got := e2.Extract([]byte(html)); len(got) != 1 {
+		t.Fatalf("html body: got %d candidates, want 1", len(got))
 	}
 }

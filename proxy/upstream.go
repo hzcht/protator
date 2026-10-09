@@ -39,31 +39,43 @@ type ForwardDialer struct {
 	loop networkSet
 }
 
+// networkSet tracks which host:port addresses are currently served by a proxy
+// in the queue, so the dialer can bypass them instead of looping back into one
+// of its own upstreams.
+//
+// Addresses are reference counted because the bucket's identity is the full URL:
+// the same host:port is a distinct entry under http and socks5, and removing
+// one must not unblock the other. Unblocking early here is the unsafe
+// direction — it hands the dialer a proxy that may dial itself.
 type networkSet struct {
 	mu sync.RWMutex
-	m  map[string]struct{}
+	m  map[string]int
 }
 
 func newNetworkSet() networkSet {
-	return networkSet{m: make(map[string]struct{}, 1024)}
+	return networkSet{m: make(map[string]int, 1024)}
 }
 
 func (s *networkSet) contains(addr string) bool {
 	s.mu.RLock()
-	_, ok := s.m[addr]
+	n := s.m[addr]
 	s.mu.RUnlock()
-	return ok
+	return n > 0
 }
 
 func (s *networkSet) put(addr string) {
 	s.mu.Lock()
-	s.m[addr] = struct{}{}
+	s.m[addr]++
 	s.mu.Unlock()
 }
 
 func (s *networkSet) drop(addr string) {
 	s.mu.Lock()
-	delete(s.m, addr)
+	if n := s.m[addr]; n <= 1 {
+		delete(s.m, addr)
+	} else {
+		s.m[addr] = n - 1
+	}
 	s.mu.Unlock()
 }
 
@@ -126,6 +138,8 @@ func (d *ForwardDialer) DialContext(ctx context.Context, network, addr string) (
 	st := attemptStateFrom(ctx)
 	skip := d.triedFrom(st)
 	pinKey := pinKeyFrom(ctx)
+
+	Stats.Requests.Add(1)
 	var lastErr error
 	for attempt := 0; attempt < d.serveRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -138,11 +152,14 @@ func (d *ForwardDialer) DialContext(ctx context.Context, network, addr string) (
 		skip[p.Key()] = struct{}{}
 		st.dial(p)
 		start := time.Now()
+		Stats.DialAttempts.Add(1)
 		conn, err := dialProxy(p, d.dialTimeout, ctx, network, addr)
 		if err != nil {
 			lastErr = err
+			Stats.DialFailures.Add(1)
 			if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 				d.bucket.Remove(p)
+				Stats.Evictions.Add(1)
 			}
 			if pinKey != "" {
 				d.pins.Del(pinKey) // remap next request to a fresh pick
@@ -370,6 +387,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	// (TLS would be silently corrupted).
 	go func() {
 		defer close(fwdDone)
+		defer RecoverPanic("connect: client->tunnel")
 		if replay.Len() > 0 {
 			// A retry: replay the early client bytes into the fresh tunnel
 			// before anything new (the previous tunnel ate them).
@@ -399,6 +417,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 					return
 				}
 				atomic.AddInt64(volume, int64(n))
+				Stats.BytesOut.Add(int64(n))
 			}
 			if rerr != nil {
 				if isTimeoutErr(rerr) {
@@ -472,12 +491,14 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	revDone := make(chan struct{})
 	go func() {
 		defer close(revDone)
+		defer RecoverPanic("connect: tunnel->client")
 		buf := make([]byte, connectBufSize)
 		for {
 			_ = conn.SetReadDeadline(time.Now().Add(d.idleTimeout))
 			m, rerr := conn.Read(buf)
 			if m > 0 {
 				atomic.AddInt64(volume, int64(m))
+				Stats.BytesIn.Add(int64(m))
 				if _, werr := client.Write(buf[:m]); werr != nil {
 					_ = pc.Close()
 					return
@@ -502,10 +523,13 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	_ = pc.Close()
 	<-revDone
 	if upstreamEnded && atomic.LoadInt64(volume) < connectMinOKBytes && time.Since(start) < connectMinOKTime {
+		Stats.ServeFailures.Add(1)
 		if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 			d.bucket.Remove(p)
+			Stats.Evictions.Add(1)
 		}
 	} else {
+		Stats.ServedOK.Add(1)
 		p.MarkServeOK(time.Since(start))
 		d.bucket.Promote(p)
 	}

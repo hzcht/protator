@@ -35,6 +35,11 @@ type SiteStat struct {
 	// to send If-None-Match / If-Modified-Since on next fetch (304 = no changes).
 	ETag         string `json:"etag,omitempty"`
 	LastModified string `json:"last_modified,omitempty"`
+
+	// untracked marks a stat synthesized for one Order call because the
+	// registry is at its cap. Its Priority is already final and it must not be
+	// scored again, nor confused with a tracked entry.
+	untracked bool
 }
 
 // Cooling reports whether the site is in failure cooldown.
@@ -98,11 +103,33 @@ func (r *SiteRegistry) Failed(url string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s := r.statLocked(url)
+	if s == nil {
+		return false // untracked: nothing to cool down, fetch it normally
+	}
 	if s.CoolUntil.IsZero() || !time.Now().Before(s.CoolUntil) {
 		s.CoolUntil = time.Time{}
 		return false
 	}
 	return true
+}
+
+// ResetCooldown clears a site's failure cooldown and its consecutive-failure
+// count, so the next cycle fetches it in full (proxy retries included) instead
+// of the cheap direct attempt a cooling site gets. This is what the admin
+// "retry now" action calls after the operator fixed whatever broke (a site that
+// moved, a captcha that expired): waiting out site_cooldown is otherwise up to
+// half an hour per fix.
+func (r *SiteRegistry) ResetCooldown(url string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.statLocked(url)
+	if s == nil {
+		return false
+	}
+	cooling := !s.CoolUntil.IsZero()
+	s.CoolUntil = time.Time{}
+	s.Fails = 0
+	return cooling
 }
 
 // Record files the outcome of one fetch attempt and maintains the cooldown. It
@@ -112,6 +139,9 @@ func (r *SiteRegistry) Record(url string, ok bool, found, emitted int, note stri
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s := r.statLocked(url)
+	if s == nil {
+		return false // registry full: no telemetry for this source
+	}
 	now := time.Now()
 	s.Cycles++
 	s.Found = found
@@ -141,6 +171,9 @@ func (r *SiteRegistry) UpdateValidators(url, etag, lastMod string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s := r.statLocked(url)
+	if s == nil {
+		return // registry full: no validators to cache
+	}
 	if etag != "" {
 		s.ETag = etag
 	}
@@ -249,9 +282,23 @@ func (r *SiteRegistry) Order(urls []string) []string {
 	out := make([]*SiteStat, 0, len(urls))
 	for _, u := range urls {
 		s := r.statLocked(u)
+		if s == nil {
+			// Registry full and this URL is new. Score it as unproven without
+			// tracking it: dropping it from the fetch order would silently stop
+			// collecting from it entirely.
+			out = append(out, &SiteStat{URL: u, Priority: unprovenScore(u, epoch), untracked: true})
+			continue
+		}
 		out = append(out, s)
 	}
+	// Score tracked entries. untracked bool marks the synthesized ones, whose
+	// Priority is already final: using Priority==0 as the sentinel instead
+	// froze the jitter of every tracked unproven source at its first Order,
+	// because scoring writes Priority back into the registry.
 	for _, s := range out {
+		if s.untracked {
+			continue
+		}
 		s.Priority = r.scoreLocked(s, epoch)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -267,13 +314,19 @@ func (r *SiteRegistry) Order(urls []string) []string {
 	return res
 }
 
+// statLocked returns the tracked stat for url, creating it if there is room.
+// It returns nil when the registry is full and the URL is new.
+//
+// Callers must handle nil: they used to receive a scratch &SiteStat that was
+// never stored, so Record/Failed mutated an object that was immediately thrown
+// away — every counter and the cooldown silently did nothing for untracked
+// sources, with no indication that telemetry had stopped for them.
 func (r *SiteRegistry) statLocked(url string) *SiteStat {
 	if s, ok := r.stats[url]; ok {
 		return s
 	}
 	if len(r.stats) >= maxTrackedSites {
-		// Tracking is capped: fall back to a scratch entry that is not stored.
-		return &SiteStat{URL: url}
+		return nil
 	}
 	s := &SiteStat{URL: url}
 	r.stats[url] = s

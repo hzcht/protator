@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"sync"
@@ -34,6 +35,7 @@ func RevalidateNow(ctx context.Context, checker *Checker, bucket *Bucket, proxie
 	if len(proxies) == 0 {
 		return
 	}
+	Stats.ForcedReval.Add(int64(len(proxies)))
 	RevalidateMany(ctx, checker, bucket, proxies, workers, 0, 0, debug)
 }
 
@@ -78,12 +80,16 @@ func RevalidateMany(ctx context.Context, checker *Checker, bucket *Bucket, snap 
 	if workers < 1 {
 		workers = 1
 	}
+	Stats.RevalPasses.Add(1)
+	Stats.RevalChecked.Add(int64(len(snap)))
 	in := make(chan *Proxy, 1024)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Per item, not per worker: a panic on one proxy must cost that
+			// proxy, not the whole worker and its share of the channel.
 			for p := range in {
 				if ctx.Err() != nil {
 					// Drain, do not act: the remaining work will be picked up
@@ -91,18 +97,9 @@ func RevalidateMany(ctx context.Context, checker *Checker, bucket *Bucket, snap 
 					// shutdown budget (Revalidate builds its own contexts).
 					continue
 				}
-				if err := checker.Revalidate(p); err != nil {
-					if bucket.Remove(p) {
-						log.Printf("revalidate: dropped %s (%v)", p.URL(), err)
-					}
-					continue
+				if err := revalidateOne(ctx, checker, bucket, debug, p); err != nil {
+					log.Printf("revalidate: %s: %v", p.URL(), err)
 				}
-				// Revalidate stamps lastCheck on the resident via MarkAlive (warm
-				// tier) but deliberately does NOT promote into the hot tail: a
-				// bulk sweep of tens of thousands would flood the curated tail
-				// with merely-"validated once" entries and crowd out the
-				// truly serving-proven ones. Hot stays reserved for real traffic.
-				debug.Add(p.URL())
 			}
 		}()
 	}
@@ -122,4 +119,30 @@ func RevalidateMany(ctx context.Context, checker *Checker, bucket *Bucket, snap 
 	}
 	close(in)
 	wg.Wait()
+}
+
+// revalidateOne re-checks a single queue member, dropping it when the check
+// fails. It recovers per proxy so one bad entry cannot take a worker — and the
+// rest of its batch — down with it.
+//
+// Revalidate stamps lastCheck on the resident via MarkAlive (warm tier) but
+// deliberately does NOT promote into the hot tail: a bulk sweep of tens of
+// thousands would flood the curated tail with merely-"validated once" entries
+// and crowd out the truly serving-proven ones. Hot stays reserved for real
+// traffic.
+func revalidateOne(ctx context.Context, checker *Checker, bucket *Bucket, debug *DebugProxies, p *Proxy) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	if err := checker.Revalidate(p); err != nil {
+		if bucket.Remove(p) {
+			Stats.RevalDropped.Add(1)
+			log.Printf("revalidate: dropped %s (%v)", p.URL(), err)
+		}
+		return nil
+	}
+	debug.Add(p.URL())
+	return nil
 }

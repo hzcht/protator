@@ -49,6 +49,11 @@ func main() {
 
 	bucket, checker, pool, debug, candidates := buildPipeline(cfg)
 
+	// The validation worker pool is owned by its supervisor, which restarts any
+	// worker that exits. Started before the first candidate is produced so
+	// nothing is emitted into an empty pipeline.
+	workers := startCheckerWorkers(cfg, checker, pool, bucket, debug, candidates)
+
 	// Startup: revalidate the previous queue first (spec stage 5), while the
 	// first collection runs in parallel.
 	snap := bucket.Snapshot()
@@ -62,11 +67,23 @@ func main() {
 	// Flush the pool's buffered appends on the way out: without this the
 	// last few KB of candidates never reach disk.
 	defer pool.Close()
+	// Same for the good-proxy audit: its buffer only reaches disk past 4 KB,
+	// so the tail — exactly the newly-found set — was lost on every exit.
+	defer proxy.CloseGoodWriters()
 
 	shutdown := startServers(ctx, cfg, bucket, fwd, logNoise)
 	collector, wakeCollector := startCollector(ctx, cfg, bucket, candidates)
-	startAdminServer(ctx, cfg, bucket, pool, collector, checker, debug, logNoise)
-	startBackgroundLoops(ctx, cfg, bucket, pool, checker, debug, candidates, wakeCollector)
+	// Cached via-proxy fetcher transports hold idle sockets open to dead
+	// upstreams; drop them on the way out.
+	defer collector.CloseTransportCache()
+
+	// Subsystem heartbeats: the last time each long-running loop made
+	// progress, derived from its counters. The health endpoint and the
+	// shutdown log both report them.
+	beats := newBeats()
+	startBeatTracker(ctx, beats)
+	startAdminServer(ctx, cfg, bucket, pool, collector, checker, debug, sink, beats, workers, wakeCollector, candidates, logNoise)
+	startBackgroundLoops(ctx, cfg, bucket, pool, checker, debug, candidates, wakeCollector, beats)
 
 	<-ctx.Done()
 	stop()
@@ -77,6 +94,18 @@ func main() {
 	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration)
 	defer cancel()
 	shutdown(drainCtx)
+
+	// Stop the validation workers here, between the drain and the deferred
+	// saveQueue/pool.Close/CloseGoodWriters: they are the last writer of the
+	// queue, the pool file and the good-proxy audit. The candidate channel is
+	// never closed for the process's life, so stopping the pool is the only way
+	// they learn to stop, and without it they keep appending through the
+	// per-line fallback to files those deferred calls have just closed. It has
+	// to happen after the drain so the last request's dial result is still
+	// accounted for, and before the saves so they see every write.
+	workers.stopAndWait()
+	log.Printf("checker: worker pool stopped (%d restarts total)", workers.Restarts())
+
 	log.Println("stopped")
 }
 
@@ -107,11 +136,17 @@ func checkConfig(cfg *proxy.Config) error {
 	return nil
 }
 
-// buildPipeline seeds the persisted queue, builds the checker, candidate pool
-// and debug hook, and starts the validation worker pump. Every candidate
-// producer (startup revalidation, collector, pool re-probing) feeds the
-// returned channel; workers persist failures to the pool and move successes
-// into the bucket.
+// buildPipeline seeds the persisted queue and builds the checker, candidate
+// pool and debug hook. It does NOT start the validation workers: those are
+// owned by startCheckerWorkers, which keeps the pool at its configured size
+// for the life of the process. Every candidate producer (startup
+// revalidation, collector, pool re-probing) feeds the returned channel.
+//
+// The stop channel this used to hand back was `defer`red inside this function,
+// so it closed when it *returned*, before a single request was served: every
+// worker exited at startup, nothing consumed the candidate channel, the
+// collector's blocking emit filled it and wedged, and the queue was never
+// replenished again.
 func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.CandidatePool, *proxy.DebugProxies, chan proxy.Candidate) {
 	// Seed from the queue file plus the append-only audit of every good
 	// proxy (capped tail: the audit grows without bound). Seed dedups, so
@@ -149,9 +184,6 @@ func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.Can
 	debug := proxy.NewDebugProxies(cfg.Storage.DebugProxiesFile, cfg.Storage.DebugProxiesMax)
 
 	candidates := make(chan proxy.Candidate, cfg.Checker.ChannelSize)
-	for i := 0; i < cfg.Checker.Workers; i++ {
-		go proxy.RunCheckLoop(candidates, checker, pool, bucket, debug, cfg)
-	}
 	return bucket, checker, pool, debug, candidates
 }
 

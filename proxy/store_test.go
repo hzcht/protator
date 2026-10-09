@@ -239,3 +239,56 @@ func TestSaveSiteListNeedsPath(t *testing.T) {
 		t.Error("SaveSiteList without a path should fail")
 	}
 }
+
+// URLLen must equal len(URL()) for every shape of proxy, including the VLESS
+// variant: the queue save measures with it to choose the tail to keep, and an
+// off-by-one would silently drop entries from the persisted queue.
+func TestURLLenMatchesURL(t *testing.T) {
+	proxies := []*Proxy{
+		{Schema: "http", Host: "1.2.3.4", Port: 8080},
+		{Schema: "", Host: "10.0.0.1", Port: 80},
+		{Schema: "socks5", Host: "2001:db8::1", Port: 1080},
+		{Schema: "vless", Host: "5.6.7.8", Port: 443},
+	}
+	for _, p := range proxies {
+		if got, want := p.URLLen(), len(p.URL()); got != want {
+			t.Errorf("URLLen(%s) = %d, want %d", p.URL(), got, want)
+		}
+	}
+	v := &Proxy{Schema: "vless", Host: "5.6.7.8", Port: 443}
+	v.SetVLESS("uuid-here", "", "example.com", "pk", "sid", "")
+	if got, want := v.URLLen(), len(v.URL()); got != want {
+		t.Errorf("vless URLLen = %d, want %d (url %q)", got, want, v.URL())
+	}
+}
+
+// An oversized queue keeps its *newest* entries (the tail), and the file must
+// stay under the budget. The reverse (keeping the head) re-seeds every restart
+// with the stalest entries in the queue.
+func TestSaveBucketAtomicKeepsNewestTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "q.lst")
+	var all []*Proxy
+	for i := 0; i < 200; i++ {
+		all = append(all, &Proxy{Schema: "http", Host: "10.1.2.3", Port: 8000 + i})
+	}
+	// Budget that fits roughly half of them.
+	budget := int64(100 * 30)
+	if err := SaveBucketAtomic(path, all, budget); err != nil {
+		t.Fatal(err)
+	}
+	loaded := ReadQueue(path)
+	if len(loaded) == 0 || len(loaded) >= len(all) {
+		t.Fatalf("loaded %d entries, want a trim of %d", len(loaded), len(all))
+	}
+	if loaded[0].Port <= all[0].Port {
+		t.Fatalf("the kept head is entry port %d, the oldest is %d: the wrong end was trimmed",
+			loaded[0].Port, all[0].Port)
+	}
+	if last := loaded[len(loaded)-1]; last.Port != all[len(all)-1].Port {
+		t.Fatalf("the newest entry (port %d) was dropped; kept tail ends at %d",
+			all[len(all)-1].Port, last.Port)
+	}
+	if st, err := os.Stat(path); err == nil && st.Size() > budget {
+		t.Fatalf("saved file is %d bytes over the %d budget", st.Size(), budget)
+	}
+}

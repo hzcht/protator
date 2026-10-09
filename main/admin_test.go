@@ -30,7 +30,9 @@ func newTestAdmin(t *testing.T) (*admin, *proxy.Bucket, string) {
 	}
 	pool := proxy.NewCandidatePool(filepath.Join(t.TempDir(), "pool.lst"), 1<<20, 10)
 	t.Cleanup(func() { pool.Close() })
-	a := &admin{cfg: cfg, bucket: bucket, pool: pool, started: time.Now(), prevProxies: make(map[string]liveRow), prevHealth: make(map[string]int)}
+	cfg.Collector.SiteMaxFails = 2
+	cfg.Collector.SiteCooldown = proxy.Duration{Duration: 10 * time.Minute}
+	a := &admin{cfg: cfg, bucket: bucket, pool: pool, started: time.Now(), ws: newWSHub(), cfgPath: "config/config.toml"}
 	return a, bucket, cfg.Collector.SitesFile
 }
 
@@ -87,7 +89,18 @@ func TestAdminHealthAndReady(t *testing.T) {
 	if status, _ := doJSON(t, a, http.MethodGet, "/ready", ""); status != http.StatusServiceUnavailable {
 		t.Fatalf("/ready status %d, want 503", status)
 	}
+	// An entry with no proof of life must NOT make the queue ready: a queue of
+	// seeded-but-unverified addresses answers "is anything in the queue" with
+	// yes while every dial fails. Proof (a served response or a passed check)
+	// is what flips it.
 	a.bucket.Add(&proxy.Proxy{Schema: "http", Host: "1.2.3.4", Port: 8080})
+	if status, _ := doJSON(t, a, http.MethodGet, "/ready", ""); status != http.StatusServiceUnavailable {
+		t.Fatalf("/ready status %d after adding an unproven proxy, want 503", status)
+	}
+	proven, _ := proxy.ParseProxyLine("http://5.6.7.8:8080")
+	proven.MarkServeOK(time.Second)
+	a.bucket.Add(proven)
+	a.bucket.Promote(proven)
 	if status, _ := doJSON(t, a, http.MethodGet, "/ready", ""); status != 200 {
 		t.Fatalf("/ready status %d, want 200", status)
 	}
@@ -466,4 +479,172 @@ func readBody(t *testing.T, resp *http.Response) string {
 		t.Fatalf("read body: %v", err)
 	}
 	return string(b)
+}
+
+// --- metrics -------------------------------------------------------------
+
+// /api/metrics must expose counters, per-second rates from two samples, and
+// live gauges. The rate window is the whole point: counters alone cannot tell
+// an operator whether serving is getting better or worse.
+func TestAdminMetricsCountersAndRates(t *testing.T) {
+	a, _, _ := newTestAdmin(t)
+
+	proxy.Stats.Reset()
+	proxy.Stats.Requests.Add(100)
+	proxy.Stats.Checks.Add(200)
+	defer proxy.Stats.Reset()
+
+	status, first := doJSON(t, a, http.MethodGet, "/api/metrics", "")
+	if status != 200 {
+		t.Fatalf("/api/metrics status %d", status)
+	}
+	counters := first["counters"].(map[string]interface{})
+	if counters["requests_total"].(float64) != 100 {
+		t.Fatalf("requests_total = %v", counters["requests_total"])
+	}
+	if gauges := first["gauges"].(map[string]interface{}); gauges["queue_proven"] == nil {
+		t.Errorf("gauges missing queue_proven: %v", gauges)
+	}
+
+	// A second sample a moment later must produce a rate for the delta.
+	time.Sleep(50 * time.Millisecond)
+	proxy.Stats.Requests.Add(50)
+	_, second := doJSON(t, a, http.MethodGet, "/api/metrics", "")
+	rates := second["rates_per_sec"].(map[string]interface{})
+	if rates["requests_total"].(float64) <= 0 {
+		t.Fatalf("requests_per_sec = %v, want > 0", rates["requests_total"])
+	}
+
+	rec := a.call(http.MethodGet, "/api/metrics?format=text", "").do(t)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "requests_total 150") {
+		t.Fatalf("text format: status %d body %q", rec.Code, rec.Body.String())
+	}
+}
+
+// --- logs ----------------------------------------------------------------
+
+// The log tail must come from the same routing the files use, so a collector
+// line lands in the collector category rather than everything in system.
+func TestAdminLogsTailByCategory(t *testing.T) {
+	a, _, _ := newTestAdmin(t)
+	dir := t.TempDir()
+	a.sink = newFileLogSink(proxy.LoggingConfig{Dir: dir})
+	t.Cleanup(func() { _ = a.sink.Close() }) // Windows cannot delete open files
+
+	old := log.Writer()
+	log.SetOutput(a.sink)
+	defer log.SetOutput(old)
+
+	log.Printf("collector: cycle done (3 sites)")
+	log.Printf("checker: pool=10 candidates persisted")
+
+	status, body := doJSON(t, a, http.MethodGet, "/api/logs?category=collector&limit=10", "")
+	if status != 200 {
+		t.Fatalf("/api/logs status %d", status)
+	}
+	lines := body["lines"].([]interface{})
+	if len(lines) != 1 || !strings.Contains(lines[0].(string), "collector: cycle done") {
+		t.Fatalf("collector tail = %v", lines)
+	}
+
+	if _, body := doJSON(t, a, http.MethodGet, "/api/logs", ""); len(body["categories"].([]interface{})) == 0 {
+		t.Error("category list is empty")
+	}
+}
+
+// --- config + token ------------------------------------------------------
+
+// The config view must render the effective config and redact secrets, and the
+// token must gate it. Both halves matter: an unredacted admin page publishes
+// credentials over a listener that was bound for convenience.
+func TestAdminConfigRedactsAndTokenGates(t *testing.T) {
+	a, _, _ := newTestAdmin(t)
+	a.cfg.Server.AdminToken = "s3cret"
+
+	if status, _ := doJSON(t, a, http.MethodGet, "/api/config", ""); status != http.StatusUnauthorized {
+		t.Fatalf("without token: status %d, want 401", status)
+	}
+	if status, _ := doJSON(t, a, http.MethodGet, "/api/config?token=s3cret", ""); status != 200 {
+		t.Fatalf("with query token: status %d, want 200", status)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	a.routes().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("with bearer token: status %d, want 200", rec.Code)
+	}
+
+	var out struct {
+		EffectiveConfig map[string]map[string]interface{} `json:"effective_config"`
+		ConfigPath      string                            `json:"config_path"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.EffectiveConfig["server"]["admin_token"]; got != "<set>" {
+		t.Fatalf("admin_token = %v, want it redacted", got)
+	}
+	if out.ConfigPath == "" {
+		t.Error("config_path is empty")
+	}
+}
+
+// --- actions -------------------------------------------------------------
+
+// The wake and cooldown-reset actions must reach the collector: a button that
+// only looks wired is worse than no button, because it teaches the operator
+// the page lies.
+func TestAdminActionEndpoints(t *testing.T) {
+	a, bucket, sitesFile := newTestAdmin(t)
+	col, err := proxy.NewCollector(a.cfg, bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.collector = col
+	wake := make(chan struct{}, 1)
+	a.wakeCollector = wake
+
+	// Cooling the source, then clearing the cooldown through the API.
+	if col.Stats().Failed(sitesFile) {
+		t.Error("a source that was never fetched must not be cooling")
+	}
+	for i := 0; i < a.cfg.Collector.SiteMaxFails+1; i++ {
+		if a.cfg.Collector.SiteMaxFails == 0 {
+			break
+		}
+		col.Stats().Record(sitesFile, false, 0, 0, "boom")
+	}
+	if !col.Stats().Failed(sitesFile) {
+		t.Fatal("the source should be cooling after repeated failures")
+	}
+	body, err := json.Marshal(map[string]string{"url": sitesFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := doJSON(t, a, http.MethodPost, "/api/sources/cooldown", string(body)); status != 200 {
+		t.Fatalf("cooldown reset: status %d", status)
+	}
+	if col.Stats().Failed(sitesFile) {
+		t.Error("cooldown was not cleared")
+	}
+
+	select {
+	case <-wake:
+		t.Fatal("wake was consumed by the cooldown test")
+	default:
+	}
+	if status, _ := doJSON(t, a, http.MethodPost, "/api/collector/wake", ""); status != 200 {
+		t.Fatalf("wake: status %d", status)
+	}
+	select {
+	case <-wake:
+	default:
+		t.Error("the wake channel was never signalled")
+	}
+
+	// Method discipline on the mutating endpoints.
+	if status, _ := doJSON(t, a, http.MethodGet, "/api/collector/wake", ""); status != http.StatusMethodNotAllowed {
+		t.Errorf("GET on wake: status %d, want 405", status)
+	}
 }

@@ -140,38 +140,71 @@ func parseHTTPStatus(b []byte) (int, error) {
 	return code, nil
 }
 
-// socksDialTimeout extends h12.io/socks's blocking dial with a timeout.
+// socksDialRes is the outcome of one background SOCKS dial.
+type socksDialRes struct {
+	conn net.Conn
+	err  error
+}
+
+// socksDialTimeout bounds h12.io/socks's blocking dial.
+//
+// The timeout has to be handed to the library as a query parameter, not just
+// enforced by the select below: h12.io/socks only sets deadlines on the socket
+// when cfg.Timeout > 0, so without ?timeout= the connect, the greeting and the
+// SOCKS handshake all run unbounded. The select still returns on time, but the
+// abandoned goroutine below then parks on an operation that can take minutes —
+// which is how a scraped proxy that accepts TCP and ignores the greeting leaks
+// a goroutine and a socket per attempt.
 func socksDialTimeout(p *Proxy, timeout time.Duration, ctx context.Context, network, addr string) (net.Conn, error) {
-	dial := socks.Dial(p.URL())
-	type res struct {
-		conn net.Conn
-		err  error
-	}
-	ch := make(chan res, 1)
+	dial := socks.Dial(socksProxyURL(p, timeout))
+	ch := make(chan socksDialRes, 1)
 	go func() {
+		defer RecoverPanic("socks: dial")
 		conn, err := dial(network, addr)
-		ch <- res{conn, err}
+		ch <- socksDialRes{conn, err}
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case r := <-ch:
+		if r.err == nil && r.conn != nil {
+			// The library armed socket deadlines for its own handshake and
+			// clears them on the socks4 path only — socks5 returns the conn
+			// still carrying them. Nothing downstream refreshes a *write*
+			// deadline, so leaving it armed means the first client write at
+			// dial_timeout (5s on the serving path) fails with i/o timeout and
+			// every long session dies. Clear them here.
+			if err := r.conn.SetDeadline(time.Time{}); err != nil {
+				r.conn.Close()
+				return nil, err
+			}
+		}
 		return r.conn, r.err
 	case <-ctx.Done():
-		// The dial may still succeed after we give up; close the late
-		// connection instead of leaking the file descriptor.
-		go func() {
-			if r := <-ch; r.conn != nil {
-				r.conn.Close()
-			}
-		}()
+		closeLateSocksDial(ch)
 		return nil, ctx.Err()
-	case <-time.After(timeout):
-		go func() {
-			if r := <-ch; r.conn != nil {
-				r.conn.Close()
-			}
-		}()
+	case <-timer.C:
+		closeLateSocksDial(ch)
 		return nil, errors.New("socks dial timeout")
 	}
+}
+
+// socksProxyURL is the proxy address with h12.io/socks's timeout query
+// parameter appended, so the library bounds its own socket operations.
+func socksProxyURL(p *Proxy, timeout time.Duration) string {
+	return p.URL() + "?timeout=" + timeout.String()
+}
+
+// closeLateSocksDial reaps a dial that finished after the caller gave up, so
+// its connection is closed rather than leaked. The library's own deadline
+// bounds how long this parks.
+func closeLateSocksDial(ch <-chan socksDialRes) {
+	go func() {
+		defer RecoverPanic("socks: late dial cleanup")
+		if r := <-ch; r.conn != nil {
+			r.conn.Close()
+		}
+	}()
 }
 
 // dialVLESS establishes a VLESS connection through a VLESS proxy.
@@ -357,8 +390,19 @@ func vlessHandshake(conn net.Conn, p *Proxy, addr string) error {
 	// Address: type(1) + len(1) + data... (IPv4=1, Domain=2, IPv6=3)
 	// Port (2 bytes, big endian)
 
-	// Fixed-size buffer on stack: max 1+16+1+2+1+1+255+2 = 279 bytes.
-	var buf [279]byte
+	// Fixed-size buffer on stack. The header is 1+16+1+2 = 20 bytes; the
+	// address is at most type(1)+len(1)+255+port(2).
+	//
+	// addr comes from the client (a SOCKS5 ATYP domain is a single length
+	// byte, so up to 255 bytes, and nothing validates it against the DNS
+	// limit). The old arithmetic double-counted a byte and let a 256-byte
+	// host index past the end of the array, so the check is now on the
+	// address itself rather than on a buffer-size formula.
+	const vlessMaxDomain = 255
+	if len(host) > vlessMaxDomain {
+		return fmt.Errorf("destination host too long for VLESS handshake: %d bytes (max %d)", len(host), vlessMaxDomain)
+	}
+	var buf [1 + 16 + 1 + 2 + 1 + 1 + vlessMaxDomain + 2]byte
 	n := 0
 	buf[n] = 0 // version
 	n++
@@ -396,9 +440,17 @@ func vlessHandshake(conn net.Conn, p *Proxy, addr string) error {
 	binary.BigEndian.PutUint16(buf[n:], uint16(port))
 	n += 2
 
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err = conn.Write(buf[:n])
-	return err
+	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	if _, err = conn.Write(buf[:n]); err != nil {
+		return err
+	}
+	// Clear it again. The connection goes straight to the serving path, and a
+	// SOCKS5 tunnel or a CONNECT tunnel is long-lived: leaving a 10s write
+	// deadline armed killed any session that wrote later than that, even
+	// though nothing was wrong with it.
+	return conn.SetDeadline(time.Time{})
 }
 
 // parseUUID parses a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) to 16 bytes.

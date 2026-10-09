@@ -142,6 +142,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			servedBlock := false
 			if t.block.shouldCheck(resp) && t.block.readAndMark(resp) {
 				servedBlock = true
+				Stats.BlockPages.Add(1)
 				if attempt < t.retries {
 					// Block page instead of content: attribute to the proxy
 					// and re-request through another one.
@@ -169,6 +170,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				// re-request through another proxy; on the last attempt the
 				// junk page is handed back as-is but the charge stands.
 				if p, ok := st.proxyUsed(); p != nil && ok {
+					Stats.ServeFailures.Add(1)
 					st.mark(p)
 					dropPin()
 					if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
@@ -184,6 +186,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			if p, ok := st.proxyUsed(); p != nil && ok {
 				if !servedBlock {
+					Stats.ServedOK.Add(1)
 					p.MarkServeOK(0) // a genuine response: the proxy served it
 					t.fwd.bucket.Promote(p)
 				}
@@ -201,8 +204,10 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			if ok {
 				// Tunnel was up but never answered — a distinct failure class
 				// from a dead dial: response-level health.
+				Stats.ServeFailures.Add(1)
 				if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
 					t.fwd.bucket.Remove(p)
+					Stats.Evictions.Add(1)
 				}
 				dropPin()
 			}

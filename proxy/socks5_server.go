@@ -77,6 +77,10 @@ func (s *Socks5Server) ListenAndServe(ctx context.Context) error {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
+			// One malformed SOCKS5 request must not take down every listener
+			// and the unsaved queue with it; net/http recovers its own
+			// goroutines, this one has no such net.
+			defer RecoverPanic("socks5: session")
 			s.handle(c)
 		}(conn)
 	}
@@ -146,21 +150,33 @@ func (s *Socks5Server) handle(conn net.Conn) {
 		return
 	}
 
+	// The upstream dial below may legitimately consume the whole dialTO
+	// budget (socks5.dial_timeout is 120s). Clear the handshake deadline
+	// before it: the greeting's SetDeadline armed *both* halves, so the
+	// success reply written afterwards would fail its own write deadline on a
+	// slow-but-working upstream, tearing down a tunnel that was just
+	// established. The reply write gets its own bounded deadline instead.
+	_ = conn.SetDeadline(time.Time{})
+
 	ctx, cancel := context.WithTimeout(context.Background(), s.dialTO)
 	up, err := s.dialer.DialContext(ctx, "tcp", target)
 	cancel()
 	if err != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(s.dialTO))
 		s.reply(conn, 0x05) // connection refused
 		return
 	}
 
 	// bnd.addr 0.0.0.0:0 is acceptable to most clients
 	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	_ = conn.SetWriteDeadline(time.Now().Add(s.dialTO))
 	if _, err := conn.Write(reply); err != nil {
 		up.Close()
 		return
 	}
-	conn.SetDeadline(time.Time{})
+	// The tunnel owns its own deadlines now: relayCount sets the idle read
+	// deadline per leg.
+	_ = conn.SetDeadline(time.Time{})
 
 	toUp, toDown := relayCount(conn, up, s.idleTO)
 	// The session ran to completion: settle the proxy's health (the dial only
@@ -253,8 +269,18 @@ func relayCount(a, b net.Conn, idle time.Duration) (fromA, fromB int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	// pipe(dst, src) counts src->dst, so pipe(a, b) is the b->a leg.
-	go func() { defer wg.Done(); fromB = pipe(a, b, idle) }()
-	go func() { defer wg.Done(); fromA = pipe(b, a, idle) }()
+	// A panic on one leg must still let wg.Wait return, or the session
+	// goroutine hangs forever on a WaitGroup that never completes.
+	go func() {
+		defer wg.Done()
+		defer RecoverPanic("socks5: pipe b->a")
+		fromB = pipe(a, b, idle)
+	}()
+	go func() {
+		defer wg.Done()
+		defer RecoverPanic("socks5: pipe a->b")
+		fromA = pipe(b, a, idle)
+	}()
 	wg.Wait()
 	return fromA, fromB
 }
