@@ -1,0 +1,54 @@
+# servertest - "is this proxy actually usable?" smoke tests
+#
+# Format: one test per line, pipe separated, '#' starts a comment:
+#
+#   URL|KIND|VALUE
+#
+# Kinds:
+#   status   - the HTTP status must equal VALUE
+#   contains - the body must contain VALUE (case-insensitive)
+#   regex    - the body must match VALUE
+#   ip       - the body must be a bare IPv4 address (VALUE ignored) - this is
+#              what proves the request really left through an upstream
+#   ipjson   - the body must be JSON containing an "ip"/"origin" field with an
+#              IPv4 address (cloudflare-style trace / httpbin)
+#   nonempty - the body must not be empty
+#   noleak   - the body must NOT contain our own direct IP (checks that the
+#              upstream is not leaking us through X-Forwarded-For / Via)
+#
+# Everything here is a URL a *decent* proxy has to serve: a rotating exit IP
+# echo, a connectivity check that must return 204 (a censoring or block-page
+# proxy answers 200), canonical plain-text pages, and a big-JSON API to prove
+# TLS + SNI + full-body proxying. Keep the list short and stable: these run on
+# every deploy.
+
+# --- connectivity checks: a censoring/transparent proxy answers 200 or a
+# --- redirect here, a working one answers exactly 204 ---
+https://www.gstatic.com/generate_204|status|204
+https://detectportal.firefox.com/success.txt|contains|success
+https://www.google.com/generate_204|status|204
+
+# --- exit-IP echo: proves the traffic really exits somewhere else ---
+https://api.ipify.org|ip|
+http://checkip.amazonaws.com/|ip|
+https://ifconfig.me/ip|ip|
+https://ipinfo.io/ip|ip|
+https://1.1.1.1/cdn-cgi/trace|regex|ip=[0-9]{1,3}(\.[0-9]{1,3}){3}
+
+# --- canonical content over TLS + plaintext HTTP ---
+https://example.com/|contains|Example Domain
+http://example.com/|contains|Example Domain
+http://neverssl.com/|contains|neverSSL
+https://www.wikipedia.org/|contains|Wikipedia
+https://raw.githubusercontent.com/torvalds/linux/master/README|contains|linux
+
+# --- JSON API through the tunnel (TLS, SNI, chunked bodies) ---
+https://api.github.com/|contains|current_user_url
+https://cloudflare.com/cdn-cgi/trace|regex|ip=[0-9]{1,3}(\.[0-9]{1,3}){3}
+
+# --- header passthrough / anonymity smoke test ---
+https://httpbin.org/headers|noleak|
+https://httpbin.org/user-agent|contains|servertest
+
+# --- nonempty sanity for a couple of common services ---
+https://api.ip.sb/ip|ip|

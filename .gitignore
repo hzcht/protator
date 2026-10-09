@@ -44,3 +44,6 @@ TEST*.xml
 # Scratch/junk
 comm.cmd
 AGENTS.md
+
+# Audit findings: local working notes, not part of the tree
+problems.md
