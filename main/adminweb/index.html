@@ -12,13 +12,16 @@
   <div id="tiles" class="tiles"></div>
   <button id="wake" type="button" title="Force a collector cycle now (the site list is re-read)">Collect now</button>
   <button id="refresh" type="button">Refresh</button>
+  <button id="shutdown" type="button" title="Graceful shutdown: drain, save the queue, flush the pool">Shutdown</button>
 </header>
+<div id="beats" class="muted beatsline"></div>
 
 <nav class="tabs">
   <button class="tab active" data-tab="proxies" type="button">Live proxies</button>
   <button class="tab" data-tab="sources" type="button">Sources</button>
   <button class="tab" data-tab="graph" type="button">24h history</button>
   <button class="tab" data-tab="sites" type="button">sites.txt</button>
+  <button class="tab" data-tab="logs" type="button">Logs</button>
 </nav>
 
 <section id="proxies" class="panel active">
@@ -32,6 +35,7 @@
       </select>
     </label>
     <label>Country <input id="country" type="text" size="4" spellcheck="false" placeholder="any"></label>
+    <label>ASN <input id="asn" type="text" size="10" spellcheck="false" placeholder="any"></label>
     <span id="proxyCount" class="muted"></span>
     <button id="retestShown" type="button" title="Re-check everything currently listed through the full checker">Retest shown</button>
     <a id="download" class="button" href="/api/proxies?format=text">Download .txt</a>
@@ -46,7 +50,7 @@
   <table id="proxyTable">
     <thead><tr>
       <th>proxy</th><th>schema</th><th>latency</th><th>ok/fail</th>
-      <th>proof age</th><th>proof</th><th>source</th><th></th><th></th>
+      <th>proof age</th><th>proof</th><th>source</th><th></th><th></th><th></th>
     </tr></thead>
     <tbody></tbody>
   </table>
@@ -86,7 +90,7 @@
   <div class="bar">
     <span id="siteCount" class="muted"></span>
     <form id="addForm" class="inline">
-      <input id="siteUrl" type="text" placeholder="https://example.com/proxy-list.txt" size="52" spellcheck="false">
+      <textarea id="siteUrls" rows="3" cols="52" placeholder="one URL per line — https://example.com/proxy-list.txt" spellcheck="false"></textarea>
       <button type="submit">Add</button>
     </form>
   </div>
@@ -98,6 +102,24 @@
     <thead><tr><th>#</th><th>url</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
+</section>
+
+<section id="logs" class="panel">
+  <div class="bar">
+    <label>Category
+      <select id="logCategory">
+        <option value="collector">collector</option>
+        <option value="checker">checker</option>
+        <option value="serve">serve</option>
+        <option value="system" selected>system</option>
+      </select>
+    </label>
+    <span id="logCount" class="muted"></span>
+  </div>
+  <p class="hint">In-memory tail of the per-category file logs (what also lands
+    in <code>data/logs/</code>). Reading a rotated file over SSH is the first
+    thing an operator does during an incident; this makes it one click.</p>
+  <pre id="logTail" class="logtail"></pre>
 </section>
 
 <div id="toast" class="toast"></div>

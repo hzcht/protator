@@ -140,6 +140,7 @@ func (a *admin) routes() http.Handler {
 	mux.HandleFunc("/api/sites", a.requireAdminToken(a.handleSites))
 	mux.HandleFunc("/api/proxies", a.requireAdminToken(a.handleProxies))
 	mux.HandleFunc("/api/proxies/revalidate", a.requireAdminToken(a.handleProxiesRevalidate))
+	mux.HandleFunc("/api/proxies/drop", a.requireAdminToken(a.handleProxiesDrop))
 	mux.HandleFunc("/api/stats/history", a.requireAdminToken(a.handleStatsHistory))
 	// The WebSocket carries the same live inventory as /api/proxies, so it
 	// goes through the same gate. The check runs on the HTTP upgrade request
@@ -212,6 +213,7 @@ func sameHost(originHost, requestHost string) bool {
 //	GET/POST/DELETE /api/sites  read and edit sites.txt in place (atomic + .bak)
 //	GET  /api/proxies   live proxies; ?scope=hot|served|checked|all&format=text|csv|jsonl
 //	POST /api/proxies/revalidate  force a re-check of the given proxies
+//	POST /api/proxies/drop        remove the given proxies from the live queue now
 //	POST /api/sources/cooldown     clear a source's failure cooldown
 //	POST /api/collector/wake       force a collector cycle now
 //	POST /api/shutdown             graceful process shutdown (drain + save)
@@ -261,6 +263,7 @@ func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Buck
 	go a.startWSNotifier(ctx)
 	a.startStatsRecorder(ctx) // start 24h stats history recorder
 	go func() {
+		defer proxy.RecoverPanic("admin: listener")
 		log.Printf("admin: ui + health on %s (http and https)", ln.Addr())
 		// Runtime accept failure must not exit: log.Fatalf would skip main's
 		// defers and lose the unsaved queue. The bind above is already fatal.
@@ -269,6 +272,7 @@ func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Buck
 		}
 	}()
 	go func() {
+		defer proxy.RecoverPanic("admin: shutdown")
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

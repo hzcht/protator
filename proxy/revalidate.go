@@ -133,6 +133,12 @@ func RevalidateMany(ctx context.Context, checker *Checker, bucket *Bucket, snap 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Backstop for everything outside revalidateOne's per-item
+			// recover (the log line's p.URL(), channel ops): without it a
+			// panic here skips wg.Done and hangs the pass on wg.Wait
+			// forever — after it already killed the process, since this is
+			// a bare goroutine.
+			defer RecoverPanic("revalidate: worker")
 			// Per item, not per worker: a panic on one proxy must cost that
 			// proxy, not the whole worker and its share of the channel.
 			for p := range in {
@@ -182,6 +188,11 @@ func RevalidateMany(ctx context.Context, checker *Checker, bucket *Bucket, snap 
 func revalidateOne(ctx context.Context, checker *Checker, bucket *Bucket, debug *DebugProxies, p *Proxy) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// Counted like every other recovered panic: the worker's
+			// backstop never fires for these (this recover is inner), so
+			// without the counter a panicking proxy shape is invisible in
+			// /api/metrics while it burns a revalidation slot per pass.
+			Stats.RecoverPanics.Add(1)
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()

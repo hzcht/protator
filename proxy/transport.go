@@ -300,24 +300,29 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 type blockDetector struct {
 	active  bool
 	max     int
-	markers []string
+	markers [][]byte // lowercased once at construction; matches do one copy
 }
 
 func newBlockDetector(active bool, maxBytes int) *blockDetector {
 	if maxBytes <= 0 {
 		maxBytes = 16384
 	}
+	raw := []string{
+		"captcha", "recaptcha", "human verification", "verify you are human",
+		"access denied", "access forbidden", "forbidden 403", "request blocked",
+		"access has been blocked", "blocked for security", "unusual traffic",
+		"attention required", "automated access", "enable javascript",
+		"please turn javascript", "antibot", "abuse report", "pagina de verificação",
+		"https://colomaker.info 正在加载", "checking your browser",
+	}
+	markers := make([][]byte, len(raw))
+	for i, m := range raw {
+		markers[i] = []byte(strings.ToLower(m))
+	}
 	return &blockDetector{
-		active: active,
-		max:    maxBytes,
-		markers: []string{
-			"captcha", "recaptcha", "human verification", "verify you are human",
-			"access denied", "access forbidden", "forbidden 403", "request blocked",
-			"access has been blocked", "blocked for security", "unusual traffic",
-			"attention required", "automated access", "enable javascript",
-			"please turn javascript", "antibot", "abuse report", "pagina de verificação",
-			"https://colomaker.info 正在加载", "checking your browser",
-		},
+		active:  active,
+		max:     maxBytes,
+		markers: markers,
 	}
 }
 
@@ -445,12 +450,15 @@ func (bd *blockDetector) readAndMarkBudget(resp *http.Response, budget time.Dura
 }
 
 func (bd *blockDetector) matches(body []byte) bool {
-	s := strings.ToLower(string(body))
-	if strings.TrimSpace(s) == "" {
+	// One copy, not two: the old strings.ToLower(string(body)) allocated the
+	// string and the lowered copy (up to 2×16 KB per sniffed response); the
+	// markers are pre-lowered, so bytes.ToLower is the only allocation left.
+	lower := bytes.ToLower(body)
+	if len(bytes.TrimSpace(lower)) == 0 {
 		return true // fully empty 200 is never real content
 	}
 	for _, m := range bd.markers {
-		if strings.Contains(s, m) {
+		if bytes.Contains(lower, m) {
 			return true
 		}
 	}

@@ -43,7 +43,8 @@ func (a *admin) healthView(tls bool) map[string]interface{} {
 	}
 	counters := proxy.Stats.Snapshot()
 	for _, k := range []string{
-		"requests_total", "dial_attempts_total", "dial_failures_total", "evictions_total",
+		"requests_total", "http_requests_total", "connect_requests_total", "socks5_sessions_total",
+		"dial_attempts_total", "dial_failures_total", "evictions_total",
 		"served_ok_total", "serve_failures_total", "block_pages_total",
 		"checks_total", "checks_passed_total", "checks_failed_total",
 		"collector_cycles_total", "reval_passes_total", "reval_dropped_total",

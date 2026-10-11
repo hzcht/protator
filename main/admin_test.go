@@ -114,7 +114,7 @@ func TestAdminIndexAndAssets(t *testing.T) {
 		t.Fatalf("/ status %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"protator", "Live proxies", "Sources", "sites.txt"} {
+	for _, want := range []string{"protator", "Live proxies", "Sources", "sites.txt", "Logs", "shutdown", "siteUrls", "logTail", "beats"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("index page missing %q", want)
 		}
@@ -126,6 +126,13 @@ func TestAdminIndexAndAssets(t *testing.T) {
 	if rec := a.call(http.MethodGet, "/static/admin.js", "").do(t); rec.Code != 200 ||
 		!strings.HasPrefix(rec.Header().Get("Content-Type"), "application/javascript") {
 		t.Errorf("js: status %d type %q", rec.Code, rec.Header().Get("Content-Type"))
+	} else {
+		js := rec.Body.String()
+		for _, want := range []string{"renderTiles", "loadLogs", "dropButton", "rateSeries", "siteUrls"} {
+			if !strings.Contains(js, want) {
+				t.Errorf("admin.js missing %q", want)
+			}
+		}
 	}
 	if rec := a.call(http.MethodGet, "/nope", "").do(t); rec.Code != 404 {
 		t.Errorf("unknown path: status %d, want 404", rec.Code)
@@ -391,6 +398,70 @@ func TestAdminSitesRefusesToEmpty(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "https://b.example/list.txt") {
 		t.Errorf("the refused delete was written anyway: %s", raw)
+	}
+}
+
+// A bulk paste (multiline box): new lines land, duplicates are reported not
+// duplicated, junk lines are reported not saved, blank lines are ignored —
+// and the file is rewritten once, not per line.
+func TestAdminSitesBulkAdd(t *testing.T) {
+	a, _, path := newTestAdmin(t)
+
+	status, res := doJSON(t, a, http.MethodPost, "/api/sites",
+		`{"urls":["https://n1.example/a.txt","https://a.example/list.txt","not a url","","   ","https://n2.example/b.txt"]}`)
+	if status != 200 {
+		t.Fatalf("bulk add: status %d body %v", status, res)
+	}
+	if res["changed"] != true {
+		t.Errorf("bulk add: changed = %v, want true", res["changed"])
+	}
+	if res["added"].(float64) != 2 {
+		t.Errorf("bulk add: added = %v, want 2", res["added"])
+	}
+	if res["duplicates"].(float64) != 1 {
+		t.Errorf("bulk add: duplicates = %v, want 1 (a.example was already listed)", res["duplicates"])
+	}
+	invalid := res["invalid"].([]interface{})
+	if len(invalid) != 1 {
+		t.Fatalf("bulk add: invalid = %v, want the one junk line", res["invalid"])
+	}
+	if invalid[0].(map[string]interface{})["line"] != "not a url" {
+		t.Errorf("bulk add: invalid line = %v, want the junk", invalid[0])
+	}
+
+	_, got := doJSON(t, a, http.MethodGet, "/api/sites", "")
+	if len(got["entries"].([]interface{})) != 4 {
+		t.Fatalf("after bulk add: %v", got["entries"])
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"https://n1.example/a.txt", "https://n2.example/b.txt"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("%s missing from the file:\n%s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), "not a url") {
+		t.Errorf("junk line was written:\n%s", raw)
+	}
+
+	// Duplicates-only bulk changes nothing and rewrites nothing: drop the .bak
+	// the first bulk created, then a save would have to recreate it.
+	_ = os.Remove(path + ".bak")
+	if status, res := doJSON(t, a, http.MethodPost, "/api/sites",
+		`{"urls":["https://a.example/list.txt"]}`); status != 200 || res["changed"] != false {
+		t.Errorf("dup-only bulk: status %d body %v", status, res)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("dup-only bulk rewrote the file")
+	}
+
+	// Empty bulk is a 400 like the empty single add, not a silent no-op.
+	for _, body := range []string{`{"urls":[]}`, `{"urls":["  ",""]}`, `{}`} {
+		if status, _ := doJSON(t, a, http.MethodPost, "/api/sites", body); status != http.StatusBadRequest {
+			t.Errorf("bulk %s: status %d, want 400", body, status)
+		}
 	}
 }
 
@@ -677,5 +748,46 @@ func TestAdminRevalidateResolvesByLookup(t *testing.T) {
 	notFound := out["not_found"].([]interface{})
 	if len(notFound) != 1 || notFound[0].(string) != "http://9.9.9.9:1" {
 		t.Fatalf("not_found = %v, want the unresolvable URL", notFound)
+	}
+}
+
+// Dropping removes queue entries immediately: the operator override for a
+// burned exit or a poisoned entry that validates fine. Absent URLs are
+// reported, not errors; an empty request is.
+func TestAdminProxiesDrop(t *testing.T) {
+	a, bucket, _ := newTestAdmin(t)
+	live, _ := proxy.ParseProxyLine("http://1.2.3.4:8080")
+	bucket.Add(live)
+
+	body, err := json.Marshal(map[string][]string{
+		"urls": {"http://1.2.3.4:8080", "http://9.9.9.9:1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, out := doJSON(t, a, http.MethodPost, "/api/proxies/drop", string(body))
+	if status != 200 {
+		t.Fatalf("drop: status %d body %v", status, out)
+	}
+	if out["dropped"].(float64) != 1 {
+		t.Fatalf("dropped = %v, want 1", out["dropped"])
+	}
+	notFound := out["not_found"].([]interface{})
+	if len(notFound) != 1 || notFound[0].(string) != "http://9.9.9.9:1" {
+		t.Fatalf("not_found = %v, want the unresolvable URL", notFound)
+	}
+	if bucket.Get("http://1.2.3.4:8080") != nil {
+		t.Fatal("dropped proxy is still in the queue")
+	}
+	// Dropping twice is a no-op the second time, not an error.
+	if status, out := doJSON(t, a, http.MethodPost, "/api/proxies/drop", string(body)); status != 200 || out["dropped"].(float64) != 0 {
+		t.Fatalf("second drop: status %d body %v", status, out)
+	}
+	if status, _ := doJSON(t, a, http.MethodPost, "/api/proxies/drop", `{"urls":[]}`); status != http.StatusBadRequest {
+		t.Fatalf("empty drop: status %d, want 400", status)
+	}
+	rec := a.call(http.MethodGet, "/api/proxies/drop", `{}`).do(t)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET drop: status %d, want 405", rec.Code)
 	}
 }

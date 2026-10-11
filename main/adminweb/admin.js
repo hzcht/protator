@@ -64,26 +64,66 @@ async function post(method, url, payload) {
   return j;
 }
 
-function tile(k, v) {
+function tile(k, v, title) {
   const t = el('div', undefined, 'tile');
+  if (title) t.title = title;
   t.append(el('span', k, 'k'), el('span', String(v), 'v'));
   return t;
 }
 
-async function loadHealth() {
-  const h = await get('/health');
-  const tiles = $('#tiles');
-  tiles.replaceChildren(
+function ageStr(s) {
+  if (s === undefined || s === null) return '-';
+  s = Math.floor(s);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h';
+}
+
+// renderTiles is shared by the HTTP poll and the WebSocket push: two copies
+// of this list drifted before (the WS path lagged every new signal), so both
+// call this one function.
+function renderTiles(h) {
+  const reqTitle = 'per front — http ' + num(h.http_requests_total) +
+    ' · connect ' + num(h.connect_requests_total) +
+    ' · socks5 ' + num(h.socks5_sessions_total);
+  $('#tiles').replaceChildren(
     tile('live', num(h.queue_live)),
     tile('proven', num(h.queue_proven)),
     tile('hot', num(h.queue_hot)),
     tile('pool', num(h.pool_candidates)),
+    tile('req', num(h.requests_total), reqTitle),
     tile('served', num(h.served_ok_total)),
+    tile('servefail', num(h.serve_failures_total)),
     tile('dialfail', num(h.dial_failures_total)),
+    tile('blocks', num(h.block_pages_total)),
     tile('checks', num(h.checks_total)),
+    tile('panics', num(h.recovered_panics_total),
+      'recovered panics process-wide — a climbing number is the bug report'),
+    tile('restarts', num(h.worker_restarts),
+      'checker worker restarts — the supervisor restarts a worker that exits'),
     tile('uptime', Math.floor(h.uptime_seconds / 60) + 'm'),
     tile('tls', h.tls ? 'yes' : 'no'),
   );
+  // Subsystem freshness: a crashed collector and a merely-slow one look
+  // identical in counters; ages tell them apart. One stale subsystem is the
+  // first thing to check when the numbers stop moving.
+  const beat = $('#beats');
+  if (beat) {
+    if (!h.beats) { beat.textContent = ''; }
+    else {
+      const b = h.beats;
+      const part = (label, age, stale) =>
+        label + ' ' + ageStr(age) + (stale ? ' STALE' : '');
+      beat.textContent = part('collector', b.collector_age_s, b.collector_stale) + ' · ' +
+        part('revalidate', b.revalidate_age_s, b.revalidate_stale) + ' · ' +
+        part('save', b.save_age_s, b.save_stale);
+    }
+  }
+}
+
+async function loadHealth() {
+  const h = await get('/health');
+  renderTiles(h);
   // The wake button is the *remedy* for a stale collector: enable it when
   // the collector is stale (the moment it is needed), not disable it.
   $('#wake').disabled = !!h.beats && !h.beats.collector_stale;
@@ -96,8 +136,10 @@ async function loadHealth() {
 async function loadProxies() {
   const scope = $('#scope').value;
   const country = $('#country').value.trim();
+  const asn = $('#asn').value.trim();
   let url = '/api/proxies?scope=' + encodeURIComponent(scope) + '&limit=' + pageSize;
   if (country) url += '&country=' + encodeURIComponent(country);
+  if (asn) url += '&asn=' + encodeURIComponent(asn);
   const d = await get(url);
   $('#proxyCount').textContent = d.total > d.count
     ? num(d.count) + ' best of ' + num(d.total) + ' in scope (window ' +
@@ -149,7 +191,34 @@ function proxyCells(p) {
     p.source || '-',
     copyButton(p.url),
     retestButton([p.url]),
+    dropButton(p.url),
   ];
+}
+
+// dropButton removes one proxy from the live queue now — the operator
+// override for a burned exit IP or a poisoned entry that validates fine.
+// Confirm-gated like the site delete: there is no undo short of the next
+// collector cycle re-adding the address.
+function dropButton(url) {
+  const b = el('button', 'drop', '');
+  b.title = 'Remove from the live queue now (no re-check)';
+  b.onclick = async () => {
+    if (!confirm('Drop ' + url + ' from the live queue?')) return;
+    b.disabled = true;
+    try {
+      const j = await post('POST', '/api/proxies/drop', { urls: [url] });
+      if (j.dropped) {
+        toast('dropped ' + url);
+        const row = document.querySelector('#proxyTable tbody tr[data-url="' + escapeSelector(url) + '"]');
+        if (row) row.remove();
+        listed = listed.filter((p) => p.url !== url);
+      } else {
+        toast('already gone: ' + url);
+        loadProxies();
+      }
+    } catch (e) { toast(e.message, true); b.disabled = false; }
+  };
+  return b;
 }
 
 function copyButton(url) {
@@ -235,6 +304,16 @@ async function loadSites() {
   });
 }
 
+// loadLogs shows the in-memory tail of one log category: the same lines
+// that land in data/logs/*.log. Category files rotate; this tail does not.
+async function loadLogs() {
+  const cat = $('#logCategory').value;
+  const d = await get('/api/logs?category=' + encodeURIComponent(cat) + '&limit=200');
+  const lines = d.lines || [];
+  $('#logCount').textContent = num(lines.length) + ' recent lines — ' + cat;
+  $('#logTail').textContent = lines.join('\n') || '(empty)';
+}
+
 function renderSources(sources) {
   $('#sourceCount').textContent =
     num(sources.filter(s => s.alive > 0).length) + ' of ' + num(sources.filter(s => !s.unproven).length) +
@@ -274,6 +353,15 @@ const series = [
   { key: 'pool_candidates', label: 'pool candidates', color: '#e2b23c' },
 ];
 
+// Rate series share the samples but not the scale: requests/min next to a
+// 50k queue would be a flat line at zero on the left axis. They get the
+// right axis, dashed. These are the numbers the hint talks about — sizes
+// say how big the pool is, rates say whether it is getting better or worse.
+const rateSeries = [
+  { key: 'requests_per_min', label: 'req/min', color: '#b48cff' },
+  { key: 'dial_fail_per_min', label: 'dialfail/min', color: '#e2603f' },
+];
+
 async function loadGraph() {
   const d = await get('/api/stats/history');
   const samples = d.samples || [];
@@ -288,7 +376,15 @@ async function loadGraph() {
     dot.style.background = s.color;
     item.append(dot, document.createTextNode(s.label));
     return item;
-  }));
+  }).concat(rateSeries.map((s) => {
+    const item = el('span');
+    const dot = el('i');
+    dot.style.background = s.color;
+    dot.style.height = '0';
+    dot.style.borderTop = '2px dashed ' + s.color;
+    item.append(dot, document.createTextNode(s.label + ' (right)'));
+    return item;
+  })));
 }
 
 // drawChart renders the queue-size series as polylines. Four series over a
@@ -297,30 +393,40 @@ async function loadGraph() {
 function drawChart(samples) {
   const cv = $('#chart');
   const ctx = cv.getContext('2d');
-  const w = cv.width, h = cv.height, pad = 8;
+  const w = cv.width, h = cv.height, pad = 8, rpad = 52;
   ctx.clearRect(0, 0, w, h);
   if (!samples.length) return;
-  let max = 1;
+  let max = 1, maxRate = 1;
   for (const s of samples) {
     for (const ser of series) {
       const v = s[ser.key] || 0;
       if (v > max) max = v;
     }
+    for (const ser of rateSeries) {
+      const v = s[ser.key] || 0;
+      if (v > maxRate) maxRate = v;
+    }
   }
-  const x = (i) => pad + (i * (w - 2 * pad)) / Math.max(1, samples.length - 1);
+  const x = (i) => pad + (i * (w - pad - rpad)) / Math.max(1, samples.length - 1);
   const y = (v) => h - pad - (v * (h - 2 * pad)) / max;
+  const yRate = (v) => h - pad - (v * (h - 2 * pad)) / maxRate;
   // Grid: 4 horizontal lines with their values.
   ctx.strokeStyle = '#262b36';
   ctx.fillStyle = '#8b93a3';
   ctx.font = '11px monospace';
   for (let g = 0; g <= 4; g++) {
     const v = (max * g) / 4, yy = y(v);
-    ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(w - pad, yy); ctx.stroke();
-    ctx.fillText(Math.round(v).toLocaleString(), w - pad - 46, yy - 3);
+    ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(w - rpad, yy); ctx.stroke();
+    ctx.fillText(Math.round(v).toLocaleString(), w - rpad - 46, yy - 3);
+    // Right axis: the rate scale, so req/min and dialfail/min stay readable
+    // next to queue sizes thousands of times larger.
+    const rv = (maxRate * g) / 4;
+    ctx.fillText(Math.round(rv).toLocaleString(), w - rpad + 6, yy - 3);
   }
   for (const ser of series) {
     ctx.strokeStyle = ser.color;
     ctx.lineWidth = 2;
+    ctx.setLineDash([]);
     ctx.beginPath();
     samples.forEach((s, i) => {
       const yy = y(s[ser.key] || 0);
@@ -328,6 +434,18 @@ function drawChart(samples) {
     });
     ctx.stroke();
   }
+  for (const ser of rateSeries) {
+    ctx.strokeStyle = ser.color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    samples.forEach((s, i) => {
+      const yy = yRate(s[ser.key] || 0);
+      if (i === 0) ctx.moveTo(x(i), yy); else ctx.lineTo(x(i), yy);
+    });
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
 }
 
 function currentTab() {
@@ -339,16 +457,47 @@ function refresh() {
     currentTab() === 'proxies' ? loadProxies() : Promise.resolve(),
     currentTab() === 'sources' ? loadSources() : Promise.resolve(),
     currentTab() === 'graph' ? loadGraph() : Promise.resolve(),
-    currentTab() === 'sites' ? loadSites() : Promise.resolve()];
+    currentTab() === 'sites' ? loadSites() : Promise.resolve(),
+    currentTab() === 'logs' ? loadLogs() : Promise.resolve()];
   Promise.all(jobs).catch((e) => toast(e.message || String(e), true));
 }
 
 $('#scope').onchange = loadProxies;
+$('#country').onchange = loadProxies;
+$('#asn').onchange = loadProxies;
+$('#logCategory').onchange = loadLogs;
 $('#refresh').onclick = () => refresh();
+// The add-sites form used to have no handler at all: the native GET submit
+// reloaded the page (landing back on the default tab) and the paste never
+// reached the API — every "add" silently did nothing.
+$('#addForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const box = $('#siteUrls');
+  const lines = box.value.split('\n').map((s) => s.trim()).filter((s) => s !== '');
+  if (!lines.length) { toast('paste at least one URL', true); box.focus(); return; }
+  try {
+    const j = await post('POST', '/api/sites', { urls: lines });
+    const parts = [];
+    if (j.added) parts.push('added ' + j.added);
+    if (j.duplicates) parts.push(j.duplicates + ' duplicate' + (j.duplicates > 1 ? 's' : '') + ' skipped');
+    if (j.invalid && j.invalid.length) parts.push(j.invalid.length + ' invalid: ' +
+      j.invalid.map((x) => x.line).join(', '));
+    toast(parts.join(', ') || 'nothing to add');
+    if (j.added) box.value = '';
+    loadSites(); // no reload: the view stays on the sites tab
+  } catch (err) { toast(err.message, true); }
+};
 $('#wake').onclick = async () => {
   try {
     const j = await post('POST', '/api/collector/wake', {});
     toast(j.note || 'collector woken');
+  } catch (e) { toast(e.message, true); }
+};
+$('#shutdown').onclick = async () => {
+  if (!confirm('Shut down protator now? It drains requests, saves the queue and flushes the pool first.')) return;
+  try {
+    const j = await post('POST', '/api/shutdown', {});
+    toast(j.note || 'shutting down');
   } catch (e) { toast(e.message, true); }
 };
 $('#retestShown').onclick = async () => {
@@ -367,6 +516,7 @@ document.querySelectorAll('.tab').forEach((t) => {
     t.classList.add('active');
     $('#' + t.dataset.tab).classList.add('active');
     if (t.dataset.tab === 'graph') loadGraph();
+    if (t.dataset.tab === 'logs') loadLogs();
   };
 });
 
@@ -396,19 +546,7 @@ function connectWS() {
 
 function applyWSMessage(msg) {
   if (msg.health) {
-    const h = msg.health;
-    const tiles = $('#tiles');
-    tiles.replaceChildren(
-      tile('live', num(h.queue_live)),
-      tile('proven', num(h.queue_proven)),
-      tile('hot', num(h.queue_hot)),
-      tile('pool', num(h.pool_candidates)),
-      tile('served', num(h.served_ok_total)),
-      tile('dialfail', num(h.dial_failures_total)),
-      tile('checks', num(h.checks_total)),
-      tile('uptime', Math.floor(h.uptime_seconds / 60) + 'm'),
-      tile('tls', h.tls ? 'yes' : 'no'),
-    );
+    renderTiles(msg.health);
   }
   // Handle delta updates (type "delta") - incremental changes
   if (msg.type === 'delta') {

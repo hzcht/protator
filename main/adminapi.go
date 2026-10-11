@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -345,6 +346,7 @@ func (a *admin) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	// Cancel after the response is on the wire: cancelling first tears the
 	// listener down and the client would see a connection reset instead.
 	go func() {
+		defer proxy.RecoverPanic("admin: delayed shutdown")
 		time.Sleep(50 * time.Millisecond)
 		a.procCancel()
 	}()
@@ -365,8 +367,13 @@ func (a *admin) handleSites(w http.ResponseWriter, r *http.Request) {
 			"entries":  list.URLs(),
 		})
 	case http.MethodPost:
+		// Single URL or a bulk paste from the multiline box: {url} or
+		// {urls: [...]}. Every line goes through SiteList.Add (validated,
+		// normalized, deduped); the file is rewritten once per request, not
+		// per line, so a 50-line paste is one atomic save with one .bak.
 		var body struct {
-			URL string `json:"url"`
+			URL  string   `json:"url"`
+			URLs []string `json:"urls"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -379,24 +386,67 @@ func (a *admin) handleSites(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		added, err := list.Add(body.URL)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+		if len(body.URLs) == 0 && body.URL == "" {
+			writeError(w, http.StatusBadRequest, "url or urls[] required")
 			return
 		}
-		if !added {
+		if len(body.URLs) == 0 {
+			added, err := list.Add(body.URL)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			if !added {
+				writeJSON(w, map[string]interface{}{
+					"ok": true, "changed": false, "added": false,
+					"entries": len(list.URLs()), "reason": "already in the list",
+				})
+				return
+			}
+			if err := proxy.SaveSiteList(list); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 			writeJSON(w, map[string]interface{}{
-				"ok": true, "changed": false, "added": false,
-				"entries": len(list.URLs()), "reason": "already in the list",
+				"ok": true, "changed": true, "added": true,
+				"entries": len(list.URLs()), "note": "picked up on the next collector cycle",
 			})
 			return
 		}
-		if err := proxy.SaveSiteList(list); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+		raws := body.URLs
+		if body.URL != "" {
+			raws = append([]string{body.URL}, raws...)
+		}
+		var added, dups int
+		invalid := []map[string]string{}
+		for _, raw := range raws {
+			if strings.TrimSpace(raw) == "" {
+				continue // pasted blank lines are not errors
+			}
+			ok, err := list.Add(raw)
+			if err != nil {
+				invalid = append(invalid, map[string]string{"line": raw, "reason": err.Error()})
+				continue
+			}
+			if !ok {
+				dups++
+				continue
+			}
+			added++
+		}
+		if added == 0 && dups == 0 && len(invalid) == 0 {
+			writeError(w, http.StatusBadRequest, "url or urls[] required")
 			return
 		}
+		if added > 0 {
+			if err := proxy.SaveSiteList(list); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 		writeJSON(w, map[string]interface{}{
-			"ok": true, "changed": true, "added": true,
+			"ok": true, "changed": added > 0,
+			"added": added, "duplicates": dups, "invalid": invalid,
 			"entries": len(list.URLs()), "note": "picked up on the next collector cycle",
 		})
 	case http.MethodDelete:
@@ -580,6 +630,51 @@ func (a *admin) handleProxiesRevalidate(w http.ResponseWriter, r *http.Request) 
 		"revalidated": revalidated,
 		"not_found":   notFound,
 		"note":        "re-checking now; dead entries are dropped, live ones stay",
+	})
+}
+
+// handleProxiesDrop removes selected proxies from the live queue immediately.
+// POST body: {"urls": ["scheme://host:port", ...]}.
+// Unlike revalidation (which re-checks and drops only the dead), this is an
+// operator override: a burned exit IP, a proxy that must not serve even
+// though it validates, a poisoned entry. Resolution is one bucket lookup per
+// URL (Get, not a snapshot index — same shape as the revalidate handler).
+func (a *admin) handleProxiesDrop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	var body struct {
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if len(body.URLs) == 0 {
+		writeError(w, http.StatusBadRequest, "urls[] required")
+		return
+	}
+	var dropped int
+	var notFound []string
+	for _, key := range body.URLs {
+		p := a.bucket.Get(key)
+		if p == nil {
+			notFound = append(notFound, key)
+			continue
+		}
+		if a.bucket.Remove(p) {
+			dropped++
+		} else {
+			notFound = append(notFound, key)
+		}
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok":        true,
+		"dropped":   dropped,
+		"not_found": notFound,
+		"note":      "removed from the live queue now; the checker may re-add an address if a source still lists it",
 	})
 }
 

@@ -30,6 +30,7 @@ func startServers(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, 
 		// running main's defers, so a transient accept failure (fd exhaustion)
 		// would cost the unsaved queue — exactly what the HTTP change avoids.
 		go func() {
+			defer proxy.RecoverPanic("socks5: listener")
 			log.Printf("socks5: proxy listening on %s", cfg.Socks5.Listen)
 			if err := socks.ListenAndServe(ctx); err != nil {
 				log.Printf("socks5: serve stopped on %s: %v", cfg.Socks5.Listen, err)
@@ -89,6 +90,9 @@ func startHTTPServer(cfg *proxy.Config, fwd *proxy.ForwardDialer, logNoise *log.
 // "all listeners ready" summary in startServers cannot print first and make
 // the startup banner lie about what is listening.
 func serveListener(srv *http.Server, ln net.Listener, name, addr string) {
+	// Bare goroutine per the wiring above: net/http recovers its own
+	// per-connection panics, but nothing recovers this frame itself.
+	defer proxy.RecoverPanic(name + ": listener")
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Printf("%s: serve stopped on %s: %v", name, addr, err)
 	}
