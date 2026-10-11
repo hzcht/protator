@@ -22,6 +22,28 @@ func LoadOrCreateTLS(certFile, keyFile string) (tls.Certificate, error) {
 	return generateSelfSigned()
 }
 
+// CertNotAfter reports when the leaf certificate expires. Used to warn before
+// an expired pair turns every https:// upstream dial into a TLS error that
+// looks exactly like proxy death.
+func CertNotAfter(cert tls.Certificate) (time.Time, bool) {
+	if cert.Leaf != nil {
+		return cert.Leaf.NotAfter, true
+	}
+	if len(cert.Certificate) == 0 {
+		return time.Time{}, false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return leaf.NotAfter, true
+}
+
+// CertWarnDays is how far ahead of expiry the startup and -check paths start
+// shouting. Regenerating means deleting the pair (or pointing at a new one),
+// so the operator needs lead time, not a post-mortem.
+const CertWarnDays = 30 * 24 * time.Hour
+
 func generateSelfSigned() (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

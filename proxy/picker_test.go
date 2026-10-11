@@ -61,6 +61,59 @@ func hostAt(i int) string {
 	return fmt.Sprintf("10.%d.%d.%d", i/65536, i/256%256, i%256)
 }
 
+// At max capacity addLocked evicts proxies[0] (oldest insertion) to make room.
+// That slot can hold a freshly proven hot entry, so the eviction must demote
+// it from the hot tail and notify subscribers — otherwise the tail keeps a
+// pointer the queue no longer owns, and the dialer's loop set and pins never
+// hear about the removal.
+func TestBucketEvictionAtMaxDemotesAndNotifies(t *testing.T) {
+	const max = 4
+	b := NewBucket(max)
+	var removed []string
+	b.Subscribe(func(p *Proxy, added bool) {
+		if !added {
+			removed = append(removed, p.Key())
+		}
+	})
+	// Fill to capacity, then prove the oldest: it now sits in hot AND in the
+	// eviction slot. The promoted pointer must be the resident Add stored,
+	// not an equal-valued copy: the hot index is keyed by pointer.
+	residents := make([]*Proxy, max)
+	for i := range residents {
+		residents[i] = &Proxy{Schema: "http", Host: hostAt(i), Port: 8080}
+		b.Add(residents[i])
+	}
+	victim := residents[0]
+	b.Promote(victim)
+	if b.HotLen() != 1 {
+		t.Fatalf("HotLen = %d, want 1", b.HotLen())
+	}
+	// One more add evicts proxies[0].
+	fresh := &Proxy{Schema: "http", Host: hostAt(100), Port: 8080}
+	if !b.Add(fresh) {
+		t.Fatal("Add at max refused")
+	}
+	if b.Len() != max {
+		t.Fatalf("Len = %d, want %d", b.Len(), max)
+	}
+	if b.HotLen() != 0 {
+		t.Fatalf("HotLen = %d, want 0 (evicted entry must leave the tail)", b.HotLen())
+	}
+	if len(removed) != 1 || removed[0] != victim.Key() {
+		t.Fatalf("removed = %v, want [%s]", removed, victim.Key())
+	}
+	// The evicted proxy must not be pickable anymore.
+	for i := 0; i < 50; i++ {
+		p, err := b.PickHealthy(context.Background(), 8, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Key() == victim.Key() {
+			t.Fatalf("evicted proxy %s still pickable", victim.Key())
+		}
+	}
+}
+
 // With nothing proven at all — a cold start before revalidation has reached
 // anything — the picker must still return something. Refusing to serve would
 // turn a thin pool into a hard outage, and an unproven proxy is still a

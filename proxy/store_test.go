@@ -292,3 +292,45 @@ func TestSaveBucketAtomicKeepsNewestTail(t *testing.T) {
 		t.Fatalf("saved file is %d bytes over the %d budget", st.Size(), budget)
 	}
 }
+
+// A crash between CreateTemp and rename leaves temp files behind (their
+// cleanup defer never ran). SweepOrphanTMP removes exactly those patterns at
+// startup and nothing else.
+func TestSweepOrphanTMP(t *testing.T) {
+	dir := t.TempDir()
+	orphans := []string{
+		filepath.Join(dir, ".sites-123456.tmp"),
+		filepath.Join(dir, ".queue-999999.tmp"),
+		filepath.Join(dir, "debug_proxies.txt.tmp"),
+	}
+	for _, f := range orphans {
+		if err := os.WriteFile(f, []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Files that must survive: the real targets, a .bak, an unrelated .tmp.
+	survivors := []string{
+		filepath.Join(dir, "sites.txt"),
+		filepath.Join(dir, "proxy.lst"),
+		filepath.Join(dir, "sites.txt.bak"),
+		filepath.Join(dir, "other.tmp"), // not one of our patterns
+	}
+	for _, f := range survivors {
+		if err := os.WriteFile(f, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	SweepOrphanTMP(dir)
+
+	for _, f := range orphans {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("orphan %s was not swept (err=%v)", filepath.Base(f), err)
+		}
+	}
+	for _, f := range survivors {
+		if _, err := os.Stat(f); err != nil {
+			t.Errorf("sweep removed a file it must not touch: %s (%v)", filepath.Base(f), err)
+		}
+	}
+}

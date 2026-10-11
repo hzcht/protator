@@ -57,7 +57,13 @@ func (r ExitReason) String() string {
 func RunCheckLoop(candidates <-chan Candidate, checker *Checker, pool *CandidatePool, bucket *Bucket, debug *DebugProxies, cfg *Config, stop <-chan struct{}, done *sync.WaitGroup) ExitReason {
 	defer done.Done()
 	persisted := 0
+	// Panic streak, counted by time window rather than consecutively: a panic
+	// on every other candidate never reaches a consecutive limit, so without
+	// the window a deterministically crashing shape logs forever at full rate
+	// and burns a core doing it.
+	const panicWindow = time.Minute
 	panics := 0
+	windowStart := time.Now()
 	for {
 		var cand Candidate
 		// No default branch: the select must block. With one, a worker whose
@@ -74,15 +80,21 @@ func RunCheckLoop(candidates <-chan Candidate, checker *Checker, pool *Candidate
 		case <-stop:
 			return ExitStopped
 		}
+		// runOne already logged and counted the panic inside its own recover;
+		// this only tracks the streak. (Calling RecoverPanic here would be a
+		// no-op: recover() returns nil outside a panic.)
 		if err := runOne(cand, checker, pool, bucket, debug, cfg, &persisted); err != nil {
-			RecoverPanic(fmt.Sprintf("checker: candidate %s:%d: %v", cand.Host, cand.Port, err))
+			now := time.Now()
+			if now.Sub(windowStart) > panicWindow {
+				panics, windowStart = 0, now
+			}
 			if panics++; panics >= panicStreakLimit {
-				log.Printf("checker: %d panics in a row without a clean candidate; giving up this worker", panics)
+				log.Printf("checker: %d panics within %s without a break; giving up this worker", panics, panicWindow)
 				return ExitPanicStreak
 			}
 			continue
 		}
-		panics = 0
+		panics, windowStart = 0, time.Now()
 	}
 }
 
@@ -94,9 +106,16 @@ const panicStreakLimit = 20
 
 // runOne validates one candidate. It returns a non-nil error only after
 // recovering a panic, so the caller can log which candidate lost the worker.
+//
+// The panic is logged and counted here, inside the deferred recover: calling
+// RecoverPanic afterwards (outside the panic) would be a no-op, because
+// recover() returns nil there — which is how recovered panics used to stay
+// completely invisible, with only the streak cap ever surfacing.
 func runOne(cand Candidate, checker *Checker, pool *CandidatePool, bucket *Bucket, debug *DebugProxies, cfg *Config, persisted *int) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			Stats.RecoverPanics.Add(1)
+			log.Printf("checker: panic on %s:%d: %v", cand.Host, cand.Port, r)
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
@@ -133,6 +152,7 @@ func runOne(cand Candidate, checker *Checker, pool *CandidatePool, bucket *Bucke
 // periodic revalidation pass churns them — so there is no reason to let them
 // starve everything else at startup.
 func RevalidateSeeded(ctx context.Context, candidates chan<- Candidate, snap []*Proxy, rate, maxSeeds int) {
+	defer RecoverPanic("revalidate: seeds")
 	if rate <= 0 {
 		rate = 200 // seeds per second
 	}

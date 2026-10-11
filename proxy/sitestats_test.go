@@ -62,8 +62,14 @@ func TestSiteRegistryCooldownExpires(t *testing.T) {
 	if r.Failed(url) {
 		t.Error("the cooldown must lapse on its own")
 	}
-	if s := r.Site(url); !s.CoolUntil.IsZero() {
+	s := r.Site(url)
+	if !s.CoolUntil.IsZero() {
 		t.Errorf("an expired cooldown must be cleared, got %v", s.CoolUntil)
+	}
+	// The streak decays with the cooldown: otherwise Fails stays at/over the
+	// limit forever and the very next failure re-arms a full cooldown.
+	if s.Fails != 0 {
+		t.Errorf("Fails = %d after the cooldown lapsed, want 0", s.Fails)
 	}
 }
 

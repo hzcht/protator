@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/pprof"
 	"strconv"
@@ -53,15 +54,29 @@ type admin struct {
 	// empty-queue watchdog uses. Set by startAdminServer; nil in tests.
 	wakeCollector chan<- struct{}
 
+	// procCancel triggers the process-wide graceful shutdown (the same
+	// context SIGTERM cancels). It backs POST /api/shutdown, which is how
+	// stop.ps1 stops the daemon on Windows: Stop-Process is TerminateProcess
+	// and would skip every defer in main. nil in tests.
+	procCancel func()
+
 	// sitesMu serializes the editor's read-modify-write. Two POSTs racing on
 	// the same file would both read the old list and the second save would
 	// drop the first one's entry. Only the write path takes it; GET does not
 	// need to, because the save is an atomic rename.
 	sitesMu sync.Mutex
 
-	// statsMu guards the 24h history ring (1 sample per minute = 1440 entries).
+	// statsMu guards the 24h history ring (1 sample per minute = 1440 entries)
+	// and the recorder's own previous snapshot below.
 	statsMu   sync.Mutex
 	statsHist []statsSample
+	// histPrev/histPrevAt are the previous recorder sample. Rates are computed
+	// sample-to-sample on the recorder's own minute cadence — not against the
+	// /api/metrics scrape window, which the page never scrapes (so the rates
+	// used to read zero forever) and which concurrent scrapers would shorten
+	// under each other.
+	histPrev   map[string]int64
+	histPrevAt time.Time
 
 	ws *wsHub
 
@@ -87,27 +102,20 @@ type statsSample struct {
 }
 
 // recordStatsSample adds a sample to the 24h ring buffer (1440 minutes max).
-//
-// The rate window (lastMetrics/lastMetricsAt) is guarded by metricsMu, because
-// countersAndRates rewrites it from the /api/metrics handler goroutine while
-// this runs from the recorder: an unsynchronised read of that map is a
-// concurrent map read/write, which the runtime answers with a panic.
 func (a *admin) recordStatsSample() {
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
 	now := time.Now()
+	c := proxy.Stats.Snapshot()
 	rpm, cpm, dpm := 0.0, 0.0, 0.0
-	a.metricsMu.Lock()
-	if a.hasMetricsSample && !a.lastMetricsAt.IsZero() {
-		mins := now.Sub(a.lastMetricsAt).Minutes()
-		if mins > 0 {
-			c := proxy.Stats.Snapshot()
-			rpm = deltaPerMin(c["requests_total"], a.lastMetrics["requests_total"], mins)
-			cpm = deltaPerMin(c["checks_total"], a.lastMetrics["checks_total"], mins)
-			dpm = deltaPerMin(c["dial_failures_total"], a.lastMetrics["dial_failures_total"], mins)
+	if a.histPrev != nil && !a.histPrevAt.IsZero() {
+		if mins := now.Sub(a.histPrevAt).Minutes(); mins > 0 {
+			rpm = deltaPerMin(c["requests_total"], a.histPrev["requests_total"], mins)
+			cpm = deltaPerMin(c["checks_total"], a.histPrev["checks_total"], mins)
+			dpm = deltaPerMin(c["dial_failures_total"], a.histPrev["dial_failures_total"], mins)
 		}
 	}
-	a.metricsMu.Unlock()
+	a.histPrev, a.histPrevAt = c, now
 	a.statsHist = append(a.statsHist, statsSample{
 		Time:           now,
 		QueueLive:      a.bucket.Len(),
@@ -306,6 +314,7 @@ func (a *admin) handleCollectorWake(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case a.wakeCollector <- struct{}{}:
+		proxy.Stats.CollectorWakes.Add(1)
 		writeJSON(w, map[string]interface{}{
 			"ok": true, "note": "emergency collector cycle started",
 		})
@@ -315,6 +324,32 @@ func (a *admin) handleCollectorWake(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 }
+
+// handleShutdown cancels the process lifetime context, which runs main's own
+// graceful sequence: stop accepting, drain in-flight requests within
+// shutdown_timeout, save the queue, flush the pool. It exists because Windows
+// has no SIGTERM — Stop-Process is TerminateProcess and would lose the queue
+// tail on every scheduled stop.
+func (a *admin) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	if a.procCancel == nil {
+		writeError(w, http.StatusServiceUnavailable, "shutdown is not wired up")
+		return
+	}
+	log.Printf("admin: graceful shutdown requested via /api/shutdown")
+	writeJSON(w, map[string]interface{}{"ok": true, "note": "shutting down"})
+	// Cancel after the response is on the wire: cancelling first tears the
+	// listener down and the client would see a connection reset instead.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		a.procCancel()
+	}()
+}
+
 func (a *admin) handleSites(w http.ResponseWriter, r *http.Request) {
 	path := a.cfg.Collector.SitesFile
 	switch r.Method {
@@ -440,8 +475,20 @@ func (a *admin) handleProxies(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		limit = n
+		// An explicit limit is still a limit: without the clamp a scripted
+		// loop with ?limit=0 (or =2000000) re-ranks the whole queue per
+		// request. Downloads get the export cap, pages the row cap.
+		if text || csv || jsonl {
+			if limit == 0 || limit > maxExportRows {
+				limit = maxExportRows
+			}
+		} else if limit == 0 || limit > maxExportRows {
+			limit = jsonRowCap
+		}
 	} else if !text && !csv && !jsonl {
 		limit = jsonRowCap
+	} else {
+		limit = maxExportRows
 	}
 	rows, total := a.live(scope, limit, countryFilter, asnFilter)
 	switch {
@@ -577,10 +624,16 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 
 // writeError keeps every response on the API JSON, including failures: the UI
 // shows the message directly, so a text/plain 400 would be unreadable there.
+//
+// writeJSON sets the Content-Type, so it must run before WriteHeader: headers
+// set after the status is written never reach the wire (the response ships as
+// sniffed text/plain instead). Same trap handleReady documents.
 func writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	writeJSON(w, map[string]interface{}{"ok": false, "error": msg, "code": code})
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(map[string]interface{}{"ok": false, "error": msg, "code": code})
 }
 
 // pprofPaths are the profiling endpoints served on the admin listener, behind

@@ -357,6 +357,90 @@ func TestServeConnectBigVolumeNotCharged(t *testing.T) {
 	}
 }
 
+// TestServeConnectHalfCloseDrainsResponse: a client that sends its request,
+// half-closes, and waits must still get the full response. The forward leg's
+// clean EOF used to hit <-fwdDone then pc.Close(), tearing the tunnel down
+// with the response in flight — every request/half-close/read protocol
+// (HTTP/1.0 style, git-over-TLS) got a truncated or empty read.
+func TestServeConnectHalfCloseDrainsResponse(t *testing.T) {
+	// Far target reads until the propagated FIN, then answers with a payload
+	// large enough to clear connectMinOKBytes — the exchange is a healthy
+	// served session, not a low-volume device signature.
+	reply := strings.Repeat("r", 16<<10)
+	far := startReadUntilEOFCloseServer(t, reply)
+	p := mustProxy(t, "http://"+startStaticConnectProxy(t, far))
+	b := NewBucket(16)
+	b.Add(p)
+
+	cfg := connectTestConfig(2, 1, 3*time.Second)
+	fwd := NewForwardDialer(b, cfg)
+	addr, results := serveConnectListener(t, fwd, "opencorporates.com:443")
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	line := make([]byte, len(connectOKLine))
+	if _, err := io.ReadFull(c, line); err != nil || string(line) != connectOKLine {
+		t.Fatalf("expected 200, got %q err=%v", line, err)
+	}
+	if _, err := c.Write([]byte("req")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	// The far target answers only after the FIN — a full read proves the
+	// half-close propagated and the reverse leg outlived the forward one.
+	got, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatalf("drain response: %v", err)
+	}
+	if string(got) != reply {
+		t.Fatalf("response = %d bytes, want %d (truncated at half-close)", len(got), len(reply))
+	}
+
+	if err := <-results; err != nil {
+		t.Fatalf("ServeConnect: %v", err)
+	}
+	if p.ConsecFails() != 0 || b.Len() != 1 {
+		t.Fatalf("healthy half-close session charged: fails=%d len=%d", p.ConsecFails(), b.Len())
+	}
+	if p.InFlight() != 0 {
+		t.Fatalf("in-flight leaked: %d", p.InFlight())
+	}
+}
+
+// startReadUntilEOFCloseServer runs a TCP server that reads until the client's
+// FIN, then writes a fixed reply and hangs up: the far-side shape of every
+// request/half-close/read protocol.
+func startReadUntilEOFCloseServer(t *testing.T, reply string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if _, err := io.ReadAll(c); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte(reply))
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
 func TestServeConnectConcurrentStreams(t *testing.T) {
 	echo := startEchoServer(t)
 	p := mustProxy(t, "http://"+startStaticConnectProxy(t, echo))

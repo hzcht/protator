@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // LoadSites reads a list file (one URL per line), skipping comments and blank
@@ -222,6 +223,39 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
+// SweepOrphanTMP removes atomic-write temp files left behind by a crash
+// between CreateTemp and rename: `.sites-*.tmp` (writeFileAtomic — sites.txt
+// and candidates.lst), `.queue-*.tmp` (SaveBucketAtomic — proxy.lst) and the
+// debug-proxies fixed-name temp. The defer os.Remove in each writer never ran,
+// so the files linger forever, eating disk and confusing operators ("is this
+// my queue?"). Only the exact patterns our own writers create are swept — a
+// generic *.tmp glob would eat unrelated user files. Safe at startup: no
+// writer has run yet, so every matching file is an orphan by definition.
+func SweepOrphanTMP(dirs ...string) {
+	patterns := []string{".sites-*.tmp", ".queue-*.tmp", "debug_proxies.txt.tmp"}
+	seen := make(map[string]struct{}, len(dirs))
+	for _, dir := range dirs {
+		if dir == "" || dir == "." {
+			dir = "."
+		}
+		if _, dup := seen[dir]; dup {
+			continue
+		}
+		seen[dir] = struct{}{}
+		for _, pat := range patterns {
+			matches, err := filepath.Glob(filepath.Join(dir, pat))
+			if err != nil {
+				continue
+			}
+			for _, m := range matches {
+				if err := os.Remove(m); err == nil {
+					log.Printf("store: swept orphaned temp file %s", m)
+				}
+			}
+		}
+	}
+}
+
 // validSiteURL keeps the list to things the collector can actually fetch.
 func validSiteURL(u string) bool {
 	parsed, err := neturl.Parse(u)
@@ -246,11 +280,28 @@ func ReadQueueLast(path string, maxLines int) []*Proxy {
 	return readQueueCapped(path, maxLines)
 }
 
+// queueLoadFailed latches a *read error* (not "file absent") on the queue
+// file: the first dirty save after such a load would overwrite the real file
+// with whatever the (empty) in-memory queue holds — an AV lock or a transient
+// I/O error turning into permanent data loss. The latch is cleared by the
+// next successful load (i.e. the next start) and by an explicit successful
+// read of the same path.
+var queueLoadFailed atomic.Bool
+
 func readQueueCapped(path string, maxLines int) []*Proxy {
 	lines, err := readLines(path)
 	if err != nil {
+		// Used to vanish silently: an unreadable/missing proxy.lst looked
+		// exactly like an empty one, and an incident could not tell "cold
+		// start" from "disk error, queue is empty again".
+		if !os.IsNotExist(err) {
+			log.Printf("queue: cannot read %s: %v (the queue file will NOT be overwritten until a successful load)", path, err)
+			Stats.QueueLoadFailures.Add(1)
+			queueLoadFailed.Store(true)
+		}
 		return nil
 	}
+	queueLoadFailed.Store(false)
 	if maxLines > 0 && len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:] // audit files: tail is freshest
 	}
@@ -291,6 +342,12 @@ func LoadRegexLines(path string) ([]string, error) {
 // fsync, rename. An oversized queue is trimmed to the budget, keeping its
 // newest entries.
 func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
+	// P67 latch: refuse to overwrite a queue file that failed to load this
+	// session. Losing the in-memory state is recoverable; clobbering the on-
+	// disk queue with an empty one is not.
+	if queueLoadFailed.Load() {
+		return fmt.Errorf("queue file %s failed to load this session; refusing to overwrite it", path)
+	}
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -417,12 +474,14 @@ func AppendGood(path, line string) {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 	if _, err := gw.w.WriteString(line + "\n"); err != nil {
+		Stats.GoodWriteFailures.Add(1)
 		log.Printf("good: write %s: %v", path, err)
 		return
 	}
 	// Flush past 4 KB to bound memory (and bound loss on a crash).
 	if gw.w.Buffered() > 4096 {
 		if err := gw.w.Flush(); err != nil {
+			Stats.GoodWriteFailures.Add(1)
 			log.Printf("good: flush %s: %v", path, err)
 		}
 	}
@@ -436,9 +495,11 @@ func CloseGoodWriters() {
 		gw := v.(*goodWriter)
 		gw.mu.Lock()
 		if err := gw.w.Flush(); err != nil {
+			Stats.GoodWriteFailures.Add(1)
 			log.Printf("good: final flush %s: %v", gw.path, err)
 		}
 		if err := gw.f.Close(); err != nil {
+			Stats.GoodWriteFailures.Add(1)
 			log.Printf("good: close %s: %v", gw.path, err)
 		}
 		gw.mu.Unlock()
@@ -453,6 +514,7 @@ func openGoodWriter(path string) *goodWriter {
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		Stats.GoodWriteFailures.Add(1)
 		log.Printf("good: open %s for append: %v (the audit trail is disabled)", path, err)
 		return nil
 	}

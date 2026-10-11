@@ -85,16 +85,23 @@ func (b *browserPool) text(ctx context.Context, url string) (string, error) {
 	}
 	done := make(chan result, 1)
 	go func() {
+		// The send below must happen exactly once: it is buffered, and the
+		// outer select falls back to the context deadline, but a panic that
+		// skipped it would still cost a full timeout plus hide the cause.
+		// Recover inside so a zero result is still delivered promptly.
 		var r result
-		_, gotoErr := page.Goto(url, playwright.PageGotoOptions{
-			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-			Timeout:   playwright.Float(float64(b.timeout / time.Millisecond)),
-		})
-		if gotoErr != nil {
-			r.err = gotoErr
-		} else {
-			r.content, r.err = page.Content()
-		}
+		func() {
+			defer RecoverPanic("collector: browser fetch")
+			_, gotoErr := page.Goto(url, playwright.PageGotoOptions{
+				WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+				Timeout:   playwright.Float(float64(b.timeout / time.Millisecond)),
+			})
+			if gotoErr != nil {
+				r.err = gotoErr
+			} else {
+				r.content, r.err = page.Content()
+			}
+		}()
 		done <- r
 	}()
 

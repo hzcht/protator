@@ -43,7 +43,7 @@ func TestCheckerWorkerSupervisorRestarts(t *testing.T) {
 
 	waitFor(t, "the worker restart", func() bool { return w.restarts.Load() == 1 })
 
-	w.stopAndWait() // must return, not hang: the supervisor drained the reports
+	w.stopAndWait(time.Second) // must return, not hang: the supervisor drained the reports
 	if got := w.restarts.Load(); got != 1 {
 		t.Fatalf("restarts = %d, want 1", got)
 	}
@@ -79,6 +79,6 @@ func TestCheckerWorkerStopIsIdempotent(t *testing.T) {
 
 	w.wg.Add(1)
 	go w.supervise(1)
-	w.stopAndWait()
-	w.stopAndWait() // must not panic on a double close
+	w.stopAndWait(time.Second)
+	w.stopAndWait(time.Second) // must not panic on a double close
 }

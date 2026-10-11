@@ -54,10 +54,16 @@ These look like limitations and are not:
   the checker and dialer have no credential path, so such a list would only
   produce proxies that fail validation. If this is ever added, it is a schema
   change first (`http://user:pass@` through `ParseProxyLine`), then a regex.
-- **Trojan/VLESS/SS/hysteria endpoints**: `regexp.txt` carries a few of these
-  shapes, but `validSchema` only accepts http/https/socks4/socks5/vless, so
-  those lines contribute bare host:port candidates at best. They are harmless
-  but not useful until the dialer supports the protocol.
+- **Trojan/Shadowsocks endpoints**: no dial path exists, so their patterns were
+  removed from `regexp.txt` outright — every match burned a full multi-protocol
+  check for a candidate that could never validate. See the NOTE in that file.
+- **VLESS URLs** (`vless://uuid@host:port?...`): the dial path exists
+  (`dialVLESS`), but the chain is broken in four places — the extractor drops
+  the UUID, `Candidate`'s VLESS fields are never filled from extraction, the
+  checker never copies them onto the `Proxy`, and the pool does not persist
+  them. The pattern was removed for the same reason as above. Bringing it back
+  means wiring all four, including the `?flow=&sni=&pbk=&sid=` query params,
+  not just a regex.
 
 ## Where each pattern shape comes from
 

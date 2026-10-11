@@ -27,7 +27,12 @@ var (
 	reSpysWrite  = regexp.MustCompile(`(?i)\b(` + ipv4RE + `(?:\.` + ipv4RE + `){3})\s*<script[^>]*>\s*document\.write\(\s*"[^"]*"\s*((?:\+\s*\(\s*[A-Za-z][A-Za-z0-9]*\s*\^\s*[A-Za-z][A-Za-z0-9]*\s*\)){1,5})\s*\)`)
 	reSpysTerm   = regexp.MustCompile(`\(\s*([A-Za-z][A-Za-z0-9]*)\s*\^\s*([A-Za-z][A-Za-z0-9]*)\s*\)`)
 	reSpysAssign = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)\s*=\s*([0-9]+|[A-Za-z][A-Za-z0-9]*\s*\^\s*[A-Za-z0-9]+|[0-9]+\s*\^\s*[A-Za-z][A-Za-z0-9]*)\s*;`)
-	reSpysScript = regexp.MustCompile(`(?is)<script[^>]*>(.*?)</script>`)
+	// Bounded gap: an unbounded (.*?) over an 8 MB adversarial body keeps a
+	// fetch worker scanning for a closing tag that never comes (RE2 has no
+	// catastrophic backtracking, but the linear scan per page is enough to
+	// pin workers when a handful of pages cooperate). Real spys.as XOR
+	// blocks are a few hundred bytes; 1000 is the RE2 per-repeat cap.
+	reSpysScript = regexp.MustCompile(`(?is)<script[^>]*>(.{0,1000})</script>`)
 )
 
 // Extractor pulls host:port candidates out of scraped page bodies using the
@@ -209,6 +214,17 @@ const maxBase64Body = 8 << 20
 // writers), and rejecting those loses the source entirely.
 func tryBase64Text(body []byte) string {
 	if len(body) < 64 || len(body) > maxBase64Body {
+		return ""
+	}
+	// Sample first: the walk below rejects at the first non-alphabet byte, so
+	// a body that is base64 for megabytes and junk at the end costs a full
+	// scan to learn what four probes already show. Whitespace is skipped at
+	// the sample points for the same reason the walk skips it.
+	for _, i := range []int{0, len(body) / 4, len(body) / 2, 3 * len(body) / 4} {
+		c := body[i]
+		if c == '\r' || c == '\n' || c == '\t' || c == ' ' || isBase64Byte(c) {
+			continue
+		}
 		return ""
 	}
 	var buf []byte

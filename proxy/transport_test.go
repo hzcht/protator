@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,7 +102,21 @@ func handleTestConnectStatic(client net.Conn, upstream string) {
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n")); err != nil {
 		return
 	}
-	go io.Copy(up, br)
+	// Mirror production pipe(): a clean client EOF is a half-close —
+	// propagate the FIN so the far side can finish its response. Only a
+	// copy error tears the upstream down wholesale. Without the split, a
+	// client that request/half-closes/reads never gets its response
+	// through this helper (and the earlier full-close version also leaked
+	// the upstream conn when the client vanished mid-response).
+	go func() {
+		if _, err := io.Copy(up, br); err == nil {
+			if cw, ok := up.(interface{ CloseWrite() error }); ok {
+				_ = cw.CloseWrite()
+				return
+			}
+		}
+		up.Close()
+	}()
 	io.Copy(client, up)
 }
 
@@ -574,6 +589,126 @@ func TestBlockDetector(t *testing.T) {
 	}
 	if bd.isDeviceJunk(&http.Response{StatusCode: 400, Header: http.Header{}, ContentLength: -1, Body: io.NopCloser(strings.NewReader("x"))}) {
 		t.Fatal("unknown-length 400 must not be charged")
+	}
+}
+
+// stallBody is a body that delivers nothing and blocks until closed — the
+// shape of a chunked interstitial whose upstream went silent mid-body.
+type stallBody struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (s *stallBody) Read([]byte) (int, error) {
+	<-s.closed
+	return 0, io.EOF
+}
+
+func (s *stallBody) Close() error {
+	s.once.Do(func() { close(s.closed) })
+	return nil
+}
+
+func TestBlockSniffBudgetAbortsStall(t *testing.T) {
+	bd := newBlockDetector(true, 1024)
+	body := &stallBody{closed: make(chan struct{})}
+	resp := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": []string{"text/html"}},
+		Body:          body,
+		ContentLength: -1, // chunked: unknown size passes shouldCheck
+	}
+	start := time.Now()
+	blocked, stalled := bd.readAndMarkBudget(resp, 100*time.Millisecond)
+	if stalled != true || blocked {
+		t.Fatalf("got blocked=%v stalled=%v, want stalled", blocked, stalled)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("sniff did not abort within budget")
+	}
+	if _, err := resp.Body.Read(make([]byte, 1)); err == nil {
+		t.Fatal("body must be dead after a stall abort")
+	}
+}
+
+func TestBlockSniffBudgetFastBodyUnaffected(t *testing.T) {
+	bd := newBlockDetector(true, 1024)
+	resp := sr(200, "text/html", "Verify you are human to continue")
+	blocked, stalled := bd.readAndMarkBudget(resp, time.Second)
+	if !blocked || stalled {
+		t.Fatalf("got blocked=%v stalled=%v, want blocked", blocked, stalled)
+	}
+	if b, _ := io.ReadAll(resp.Body); string(b) != "Verify you are human to continue" {
+		t.Fatalf("body lost after sniff-rewind: %q", b)
+	}
+}
+
+func TestBlockSniffBudgetZeroKeepsUnbounded(t *testing.T) {
+	bd := newBlockDetector(true, 1024)
+	resp := sr(200, "text/html", "<html>real page content</html>")
+	blocked, stalled := bd.readAndMarkBudget(resp, 0)
+	if blocked || stalled {
+		t.Fatalf("got blocked=%v stalled=%v, want plain verdict with budget 0", blocked, stalled)
+	}
+}
+
+// TestProxyTransportSniffStallFailsOver verifies the serving-path consequence:
+// an upstream that answers200 headers and then stalls mid-body is aborted at
+// serve_sniff_timeout, charged as a response-level failure (evicted after
+// serve_max_fails), and the request is retried through a healthy proxy —
+// instead of the client's headers waiting out serve_total_timeout.
+func TestProxyTransportSniffStallFailsOver(t *testing.T) {
+	stallSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(200)
+		w.Write([]byte("<html>par"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // hold the connection open, mid-body, forever
+	}))
+	defer stallSrv.Close()
+	var goodHits int64
+	goodSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&goodHits, 1)
+		w.Write([]byte("content-C"))
+	}))
+	defer goodSrv.Close()
+
+	pStall := mustProxy(t, "http://"+startStaticConnectProxy(t, stallSrv.Listener.Addr().String()))
+	pGood := mustProxy(t, "http://"+startStaticConnectProxy(t, goodSrv.Listener.Addr().String()))
+	b := NewBucket(16)
+	b.Add(pGood) // pStall lives only behind the pin, not in the pool
+
+	cfg := testServerConfig(2, 1)
+	cfg.Server.ServeBlockDetect = true
+	cfg.Server.ServeSniffTimeout = Duration{100 * time.Millisecond}
+	fwd := NewForwardDialer(b, cfg)
+	pt := NewProxyTransport(cfg, fwd)
+	defer pt.base.(*http.Transport).CloseIdleConnections()
+	fwd.pins.Set("kstall", pStall)
+
+	req, _ := http.NewRequest("GET", "http://example.com/", nil)
+	req = req.WithContext(WithConnKey(req.Context(), "kstall"))
+	start := time.Now()
+	resp, err := pt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "content-C" {
+		t.Fatalf("body = %q, want content-C (did not fail over)", body)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("request took %v, sniff budget did not bound the stall", elapsed)
+	}
+	if pStall.ConsecFails() != 1 {
+		t.Fatalf("stall proxy fails = %d, want 1 (charged as response-level failure)", pStall.ConsecFails())
+	}
+	if atomic.LoadInt64(&goodHits) != 1 {
+		t.Fatalf("good server hits = %d, want 1", goodHits)
+	}
+	if fwd.pins.Get("kstall") != pGood {
+		t.Fatal("stall pin must remap to the healthy proxy after failover")
 	}
 }
 

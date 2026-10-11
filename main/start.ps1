@@ -16,6 +16,28 @@ $ErrorActionPreference = "Stop"
 $exe = Join-Path $PSScriptRoot "main.exe"
 $root = Split-Path $PSScriptRoot -Parent
 
+# Stop the old instance BEFORE building: Windows denies writing a running
+# exe, so build-first broke every restart by default. Match by path, not
+# name (-Name "main" would kill unrelated main.exe processes).
+$old = @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path -eq $exe })
+if ($old) {
+    # Prefer the graceful stop (cooperative shutdown + save); it lives next
+    # to this script and falls back to a hard kill on its own.
+    & (Join-Path $PSScriptRoot "stop.ps1")
+    foreach ($p in $old) {
+        try { $p.WaitForExit(5000) | Out-Null } catch { }
+    }
+    $still = @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path -eq $exe })
+    if ($still) {
+        $still | Stop-Process -Force
+        Write-Host "stopped old instance(s) after timeout: $($still.Id -join ', ')"
+    } else {
+        Write-Host "stopped old instance(s): $($old.Id -join ', ')"
+    }
+}
+
 # Rebuild by default. Skipping this is how you end up running yesterday's
 # binary: a stale main.exe in this directory is silently "the app", and the
 # symptom is a fix that looks like it did nothing (e.g. an admin page that
@@ -43,32 +65,26 @@ if (-not (Test-Path (Join-Path $root $Config))) {
     exit 1
 }
 
-$err = Join-Path $root "data/instance_err.log"
-
 if ($Check) {
     & $exe -config (Join-Path $root $Config) -check
     exit $LASTEXITCODE
 }
 
-# Restart semantics: kill whatever is running so a stale instance with an old
-# config never survives a deploy.
-$old = Get-Process -Name "main" -ErrorAction SilentlyContinue
-if ($old) {
-    $old | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
-    Write-Host "stopped old instance(s): $($old.Id -join ', ')"
-}
-
+# The daemon reads config/ and data/ by relative path, so its working
+# directory must be the repo root — ".." resolved against the invoker's CWD
+# (the old bug) put those paths outside the repo and started with an empty
+# queue and no sites every time the script was run from elsewhere.
 Start-Process -FilePath $exe `
     -ArgumentList "-config", (Join-Path $root $Config) `
-    -WorkingDirectory ".." `
+    -WorkingDirectory $root `
     -WindowStyle Hidden `
     -RedirectStandardError (Join-Path $root "data/instance_err.log")
 
 Start-Sleep -Seconds 1
-$p = Get-Process -Name "main" -ErrorAction SilentlyContinue
+$p = @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path -eq $exe })
 if (-not $p) {
-    Write-Error "instance failed to start - see $err"
+    Write-Error "instance failed to start - see $(Join-Path $root 'data/instance_err.log')"
     exit 1
 }
 Write-Host "started pid(s): $($p.Id -join ', ')"

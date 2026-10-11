@@ -491,7 +491,7 @@ func TestAdminMetricsCountersAndRates(t *testing.T) {
 	a, _, _ := newTestAdmin(t)
 
 	proxy.Stats.Reset()
-	proxy.Stats.Requests.Add(100)
+	proxy.Stats.HTTPRequests.Add(100)
 	proxy.Stats.Checks.Add(200)
 	defer proxy.Stats.Reset()
 
@@ -509,7 +509,7 @@ func TestAdminMetricsCountersAndRates(t *testing.T) {
 
 	// A second sample a moment later must produce a rate for the delta.
 	time.Sleep(50 * time.Millisecond)
-	proxy.Stats.Requests.Add(50)
+	proxy.Stats.HTTPRequests.Add(50)
 	_, second := doJSON(t, a, http.MethodGet, "/api/metrics", "")
 	rates := second["rates_per_sec"].(map[string]interface{})
 	if rates["requests_total"].(float64) <= 0 {

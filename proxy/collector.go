@@ -32,6 +32,10 @@ type Collector struct {
 	// amortized over time instead of running on every candidate once the map
 	// is over its cap (see seenRecently).
 	seenSwept time.Time
+	// windowOff is the rotation offset for rotateWindow: how many ordered
+	// sources past the head the current cycle starts at. Atomic: cycle runs
+	// on one goroutine, but tests drive rotateWindow concurrently.
+	windowOff int64
 
 	// transportCache caches http.Transport per proxy address for via-proxy
 	// fetches. Key: "schema://host:port", Value: *http.Transport
@@ -103,14 +107,21 @@ func (c *Collector) aliveBySource() map[string]int {
 // immediate cycle instead of waiting out CycleSleep.
 func (c *Collector) Run(ctx context.Context, out chan<- Candidate, wake <-chan struct{}) {
 	for {
-		sites, err := LoadSites(c.cfg.Collector.SitesFile)
-		if err != nil {
-			log.Printf("collector: %v", err)
-		} else {
-			c.stats.Track(sites)
-			c.stats.SetAlive(c.aliveBySource())
-			c.cycle(ctx, c.stats.Order(sites), out)
-		}
+		// Per cycle, not per run: a panic in one cycle (a malformed sites.txt
+		// line, a registry edge) must cost that cycle, not the collector —
+		// without it the only producer of fresh candidates dies silently and
+		// the queue starves over days.
+		func() {
+			defer RecoverPanic("collector: cycle")
+			sites, err := LoadSites(c.cfg.Collector.SitesFile)
+			if err != nil {
+				log.Printf("collector: %v", err)
+			} else {
+				c.stats.Track(sites)
+				c.stats.SetAlive(c.aliveBySource())
+				c.cycle(ctx, c.stats.Order(sites), out)
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			return
@@ -121,23 +132,49 @@ func (c *Collector) Run(ctx context.Context, out chan<- Candidate, wake <-chan s
 	}
 }
 
+// rotateWindow walks the ordered source list in slices of MaxSitesPerCycle so
+// the tail is fetched every ceil(len/n) cycles instead of never. Always taking
+// the head starves everything past the cap: the head sources keep their yield
+// (and their cooldowns keep everyone else out), so the tail is effectively
+// dead configuration. The window advances by n per cycle and wraps, so the
+// first cycle still starts at the head and every source is reached regularly.
+func (c *Collector) rotateWindow(sites []string) []string {
+	n := c.cfg.Collector.MaxSitesPerCycle
+	if n <= 0 || len(sites) <= n {
+		return sites
+	}
+	start := int((atomic.AddInt64(&c.windowOff, int64(n)) - int64(n)) % int64(len(sites)))
+	if start == 0 {
+		log.Printf("collector: %d sources queued, fetching the top %d this cycle", len(sites), n)
+		return sites[:n]
+	}
+	out := make([]string, 0, n)
+	out = append(out, sites[start:]...)
+	if len(out) < n {
+		out = append(out, sites[:n-len(out)]...)
+	}
+	log.Printf("collector: %d sources queued, fetching %d at offset %d this cycle", len(sites), len(out), start)
+	return out
+}
+
 // cycle fetches all sites concurrently (limited by fetch_workers). The site
 // list arrives pre-ordered by the registry (best source first); max_sites_per_cycle
 // caps how many are attempted so a long list stays on a predictable rotation
 // instead of one cycle running for days.
 func (c *Collector) cycle(ctx context.Context, sites []string, out chan<- Candidate) {
-	if n := c.cfg.Collector.MaxSitesPerCycle; n > 0 && len(sites) > n {
-		log.Printf("collector: %d sources queued, fetching the top %d this cycle", len(sites), n)
-		sites = sites[:n]
-	}
+	sites = c.rotateWindow(sites)
 	var wg sync.WaitGroup
 	var okSites, failSites int64
 	var totalCands int64
 	sem := make(chan struct{}, c.cfg.Collector.FetchWorkers)
+sitesLoop:
 	for _, site := range sites {
 		select {
 		case <-ctx.Done():
-			return
+			// Stop scheduling, but still wait for the in-flight fetches: they
+			// are (now) ctx-bound and call MarkServeOK/Promote/Remove on the
+			// bucket, which must not race the deferred shutdown saves.
+			break sitesLoop
 		case sem <- struct{}{}:
 		}
 		wg.Add(1)
@@ -173,22 +210,33 @@ func (c *Collector) fetch(ctx context.Context, site string, out chan<- Candidate
 	// Cooling sites get a cheap direct attempt only (no proxy retries,
 	// no browser) until the cooldown expires.
 	if c.stats.Failed(site) {
-		r := c.extractHTTP(site)
+		r := c.extractHTTP(ctx, site)
 		if len(r.cands) > 0 {
 			n := c.emit(ctx, site, r.cands, out)
 			c.record(site, true, len(r.cands), n, r.note)
 			return n
+		}
+		if r.notModified {
+			// Healthy, nothing new — this is what a cooling ETag'd source
+			// answers every cycle; recording it as a failure kept it in
+			// cooldown forever.
+			c.record(site, true, 0, 0, r.note)
+			return 0
 		}
 		c.record(site, false, 0, 0, r.note)
 		log.Printf("collector: %s -> cooling [%s]", site, r.note)
 		return -1
 	}
 
-	r := c.extractHTTP(site)
+	r := c.extractHTTP(ctx, site)
 	if len(r.cands) > 0 {
 		n := c.emit(ctx, site, r.cands, out)
 		c.record(site, true, len(r.cands), n, r.note)
 		return n
+	}
+	if r.notModified {
+		c.record(site, true, 0, 0, r.note)
+		return 0
 	}
 	directNote := r.note
 
@@ -211,7 +259,7 @@ func (c *Collector) fetch(ctx context.Context, site string, out chan<- Candidate
 			if err != nil {
 				break
 			}
-			r = c.extractViaProxy(site, p)
+			r = c.extractViaProxy(ctx, site, p)
 			if len(r.cands) > 0 {
 				p.MarkServeOK(0)
 				c.bucket.Promote(p) // served a genuine fetch: earn the hot tail
@@ -219,6 +267,10 @@ func (c *Collector) fetch(ctx context.Context, site string, out chan<- Candidate
 				n := c.emit(ctx, site, r.cands, out)
 				c.record(site, true, len(r.cands), n, r.note)
 				return n
+			}
+			if r.notModified {
+				c.record(site, true, 0, 0, r.note)
+				return 0
 			}
 			switch {
 			case r.proxyFault:
@@ -299,6 +351,10 @@ func (c *Collector) emit(ctx context.Context, site string, cands []Candidate, ou
 		// completeness under load.
 		select {
 		case out <- cands[i]:
+			// Mark seen only after the send lands: recording first made a
+			// send abandoned on ctx.Done() hide the candidate for the whole
+			// window without it ever reaching the pipeline.
+			c.markSeen(cands[i])
 			emitted++
 		case <-ctx.Done():
 			return emitted
@@ -316,6 +372,13 @@ type fetchResult struct {
 	// target-side block or a page that simply yielded nothing. Only proxy
 	// faults feed back into the pool health.
 	proxyFault bool
+	// notModified reports a 304: the source is healthy and simply has no new
+	// content. Treating it as a failure (the old behavior, since the empty
+	// candidate list was indistinguishable from a dead fetch) made every
+	// ETag'd source fail every cycle, burn via-proxy retries and a browser
+	// render, and cool down after site_max_fails — then keep failing from
+	// the cooldown branch until the remote content happened to change.
+	notModified bool
 }
 
 // collectViaAttemptTimeout caps a single via-proxy fetch. Dead/blackholed
@@ -413,7 +476,7 @@ func jsHint(body []byte) string {
 
 // extractHTTP GETs the site without a proxy.
 // Uses conditional GET (If-None-Match / If-Modified-Since) based on SiteStat.
-func (c *Collector) extractHTTP(site string) fetchResult {
+func (c *Collector) extractHTTP(ctx context.Context, site string) fetchResult {
 	// Check for cached validators
 	var etag, lastMod string
 	if s := c.stats.Site(site); s != nil {
@@ -421,7 +484,7 @@ func (c *Collector) extractHTTP(site string) fetchResult {
 		lastMod = s.LastModified
 	}
 
-	req, err := http.NewRequest("GET", site, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", site, nil)
 	if err != nil {
 		return fetchResult{note: "bad url: " + err.Error()}
 	}
@@ -438,10 +501,10 @@ func (c *Collector) extractHTTP(site string) fetchResult {
 	if err != nil {
 		return fetchResult{note: "get: " + shortErr(err)}
 	}
-	// 304 Not Modified: no new content, return empty candidates
+	// 304 Not Modified: healthy source, no new content.
 	if resp.StatusCode == http.StatusNotModified {
 		resp.Body.Close()
-		return fetchResult{cands: nil, note: "304 not modified"}
+		return fetchResult{note: "304 not modified", notModified: true}
 	}
 	// One immediate retry on rate-limit/challenge with server-guided wait.
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
@@ -449,7 +512,15 @@ func (c *Collector) extractHTTP(site string) fetchResult {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
 		if wait > 0 {
-			time.Sleep(wait)
+			// Bounded by the cycle context: a bare sleep outlived SIGTERM by
+			// up to 30s and held a fetch_workers slot the whole time.
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fetchResult{note: "rate-limited, shutdown"}
+			case <-timer.C:
+			}
 			if resp2, err2 := c.client.Do(req); err2 == nil {
 				resp = resp2
 			} else {
@@ -497,7 +568,17 @@ func (c *Collector) extractHTTP(site string) fetchResult {
 // are classified: transport-level errors and device-junk statuses mark the
 // proxy as at fault (proxyFault), while target-side blocks *(a tiny 200
 // lander, a 403/404/429, a 5xx) leave the proxy's health untouched.
-func (c *Collector) extractViaProxy(site string, p *Proxy) fetchResult {
+func (c *Collector) extractViaProxy(ctx context.Context, site string, p *Proxy) fetchResult {
+	// net/http's Transport.ProxyURL only understands http/https/socks5/socks5h.
+	// A socks4/vless proxy (both valid pipeline schemas; the checker swaps
+	// dialers for them) fails instantly with "unsupported protocol scheme" —
+	// and that used to be charged as a proxy fault, so the collector silently
+	// evicted healthy non-http proxies on every via-proxy attempt.
+	switch p.Schema {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fetchResult{note: "via-proxy unsupported for schema " + p.Schema}
+	}
 	proxyURL, err := url.Parse(p.URL())
 	if err != nil {
 		return fetchResult{note: "bad proxy url", proxyFault: true}
@@ -525,7 +606,7 @@ func (c *Collector) extractViaProxy(site string, p *Proxy) fetchResult {
 		lastMod = s.LastModified
 	}
 
-	req, err := http.NewRequest("GET", site, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", site, nil)
 	if err != nil {
 		return fetchResult{note: "bad url", proxyFault: true}
 	}
@@ -542,10 +623,10 @@ func (c *Collector) extractViaProxy(site string, p *Proxy) fetchResult {
 	if err != nil {
 		return fetchResult{note: "via " + p.Addr() + ": " + shortErr(err), proxyFault: true}
 	}
-	// 304 Not Modified: no new content
+	// 304 Not Modified: healthy source, no new content.
 	if resp.StatusCode == http.StatusNotModified {
 		resp.Body.Close()
-		return fetchResult{cands: nil, note: "304 not modified"}
+		return fetchResult{note: "304 not modified", notModified: true}
 	}
 	defer resp.Body.Close()
 	if !isHealthyResponse(resp) {
@@ -717,8 +798,17 @@ func (c *Collector) seenRecently(cand Candidate) bool {
 			}
 		}
 	}
-	c.seen[key] = now
 	return false
+}
+
+// markSeen records a successfully emitted candidate. Recording is separate
+// from the check so a send abandoned on shutdown does not blacklist a
+// candidate that never reached the pipeline.
+func (c *Collector) markSeen(cand Candidate) {
+	key := cand.Schema + "://" + cand.Host + ":" + strconv.Itoa(cand.Port)
+	c.seenMu.Lock()
+	c.seen[key] = time.Now()
+	c.seenMu.Unlock()
 }
 
 // uaIndex picks a rotating user agent index.

@@ -8,7 +8,7 @@ listen = "0.0.0.0:8888"
 listen_https = "0.0.0.0:8443"
 tls_cert_file = ""
 tls_key_file = ""
-# 0 disables a read/write timeout on the client side.
+# 0 disables a read/write/idle timeout on the client side (net/http semantics).
 read_timeout = "60s"
 write_timeout = "120s"
 idle_timeout = "90s"
@@ -42,6 +42,10 @@ block_url_suffixes = [".gif", ".jpg", ".svg", ".woff", ".ttf"]
 dial_timeout = "5s"
 tls_handshake_timeout = "8s"
 response_header_timeout = "10s"
+# Idle-pool limits for the checker's and collector's HTTP clients (which keep
+# their own connection pools). The serving transport forces
+# DisableKeepAlives — one fresh chain per client request — so these do nothing
+# on the serving path despite living in [server].
 max_idle_conns = 128
 idle_conn_timeout = "90s"
 # Serving-path resilience: fresh proxy per client request, transparent retry
@@ -61,10 +65,15 @@ pick_probes = 8
 # way to destroy serving stability. The app warns at startup if they conflict.
 pick_serve_window = "90s"
 pick_fresh_window = "20m"
+# Refuse a request when no proxy carries proof of life inside the windows
+# above, instead of serving it through an unverified entry. Off by default
+# (availability first); turn on for 502-over-"maybe".
+serve_require_proven = false
 # Request-level failover: total wall-clock budget across all attempts, and the
 # interstitial/block-page detector (a 200 text/html response in English,
 # Russian or Chinese up to max bytes that matches known blocker markers counts
-# as "no content" and is re-requested through another proxy).
+# as "no content" and is re-requested through another proxy). 0 disables the
+# total budget (each attempt keeps its own timeouts).
 serve_total_timeout = "25s"
 # CONNECT-tunnel supervision: after the upstream answers "200 Connection
 # established" we wait up to this long for the far target's first byte. If the
@@ -85,6 +94,15 @@ serve_connect_probe = "3s"
 serve_response_probe = "3s"
 serve_block_detect = true
 serve_block_max_bytes = 16384
+# Budget for the interstitial sniff itself. The detector reads up to
+# serve_block_max_bytes+1 of the response body *inside* the request path,
+# before any of it reaches the client; an upstream that answers headers and
+# then stalls mid-body would otherwise hold the client's headers hostage for
+# the whole serve_total_timeout on every attempt. On expiry the body is
+# closed and the attempt is charged as a serve failure and retried through
+# another proxy. 0/negative falls back to 3s (disable the detector entirely
+# via serve_block_detect = false instead).
+serve_sniff_timeout = "3s"
 # Session stickiness: connection pinning pins the upstream per client TCP
 # connection (no latency overhead); max entries caps the pin table. Clients can
 # additionally pin across connections by sending an "X-Sticky-Session" header
@@ -158,9 +176,13 @@ require_stable_exit = true
 # Final acceptance probe: tunnel through the exact serving dial path
 # (dialProxy) and carry a real GET before accepting the proxy. Off by default.
 e2e_probe = true
-# GeoIP database (MaxMind GeoIP2-City.mmdb) for country/ASN lookup.
-# Download from: https://dev.maxmind.com/geoip/geoip2/geolite2/
+# GeoIP databases (MaxMind) for country/ASN lookup on each validated proxy's
+# exit IP. Two separate files: the City database provides the country, the ASN
+# database provides "AS12345 Provider". Either, both, or neither may be set;
+# unset = the corresponding admin filter stays empty. Download (free tier):
+# https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
 # geoip_db_path = "GeoIP2-City.mmdb"
+# geoip_asn_db_path = "GeoLite2-ASN.mmdb"
 
 [collector]
 sites_file = "config/sites.txt"
@@ -178,16 +200,6 @@ cycle_sleep = "25m"
 # after this many consecutive failures.
 site_cooldown = "30m"
 site_max_fails = 3
-# Rate limit for feeding the seeded queue back into validation at startup
-# (seeds per second). A 65k seed dump otherwise floods the candidate channel
-# and starves the collector's fresh candidates and the pool re-probe loop.
-revalidate_seed_rate = 200
-# Cap on how many seeds are fed back at startup. The periodic revalidation
-# pass churns the rest; feeding all 65k keeps the checker busy with dead seeds
-# for hours while fresh candidates from the collector wait.
-revalidate_seed_max = 5000
-# Optional directory where candidate hits per site are logged.
-site_log_dir = ""
 # Cap on the persisted candidate pool. The checker churns a few candidates per
 # second, so a pool much larger than this is dead weight: new candidates get
 # dropped once it is full. 200k is ~10x the checker's hourly throughput.
@@ -232,6 +244,14 @@ good_file = "data/good_proxies.last"
 save_interval = "1m"
 revalidate_interval = "15m"
 revalidate_workers = 200
+# Rate limit for feeding the seeded queue back into validation at startup
+# (seeds per second). A 65k seed dump otherwise floods the candidate channel
+# and starves the collector's fresh candidates and the pool re-probe loop.
+revalidate_seed_rate = 200
+# Cap on how many seeds are fed back at startup. The periodic revalidation
+# pass churns the rest; feeding all 65k keeps the checker busy with dead seeds
+# for hours while fresh candidates from the collector wait.
+revalidate_seed_max = 5000
 # Proxies that served a client dial more recently than this are skipped by the
 # periodic revalidation (real traffic = fresher proof of life).
 revalidate_fresh_servers = "15m"
@@ -251,14 +271,14 @@ debug_proxies_file = "data/debug_proxies.txt"
 debug_proxies_max = 50
 
 [logging]
-level = "info"
 # File logs with size-based rotation: one file per category under the dir below
 #   collector.log  - list scraping (collector: ...)
 #   checker.log    - validation pipeline (checker: ...)
 #   serve.log      - serving-path dial events (serve: CONNECT ...)
 #   system.log     - everything else (queue, pool, revalidate, listeners, noise)
-# Everything is ALSO mirrored to stderr (console / redirect) as before. Leave
-# dir = "" to disable files and keep stderr-only logging.
+# Everything is ALSO mirrored to stderr (console / redirect) as before.
+# There is no "stderr only" mode: an empty dir is replaced by the default
+# data/logs at startup (fillDefaults); file logging cannot be turned off.
 dir = "data/logs"
 # Rotate a category file once it exceeds this many bytes.
 max_bytes = 33554432

@@ -19,6 +19,7 @@ type Socks5Server struct {
 	dialer     *ForwardDialer
 	dialTO     time.Duration
 	idleTO     time.Duration
+	totalTO    time.Duration
 	listenAddr string
 
 	mu sync.Mutex
@@ -32,6 +33,10 @@ func NewSocks5Server(cfg *Config, dialer *ForwardDialer) *Socks5Server {
 		dialTO:     cfg.Socks5.DialTimeout.Duration,
 		idleTO:     cfg.Socks5.IdleTimeout.Duration,
 		listenAddr: cfg.Socks5.Listen,
+		// The HTTP front bounds a whole request by serve_total_timeout; the
+		// SOCKS5 handshake has no equivalent, so one slow upstream per retry
+		// could hold a client for dial_timeout × serve_retries with no cap.
+		totalTO: cfg.Server.ServeTotalTimeout.Duration,
 	}
 }
 
@@ -150,8 +155,13 @@ func (s *Socks5Server) handle(conn net.Conn) {
 		return
 	}
 
+	// One unit per completed handshake (P47): a SOCKS5 session is what this
+	// front serves, and counting it here (not in DialContext) keeps the
+	// per-front counters disjoint — a failed greeting never reaches here.
+	Stats.SOCKS5Sessions.Add(1)
+
 	// The upstream dial below may legitimately consume the whole dialTO
-	// budget (socks5.dial_timeout is 120s). Clear the handshake deadline
+	// budget (socks5.dial_timeout, default 12s). Clear the handshake deadline
 	// before it: the greeting's SetDeadline armed *both* halves, so the
 	// success reply written afterwards would fail its own write deadline on a
 	// slow-but-working upstream, tearing down a tunnel that was just
@@ -159,6 +169,20 @@ func (s *Socks5Server) handle(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.dialTO)
+	// One client TCP connection = one upstream, same contract as the HTTP
+	// front's ConnKey pin: without it every SOCKS session picked afresh and
+	// the config's stickiness promise did not cover this front.
+	if key := conn.RemoteAddr().String(); key != "" {
+		ctx = WithConnKey(ctx, key)
+	}
+	// Bound the whole handshake by the same total the HTTP front enforces:
+	// DialContext retries internally up to serve_retries, so the per-dial
+	// budget alone lets one client wait dial_timeout × retries.
+	if s.totalTO > 0 {
+		var totalCancel context.CancelFunc
+		ctx, totalCancel = context.WithTimeout(ctx, s.totalTO)
+		defer totalCancel()
+	}
 	up, err := s.dialer.DialContext(ctx, "tcp", target)
 	cancel()
 	if err != nil {
@@ -166,6 +190,12 @@ func (s *Socks5Server) handle(conn net.Conn) {
 		s.reply(conn, 0x05) // connection refused
 		return
 	}
+	// The upstream must be closed on every exit path: proxyConn.Close is the
+	// only caller of MarkInFlightDone, so skipping it ratchets p.inFlight +1
+	// per session forever (the picker reads it as load) and leaves the socket
+	// to the finalizer. The CONNECT front closes its upstream for exactly this
+	// reason; the SOCKS path used to forget.
+	defer up.Close()
 
 	// bnd.addr 0.0.0.0:0 is acceptable to most clients
 	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
@@ -179,6 +209,12 @@ func (s *Socks5Server) handle(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 
 	toUp, toDown := relayCount(conn, up, s.idleTO)
+	// Bytes belong to the registry, not just the verdict below: without them a
+	// SOCKS5-dominant workload reads bytes_in/out = 0 while serving flat out.
+	// (Requests/Attempts/Failures are already counted: the dial above goes
+	// through the shared ForwardDialer.DialContext.)
+	Stats.BytesOut.Add(toUp)
+	Stats.BytesIn.Add(toDown)
 	// The session ran to completion: settle the proxy's health (the dial only
 	// sampled latency; a served session is what clears any failure streak).
 	if pc, ok := up.(*proxyConn); ok {
@@ -192,14 +228,21 @@ func (s *Socks5Server) handle(conn net.Conn) {
 // tail. A session where the client spoke but the far side never answered is
 // charged like a blackhole; a session where nobody spoke (port probe, instant
 // close) is neutral — no proof either way.
+//
+// The verdict is counted in the registry like every other serving path: the
+// dial-time counters live in DialContext, but only settle knows whether the
+// tunnel delivered anything.
 func (s *Socks5Server) settle(p *Proxy, toUp, toDown int64) {
 	switch {
 	case toDown > 0:
 		p.MarkServeOK(0)
+		Stats.ServedOK.Add(1)
 		s.dialer.bucket.Promote(p)
 	case toUp > 0:
+		Stats.ServeFailures.Add(1)
 		if fails := p.MarkServeFail(); fails >= int64(s.dialer.serveMaxFails) {
 			s.dialer.bucket.Remove(p)
+			Stats.Evictions.Add(1)
 		}
 	}
 }
@@ -258,13 +301,10 @@ func containsByte(b []byte, v byte) bool {
 
 // relay pipes bidirectional traffic, resetting the idle deadline on every
 // byte so that long-lived tunnels stay open while active.
-func relay(a, b net.Conn, idle time.Duration) {
-	relayCount(a, b, idle)
-}
-
-// relayCount is relay plus per-leg volume: fromA counts bytes a->b, fromB
-// bytes b->a. The SOCKS verdict needs the split (far-side silence vs a session
-// where nobody spoke); the CONNECT path only needs the pipe.
+// relayCount pipes both directions and returns per-leg volume: fromA counts
+// bytes a->b, fromB bytes b->a. The SOCKS verdict needs the split (far-side
+// silence vs a session where nobody spoke); the CONNECT path uses it too for
+// its probe-off byte accounting.
 func relayCount(a, b net.Conn, idle time.Duration) (fromA, fromB int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -296,11 +336,28 @@ func pipe(dst, src net.Conn, idle time.Duration) int64 {
 		n, err := src.Read(buf)
 		if n > 0 {
 			total += int64(n)
+			// A write deadline is not optional: a peer that stops reading
+			// (closed TCP window) blocks dst.Write forever, wg.Wait in
+			// relayCount waits for this leg, and the session goroutine plus
+			// both sockets stay pinned past idle_timeout. Read deadlines do
+			// not cover the write half.
+			_ = dst.SetWriteDeadline(time.Now().Add(idle))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return total
 			}
 		}
 		if err != nil {
+			// A clean EOF from src is a half-close, not session death:
+			// propagate the FIN via CloseWrite so the peer's read side
+			// unblocks (SOCKS/CONNECT clients that request, half-close,
+			// then wait for the full response would otherwise hang until
+			// idle_timeout rips the whole session). Error/reset paths
+			// keep the old behavior — the session is already broken.
+			if errors.Is(err, io.EOF) {
+				if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+					_ = cw.CloseWrite()
+				}
+			}
 			return total
 		}
 	}

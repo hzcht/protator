@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -61,6 +62,13 @@ type CandidatePool struct {
 	compactReq chan struct{}
 	stopComp   chan struct{}
 	stopOnce   sync.Once
+	// compactWg tracks an in-flight async rewrite so Close can wait for it
+	// before doing its own final pass. Add(1) happens under mu, before the
+	// lock is released for I/O; Done is last, after the pending flush.
+	compactWg sync.WaitGroup
+	// closed is set by Close under mu. compactAsync checks it under the same
+	// lock, so no rewrite can start after Close began waiting.
+	closed bool
 }
 
 // compactEvictThreshold bounds how far the file may drift ahead of memory
@@ -107,6 +115,7 @@ func NewCandidatePool(path string, maxBytes int64, maxCount int) *CandidatePool 
 	if path != "" {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
+			Stats.PoolWriteFailures.Add(1)
 			log.Printf("pool: open %s for append: %v (falling back to per-line appends)", path, err)
 		} else {
 			cp.file = f
@@ -131,31 +140,41 @@ func NewCandidatePool(path string, maxBytes int64, maxCount int) *CandidatePool 
 	return cp
 }
 
-// Close stops the compaction goroutine, then flushes and closes the pool
-// file. A final compaction runs if the file drifted: Close is the last chance
-// to rewrite it down to what memory still holds.
+// Close stops the compaction goroutine, waits for an in-flight rewrite, then
+// flushes and closes the pool file. A final compaction runs only if the file
+// actually diverged (evicted lines still on disk, or a failed rewrite/append):
+// an Add-only run leaves nothing to realign, and the buffered appends reach
+// disk through the flush below — rewriting 200k lines on every clean shutdown
+// for that would be pure fsync cost.
 //
-// Safe to call more than once. The stop flag is a mutex-guarded bool rather
-// than a closed-channel check: two concurrent Closes could both observe the
-// open channel in a select and one would panic on the second close.
+// Safe to call more than once (sync.Once on the stop).
 func (cp *CandidatePool) Close() {
 	cp.stopOnce.Do(func() { close(cp.stopComp) })
 	cp.mu.Lock()
+	cp.closed = true
+	cp.mu.Unlock()
+	// No lock held here: the in-flight rewrite needs mu briefly to finish, and
+	// holding it would deadlock the wait.
+	cp.compactWg.Wait()
+	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	// Realign the file with memory if it drifted: evicted lines are still on
-	// disk and parked lines are not. The eviction counter is not enough on its
-	// own — the last compaction resets it, and appends that landed afterwards
-	// would leave the file behind with nothing to report it.
-	if cp.drift && len(cp.lines) > 0 {
+	// Realign the file with memory when it diverged. cp.evicted counts
+	// evictions since the last rewrite (only a rewrite resets it), so it is
+	// exactly "dropped lines still on disk"; drift covers failed
+	// rewrites/appends. Add-only divergence needs no rewrite — the flush below
+	// persists the buffered appends.
+	if (cp.evicted > 0 || cp.drift) && len(cp.lines) > 0 {
 		cp.compactLocked()
 	}
 	if cp.writer != nil {
 		if err := cp.writer.Flush(); err != nil {
+			Stats.PoolWriteFailures.Add(1)
 			log.Printf("pool: final flush %s: %v", cp.path, err)
 		}
 	}
 	if cp.file != nil {
 		if err := cp.file.Close(); err != nil {
+			Stats.PoolWriteFailures.Add(1)
 			log.Printf("pool: close %s: %v", cp.path, err)
 		}
 		cp.file = nil
@@ -167,6 +186,7 @@ func (cp *CandidatePool) Close() {
 func (cp *CandidatePool) flush() {
 	if cp.writer != nil {
 		if err := cp.writer.Flush(); err != nil {
+			Stats.PoolWriteFailures.Add(1)
 			log.Printf("pool: flush %s: %v", cp.path, err)
 		}
 	}
@@ -204,7 +224,14 @@ func (cp *CandidatePool) Add(c Candidate) bool {
 	cp.keys[pl.key] = line
 	cp.lines = append(cp.lines, line)
 	cp.bytes += int64(len(line) + 1)
-	cp.drift = true
+	// drift is set only on failure below, not unconditionally: buffered and
+	// fallback appends reach disk through the normal flush, so "an Add
+	// happened" is not divergence. Setting it on every Add forced Close into
+	// a full multi-megabyte rewrite+fsync on every clean shutdown.
+	// Divergence the file cannot heal itself is exactly two things: evicted
+	// lines still on disk (tracked by cp.evicted, reset only by a rewrite)
+	// and lines memory holds that never reached disk (this flag, set on a
+	// failed write or rewrite).
 	// Buffered write: append to buffer, flush once it holds enough to be
 	// worth the syscall. (A line-count check would misfire under rotation:
 	// len(lines) sits at the cap, so the modulo never advances.)
@@ -215,11 +242,15 @@ func (cp *CandidatePool) Add(c Candidate) bool {
 		cp.pending = append(cp.pending, line)
 	} else if cp.writer != nil {
 		if _, err := cp.writer.WriteString(line + "\n"); err != nil {
-			// The line is in memory, so the compaction below will get it on
-			// disk eventually; say so rather than losing it quietly.
+			// The line is in memory but not on disk, and no rewrite is
+			// scheduled for it: mark the divergence so Close realigns.
+			cp.drift = true
+			Stats.PoolWriteFailures.Add(1)
 			log.Printf("pool: write %s: %v", cp.path, err)
 		} else if cp.writer.Buffered() > 4096 {
 			if err := cp.writer.Flush(); err != nil {
+				cp.drift = true
+				Stats.PoolWriteFailures.Add(1)
 				log.Printf("pool: flush %s: %v", cp.path, err)
 			}
 		}
@@ -274,7 +305,11 @@ func (cp *CandidatePool) compactLoop(stop <-chan struct{}) {
 // rename, then flush the lines that were appended while it ran.
 func (cp *CandidatePool) compactAsync() {
 	cp.mu.Lock()
-	if cp.evicted < compactEvictThreshold || len(cp.lines) == 0 {
+	// No new rewrites after Close: it waits for the in-flight one, then does
+	// its own final pass under the same lock. Checking here (under mu, where
+	// Close sets the flag) closes the race where the loop picks up a stale
+	// request after Close started waiting.
+	if cp.closed || cp.evicted < compactEvictThreshold || len(cp.lines) == 0 {
 		cp.mu.Unlock()
 		return
 	}
@@ -294,16 +329,31 @@ func (cp *CandidatePool) compactAsync() {
 	// handle to the destination is open, including our own. Lines that arrive
 	// while the handle is gone are parked in pending.
 	cp.detachFileLocked()
+	// Counted before the lock is released so Close can wait for exactly the
+	// rewrites that started. Done is the last statement, after the pending
+	// flush, so Close never proceeds while this still touches the file.
+	cp.compactWg.Add(1)
 	cp.mu.Unlock()
 
+	// The outcome is merged back under the lock below. Writing drift here —
+	// with the lock released — raced every concurrent Add: an eviction that
+	// landed mid-rewrite set drift, and the unconditional store below wiped
+	// it, so Close skipped the final realign and the file kept evicted lines.
+	var compactErr error
 	if err := writeFileAtomic(path, renderPoolLines(lines)); err != nil {
+		compactErr = err
+		Stats.PoolWriteFailures.Add(1)
 		log.Printf("pool: compact %s: %v", path, err)
-		cp.drift = true // the rewrite failed: the file is still behind
-	} else {
-		cp.drift = false
 	}
 
 	cp.mu.Lock()
+	if compactErr != nil {
+		cp.drift = true // the rewrite failed: the file is still behind
+	}
+	// On success drift is left alone. Evictions that landed mid-rewrite are
+	// still tracked by cp.evicted (only a rewrite resets it), and parked
+	// appends are flushed below, which sets drift itself on failure — so a
+	// blind store of false here would lie either way.
 	cp.attachFileLocked()
 	pending := cp.pending
 	cp.pending = nil
@@ -313,11 +363,15 @@ func (cp *CandidatePool) compactAsync() {
 	// the file up to date; a failure here costs the next compaction, which
 	// rewrites from memory anyway.
 	if len(pending) > 0 {
-		appendPoolLines(cp.path, pending)
-		cp.mu.Lock()
-		cp.drift = true // appended after the rewrite: keep drift honest
-		cp.mu.Unlock()
+		if err := appendPoolLines(cp.path, pending); err != nil {
+			Stats.PoolWriteFailures.Add(1)
+			log.Printf("pool: %v", err)
+			cp.mu.Lock()
+			cp.drift = true // the file is missing lines memory holds
+			cp.mu.Unlock()
+		}
 	}
+	cp.compactWg.Done()
 	log.Printf("pool: compacted %s (%d lines, %d appended meanwhile)", path, len(lines), len(pending))
 }
 
@@ -356,6 +410,7 @@ func (cp *CandidatePool) attachFileLocked() {
 	}
 	f, err := os.OpenFile(cp.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		Stats.PoolWriteFailures.Add(1)
 		log.Printf("pool: reopen %s for append: %v (falling back to per-line appends)", cp.path, err)
 		return
 	}
@@ -405,6 +460,7 @@ func (cp *CandidatePool) compactLocked() {
 	}
 	cp.detachFileLocked()
 	if err := writeFileAtomic(cp.path, renderPoolLines(cp.lines)); err != nil {
+		Stats.PoolWriteFailures.Add(1)
 		log.Printf("pool: compact %s: %v", cp.path, err)
 	} else {
 		log.Printf("pool: compacted %s (%d lines, %d evicted)", cp.path, len(cp.lines), evicted)
@@ -571,31 +627,34 @@ func appendPoolLine(path, line string) {
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		Stats.PoolWriteFailures.Add(1)
 		log.Printf("pool: open %s for append: %v (candidates are not being persisted)", path, err)
 		return
 	}
 	defer f.Close()
 	if _, err := f.WriteString(line + "\n"); err != nil {
+		Stats.PoolWriteFailures.Add(1)
 		log.Printf("pool: write %s: %v", path, err)
 	}
 }
 
 // appendPoolLines appends several lines in one open/close. Used to flush the
-// lines parked while a compaction owned the file.
-func appendPoolLines(path string, lines []string) {
+// lines parked while a compaction owned the file. It reports whether every
+// line reached disk: the caller marks the pool drifted on failure, so the next
+// rewrite (or Close) realigns the file instead of assuming it is current.
+func appendPoolLines(path string, lines []string) error {
 	if path == "" || len(lines) == 0 {
-		return
+		return nil
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		log.Printf("pool: open %s for append: %v (%d candidates are not being persisted)", path, err, len(lines))
-		return
+		return fmt.Errorf("open %s for append: %w (%d candidates are not being persisted)", path, err, len(lines))
 	}
 	defer f.Close()
 	for _, l := range lines {
 		if _, err := f.WriteString(l + "\n"); err != nil {
-			log.Printf("pool: write %s: %v", path, err)
-			return
+			return fmt.Errorf("write %s: %w", path, err)
 		}
 	}
+	return nil
 }

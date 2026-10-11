@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"strconv"
 	"strings"
 	"time"
@@ -22,9 +23,16 @@ const filterScanMax = 200_000
 // jsonRowCap bounds a single JSON response. The queue can hold two million
 // entries and the page only ever shows the first pageful, so an unbounded
 // "scope=all" would build a multi-hundred-megabyte response out of a stray
-// click. The text download is left uncapped on purpose: exporting the list is
-// the one thing an operator asks for a lot of rows.
+// click.
 const jsonRowCap = 1000
+
+// maxExportRows bounds the text/csv/jsonl downloads and any explicit limit.
+// Exporting the list is the one thing an operator asks for a lot of rows, so
+// the downloads are allowed two orders of magnitude more than a page — but not
+// infinity: an uncapped scope=all on a multi-million queue materializes the
+// whole ranked set, and a scripted loop against it is a self-DoS behind the
+// token. limit=0 still means "everything up to this".
+const maxExportRows = 100_000
 
 // liveRow is one entry of the "really alive" proxy table. It is the single
 // rendering of a proxy for every admin surface — the HTTP list, the CSV/JSONL
@@ -118,17 +126,27 @@ func (a *admin) live(scope string, limit int, countryFilter, asnFilter string) (
 // the whole queue, which for a two million entry queue is most of a second of
 // CPU per broadcast. The unranked scan is the same set at a fraction of the
 // cost.
-func (a *admin) liveDelta() []liveRow {
+//
+// The result is capped at jsonRowCap: every proxy checked inside the window
+// used to go out whole in the initial state and every broadcast (~100k rows
+// is ~20-30 MB of JSON per tick, per client). The page only renders the first
+// pageful, so the rows past the cap are simply not shown; truncated tells it
+// (and the operator) that the view is partial rather than silently short.
+func (a *admin) liveDelta() (rows []liveRow, truncated bool) {
 	if a.bucket == nil {
-		return nil
+		return nil, false
 	}
 	proxies := a.bucket.LiveListUnranked(proxy.AliveChecked, liveWindow)
 	now := time.Now()
 	out := make([]liveRow, 0, len(proxies))
 	for _, p := range proxies {
+		if len(out) >= jsonRowCap {
+			truncated = true
+			break
+		}
 		out = append(out, newLiveRow(p, now))
 	}
-	return out
+	return out, truncated
 }
 
 // exportText renders rows as one proxy URL per line: paste straight into curl,
@@ -142,45 +160,35 @@ func exportText(rows []liveRow) []byte {
 	return []byte(b.String())
 }
 
-// csvHeader is the CSV column order. Keeping it next to the row struct is what
-// keeps the two from drifting: the header and the writer read the same fields.
-const csvHeader = "url,schema,host,port,source,country,asn,latency_ms,ok_total,fail_total,consec_fails,proof_age_s,served,checked,in_flight\n"
-
-// exportCSV renders rows as CSV.
+// exportCSV renders rows as CSV through encoding/csv: a source URL with a
+// comma in it (many list URLs carry query strings) used to shift every
+// following column when fields were concatenated raw. The column order lives
+// with the writer; the old csvHeader const drifted from the row struct.
 func exportCSV(rows []liveRow) []byte {
 	var b strings.Builder
-	b.WriteString(csvHeader)
+	w := csv.NewWriter(&b)
+	w.Write([]string{"url", "schema", "host", "port", "source", "country", "asn",
+		"latency_ms", "ok_total", "fail_total", "consec_fails", "proof_age_s",
+		"served", "checked", "in_flight"})
 	for _, row := range rows {
-		b.WriteString(row.URL)
-		b.WriteByte(',')
-		b.WriteString(row.Schema)
-		b.WriteByte(',')
-		b.WriteString(row.Host)
-		b.WriteByte(',')
-		b.WriteString(strconv.Itoa(row.Port))
-		b.WriteByte(',')
-		b.WriteString(row.Source)
-		b.WriteByte(',')
-		b.WriteString(row.Country)
-		b.WriteByte(',')
-		b.WriteString(row.ASN)
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatInt(row.Latency, 10))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatInt(row.OK, 10))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatInt(row.Fails, 10))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatInt(row.Consec, 10))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatFloat(row.Age, 'f', 3, 64))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatBool(row.Served))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatBool(row.Checked))
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatInt(row.InFlight, 10))
-		b.WriteByte('\n')
+		w.Write([]string{
+			row.URL,
+			row.Schema,
+			row.Host,
+			strconv.Itoa(row.Port),
+			row.Source,
+			row.Country,
+			row.ASN,
+			strconv.FormatInt(row.Latency, 10),
+			strconv.FormatInt(row.OK, 10),
+			strconv.FormatInt(row.Fails, 10),
+			strconv.FormatInt(row.Consec, 10),
+			strconv.FormatFloat(row.Age, 'f', 3, 64),
+			strconv.FormatBool(row.Served),
+			strconv.FormatBool(row.Checked),
+			strconv.FormatInt(row.InFlight, 10),
+		})
 	}
+	w.Flush()
 	return []byte(b.String())
 }

@@ -57,6 +57,11 @@ type Bucket struct {
 	// the config; see SetFreshnessWindows.
 	serveWindow time.Duration
 	freshWindow time.Duration
+	// requireProven refuses a pick when no entry carries proof of life inside
+	// the windows above, instead of falling back to the unverified bulk. Set
+	// once at startup from server.serve_require_proven (default false); read
+	// lock-free on the serving path after that, like the windows.
+	requireProven bool
 
 	// changeMu guards subs. Subscribers are a list, not a single slot: the
 	// forward dialer (loop set, pin release) and the admin page (WebSocket
@@ -244,11 +249,19 @@ func (b *Bucket) addLocked(p *Proxy) (added bool, evicted *Proxy) {
 
 // Promote marks p as recently proven (served a genuine response, passed a
 // revalidation, or was just validated), so pickers concentrate capacity on the
-// working tail of the pool instead of the dead bulk. Cheap and lock-free to
-// call from the serving path; a no-op for entries already out of the bucket.
+// working tail of the pool instead of the dead bulk. The common case — the
+// same exit at the front of the tail — takes only the read lock; every other
+// case takes the write lock to reorder (and, for a newly proven entry, to
+// rebuild hotIdx). A no-op for entries already out of the bucket.
 func (b *Bucket) Promote(p *Proxy) {
 	if p == nil {
 		return
+	}
+	b.mu.RLock()
+	front := len(b.hot) > 0 && b.hot[0] == p
+	b.mu.RUnlock()
+	if front {
+		return // already the most recent proof: nothing to reorder
 	}
 	b.mu.Lock()
 	b.promoteLocked(p)
@@ -381,10 +394,21 @@ func (b *Bucket) IsDirty() bool {
 	return b.dirty
 }
 
-// MarkClean clears the dirty flag after a successful save.
+// MarkClean clears the dirty flag after a successful save. Callers that
+// snapshot-then-write clear it *before* the snapshot (see main/loops.go
+// saveQueue): mutations that land during a slow write then re-dirty the flag
+// instead of being silently skipped until the next mutation.
 func (b *Bucket) MarkClean() {
 	b.mu.Lock()
 	b.dirty = false
+	b.mu.Unlock()
+}
+
+// MarkDirty re-arms the save flag: a write that failed after MarkClean must
+// be retried on the next tick, not lost.
+func (b *Bucket) MarkDirty() {
+	b.mu.Lock()
+	b.dirty = true
 	b.mu.Unlock()
 }
 
@@ -419,18 +443,28 @@ func (b *Bucket) HotLen() int {
 	return len(b.hot)
 }
 
-// ProvenCount returns how many proxies can be served with evidence, i.e. how
-// many are in the proven tier: they either carried a real client response or
-// passed a full validation inside the pick_windows the picker uses.
+// ProvenCount returns how many proxies can be served with evidence: the hot
+// tail entries whose proof of life is still inside the pick windows.
 //
 // This is what a readiness probe must look at, not Len(). A queue of two
 // million seeded-but-unverified addresses answers "is anything in the queue"
 // with yes while every single dial fails, which is the one state a supervisor
 // must not be told is healthy.
+//
+// Membership alone is not evidence: entries age in place, so len(hot) can be
+// 512 while every one of them is stale. Counting the tail without the window
+// filter is how /ready answered 200 for a dead queue.
 func (b *Bucket) ProvenCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return len(b.hot)
+	now := nowNanos()
+	n := 0
+	for _, p := range b.hot {
+		if b.freshnessRank(now, p) != freshStale {
+			n++
+		}
+	}
+	return n
 }
 
 // Random returns a uniformly random live proxy, waiting if the queue is empty.
@@ -499,9 +533,17 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 		// admits entries that were live at rebuild time; rankPick re-checks
 		// each sample against b.index and skips the ones removed since.
 		now := nowNanos()
+		// Fail closed before touching the bulk: with requireProven on, the
+		// unverified queue is not a fallback tier, so a request with no
+		// proven entry to serve it fails instead of going out through one.
+		if b.requireProven {
+			best, err := b.pickProvenLocked(proven, probes, skip, now)
+			b.mu.RUnlock()
+			return best, err
+		}
 		source := b.proxies
 		switch {
-		case len(b.hot) > 0:
+		case b.hotHasFreshLocked(now):
 			source = b.hot
 		case len(proven) > 0:
 			source = proven
@@ -579,27 +621,41 @@ func (b *Bucket) LiveList(scope string, window time.Duration, limit int) []*Prox
 // admin WebSocket delta diffs two of these a second, and ranking a two million
 // entry queue to compute a set difference is almost the entire cost of the
 // broadcast. Order here is meaningless by design.
+//
+// Only the pointer copy runs under the read lock; the window filter runs
+// outside it. Every field the filter reads is atomic, so holding RLock across
+// the whole scan would only stall Add/Remove (checker, revalidation, serving
+// evictions) for no correctness gain. Membership can shift mid-scan on a huge
+// queue — an entry added between copy and filter may be missed, one removed
+// may be included — but the delta recomputes every second, so the view
+// self-heals faster than an operator can read it.
 func (b *Bucket) LiveListUnranked(scope string, window time.Duration) []*Proxy {
-	now := time.Now()
-	var out []*Proxy
 	b.mu.RLock()
-	defer b.mu.RUnlock()
 	src := b.proxies
 	if scope == AliveHot {
 		src = b.hot
 	}
-	for _, p := range src {
-		served := p.LastServed()
-		checked := p.LastCheck()
+	cp := make([]*Proxy, len(src))
+	copy(cp, src)
+	b.mu.RUnlock()
+	// Nano compares, same as LiveListPage: time.Unix + Time.Sub per queue
+	// entry was the dominant cost of the one-second delta scan once the
+	// copy moved out of the lock.
+	nowNS := time.Now().UnixNano()
+	windowNS := int64(window)
+	var out []*Proxy
+	for _, p := range cp {
+		served := p.lastOKNanos()
+		checked := p.lastCheckNanos()
 		switch {
-		case !served.IsZero() && now.Sub(served) <= window:
-		case !checked.IsZero() && now.Sub(checked) <= window:
+		case served != 0 && nowNS-served <= windowNS:
+		case checked != 0 && nowNS-checked <= windowNS:
 		default:
 			if scope != AliveAll {
 				continue
 			}
 		}
-		if scope == AliveServed && (served.IsZero() || now.Sub(served) > window) {
+		if scope == AliveServed && (served == 0 || nowNS-served > windowNS) {
 			continue
 		}
 		out = append(out, p)
@@ -622,12 +678,10 @@ func (b *Bucket) LiveListUnranked(scope string, window time.Duration) []*Proxy {
 // with no bound to stop it.
 func (b *Bucket) LiveListPage(scope string, window time.Duration, limit int) (rows []*Proxy, total int) {
 	now := time.Now()
-	type row struct {
-		p     *Proxy
-		rank  int
-		stamp time.Time
-	}
-	var found []row
+	// Copy pointers under the lock, filter and rank outside it (same shape as
+	// LiveListUnranked, P49): the scan used to run with b.mu.RLock held, so
+	// one default admin page blocked checker commits and serving evictions
+	// for the duration of a full-queue walk. The lock now covers a copy.
 	b.mu.RLock()
 	src := b.proxies
 	if scope == AliveHot {
@@ -636,19 +690,97 @@ func (b *Bucket) LiveListPage(scope string, window time.Duration, limit int) (ro
 		// below: serving proof first, then a validation stamp.
 		src = b.hot
 	}
-	for _, p := range src {
-		served := p.LastServed()
-		checked := p.LastCheck()
+	cp := make([]*Proxy, len(src))
+	copy(cp, src)
+	b.mu.RUnlock()
+
+	// liveRow carries the ranking evidence for one qualifying entry. idx is
+	// the scan position and breaks every remaining tie: that is what
+	// SliceStable's "equal elements keep insertion order" used to provide,
+	// and with a total order the selection below needs no stability.
+	//
+	// stamp is the raw unix-nano proof time, not a time.Time: the scan runs
+	// this over every queue entry, and time.Unix+Time.Sub per row was the
+	// dominant cost of the whole request once the sort was bounded (the
+	// picker already compares nanos this way — see lastOKNanos in pick.go).
+	// 0 means "no proof"; comparisons are plain int64.
+	type liveRow struct {
+		p     *Proxy
+		rank  int
+		stamp int64
+		lat   time.Duration
+		idx   int
+	}
+	better := func(a, b liveRow) bool {
+		if a.rank != b.rank {
+			return a.rank > b.rank
+		}
+		if a.stamp != b.stamp {
+			return a.stamp > b.stamp
+		}
+		if a.lat != b.lat {
+			if a.lat == 0 {
+				return false // unmeasured sorts last
+			}
+			if b.lat == 0 {
+				return true
+			}
+			return a.lat < b.lat
+		}
+		return a.idx < b.idx
+	}
+	worse := func(a, b liveRow) bool { return better(b, a) }
+
+	// siftDown restores the max-heap property (root = worst kept row) after
+	// slot i was overwritten.
+	siftDown := func(h []liveRow, i int) {
+		for {
+			l := 2*i + 1
+			if l >= len(h) {
+				return
+			}
+			j := l
+			if r := l + 1; r < len(h) && worse(h[r], h[l]) {
+				j = r
+			}
+			if !worse(h[j], h[i]) {
+				return
+			}
+			h[i], h[j] = h[j], h[i]
+			i = j
+		}
+	}
+
+	// The old shape collected every qualifier, sorted the whole set
+	// (O(n log n) of the queue) and truncated — a two-million entry queue
+	// spent most of an admin request ranking rows the page would never
+	// show, and the comparator re-read Latency() (an atomic load) inside
+	// every comparison. Selection keeps only the best `limit` rows in a
+	// bounded max-heap: O(n log k) with k = limit, one Latency() load per
+	// qualifier, and O(k) memory instead of O(n). limit <= 0 still means
+	// "everything" — no bound to stop at, so that path never evicts from
+	// the heap and the final sort ranks everything it saw.
+	//
+	// Latency is snapshotted into the row once per qualifier, never read
+	// inside better(): the old comparator paid two atomic loads per
+	// comparison.
+	keep := limit
+	nowNS := now.UnixNano()
+	windowNS := int64(window)
+	var heap []liveRow
+	for i, p := range cp {
+		served := p.lastOKNanos()
+		checked := p.lastCheckNanos()
 		var rank int
-		var stamp time.Time
+		var stamp int64
 		switch {
-		case !served.IsZero() && now.Sub(served) <= window:
+		case served != 0 && nowNS-served <= windowNS:
 			rank, stamp = 2, served
-		case !checked.IsZero() && now.Sub(checked) <= window:
+		case checked != 0 && nowNS-checked <= windowNS:
 			rank, stamp = 1, checked
 		default:
 			if scope == AliveAll {
-				rank, stamp = 0, time.Time{}
+				rank, stamp = 0, 0
 			} else {
 				continue
 			}
@@ -656,42 +788,30 @@ func (b *Bucket) LiveListPage(scope string, window time.Duration, limit int) (ro
 		if scope == AliveServed && rank < 2 {
 			continue
 		}
-		found = append(found, row{p: p, rank: rank, stamp: stamp})
-	}
-	b.mu.RUnlock()
-	total = len(found)
-
-	// SliceStable, and no key comparison for ties: a tie keeps queue order,
-	// which is all the determinism the page needs. The old tie-break called
-	// p.Key() inside the comparator, and Key() falls back to building the URL
-	// for any proxy that has not been through a pick yet — so ranking a page
-	// of a 70k queue made a million fmt.Sprintf calls and 146k allocations,
-	// ~15ms of every admin request.
-	sort.SliceStable(found, func(i, j int) bool {
-		if found[i].rank != found[j].rank {
-			return found[i].rank > found[j].rank
-		}
-		if !found[i].stamp.Equal(found[j].stamp) {
-			return found[i].stamp.After(found[j].stamp)
-		}
-		li, lj := found[i].p.Latency(), found[j].p.Latency()
-		if li != lj {
-			if li == 0 {
-				return false // unmeasured sorts last
+		total++
+		row := liveRow{p: p, rank: rank, stamp: stamp, lat: p.Latency(), idx: i}
+		if keep > 0 && len(heap) == keep {
+			if !better(row, heap[0]) {
+				continue // loses to the worst row already kept
 			}
-			if lj == 0 {
-				return true
-			}
-			return li < lj
+			heap[0] = row
+			siftDown(heap, 0)
+			continue
 		}
-		return false // equal evidence: insertion order decides (stable)
-	})
-	if limit > 0 && len(found) > limit {
-		found = found[:limit]
+		heap = append(heap, row)
+		for j := len(heap) - 1; j > 0; {
+			parent := (j - 1) / 2
+			if !worse(heap[j], heap[parent]) {
+				break
+			}
+			heap[j], heap[parent] = heap[parent], heap[j]
+			j = parent
+		}
 	}
-	out := make([]*Proxy, len(found))
-	for i := range found {
-		out[i] = found[i].p
+	sort.Slice(heap, func(i, j int) bool { return better(heap[i], heap[j]) })
+	out := make([]*Proxy, len(heap))
+	for i := range heap {
+		out[i] = heap[i].p
 	}
 	return out, total
 }

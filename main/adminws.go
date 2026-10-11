@@ -31,6 +31,13 @@ type wsConn struct {
 const (
 	wsIdleTimeout  = 5 * time.Minute
 	wsWriteTimeout = 30 * time.Second
+	// wsMaxFrameBytes bounds one inbound frame. The admin page never sends
+	// data; the only inbound traffic is the implicit close/ping path, so
+	// 64 KB is orders of magnitude above anything legitimate.
+	wsMaxFrameBytes = 64 << 10
+	// wsMaxClients bounds simultaneous admin pages. Each costs two
+	// goroutines, a 256-slot buffer and a socket.
+	wsMaxClients = 32
 )
 
 // wsHub owns every connected admin page. It is a type of its own because the
@@ -112,6 +119,21 @@ func (h *wsHub) count() int {
 
 // handleWebSocket upgrades a connection to a WebSocket for live updates.
 func (a *admin) handleWebSocket(ws *websocket.Conn) {
+	// Cap the receive side before anything is read: the page never sends
+	// payloads, and a single oversized frame (the length field is 8 bytes)
+	// would otherwise be materialized whole in memory by
+	// websocket.Message.Receive. ErrFrameTooLarge unwinds the reader loop
+	// below and the connection is dropped.
+	ws.MaxPayloadBytes = wsMaxFrameBytes
+
+	// Bound the number of live pages: each holds a writer goroutine, a
+	// reader goroutine, a 256-slot send buffer and a socket. A runaway
+	// reconnect loop (or a scanner) must not grow those without limit.
+	if a.ws.count() >= wsMaxClients {
+		_ = ws.Close()
+		return
+	}
+
 	// Whatever deadline the server set before the hijack, drop it: this
 	// connection now runs on the deadlines below.
 	_ = ws.SetDeadline(time.Time{})
@@ -166,12 +188,14 @@ func (a *admin) handleWebSocket(ws *websocket.Conn) {
 // The TLS flag is the listener's, not the connection's: the WebSocket frame
 // does not carry it, and the page knows its own scheme anyway.
 func (a *admin) sendWSState(c *wsConn) {
+	proxies, truncated := a.liveDelta()
 	msg := map[string]interface{}{
-		"type":    "state",
-		"health":  a.healthView(a.tlsConfigured),
-		"proxies": a.liveDelta(),
-		"sources": a.sources(),
-		"history": a.statsHistory(),
+		"type":      "state",
+		"health":    a.healthView(a.tlsConfigured),
+		"proxies":   proxies,
+		"truncated": truncated,
+		"sources":   a.sources(),
+		"history":   a.statsHistory(),
 	}
 	data, _ := json.Marshal(msg)
 	select {
@@ -184,10 +208,18 @@ func (a *admin) sendWSState(c *wsConn) {
 // broadcast per tick. The checker adds and revalidation drops arrive in
 // bursts of hundreds per second; recomputing a whole-queue diff for each one
 // inline would put admin bookkeeping in the hot path of every worker.
+//
+// The interval follows the queue size, re-evaluated every tick so a queue
+// that grows past the threshold slows down on its own: a delta over a few
+// thousand entries is milliseconds, over two million it is seconds of scan
+// plus megabytes of JSON per client. A dashboard that refreshes every few
+// seconds instead of every second is still live; a proxy that spends its time
+// rendering the admin page is not serving.
 func (a *admin) startWSNotifier(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	pending := false
+	var lastBroadcast time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -195,10 +227,19 @@ func (a *admin) startWSNotifier(ctx context.Context) {
 		case <-a.ws.notify:
 			pending = true
 		case <-t.C:
-			if pending {
-				pending = false
-				a.notifyWSChanged()
+			if !pending {
+				continue
 			}
+			minInterval := time.Second
+			if a.bucket != nil && a.bucket.Len() > 100_000 {
+				minInterval = 5 * time.Second
+			}
+			if !lastBroadcast.IsZero() && time.Since(lastBroadcast) < minInterval {
+				continue // stay pending; try again next tick
+			}
+			pending = false
+			lastBroadcast = time.Now()
+			a.notifyWSChanged()
 		}
 	}
 }
@@ -209,7 +250,7 @@ func (a *admin) notifyWSChanged() {
 	if a.ws.count() == 0 {
 		return // nobody is listening: the diff is pure cost
 	}
-	live := a.liveDelta()
+	live, truncated := a.liveDelta()
 	currentProxies := make(map[string]liveRow, len(live))
 	for _, p := range live {
 		currentProxies[p.URL] = p
@@ -218,11 +259,12 @@ func (a *admin) notifyWSChanged() {
 	added, removed, updated := a.ws.diff(currentProxies)
 
 	msg := map[string]interface{}{
-		"type":    "delta",
-		"health":  a.healthView(a.tlsConfigured),
-		"added":   added,
-		"removed": removed,
-		"updated": updated,
+		"type":      "delta",
+		"health":    a.healthView(a.tlsConfigured),
+		"added":     added,
+		"removed":   removed,
+		"updated":   updated,
+		"truncated": truncated,
 	}
 	data, _ := json.Marshal(msg)
 	a.ws.broadcast(data)

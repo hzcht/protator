@@ -47,7 +47,8 @@ type Checker struct {
 	tests   []ContentTest
 	testsRe [][]*regexp.Regexp // parallel to tests; nil entry = substring match
 	ipRe    *regexp.Regexp
-	geoDB   *geoip2.Reader
+	geoDB   *geoip2.Reader // City database (country); nil = off
+	geoASN  *geoip2.Reader // ASN database (separate file); nil = off
 
 	// transportCache caches http.Transport per proxy address to avoid
 	// creating a new transport (and its connection pool) for every check.
@@ -85,6 +86,19 @@ func NewChecker(cfg *Config) (*Checker, error) {
 			return nil, fmt.Errorf("open GeoIP database %s: %w", cfg.Checker.GeoIPDBPath, err)
 		}
 		c.geoDB = db
+	}
+	// The ASN database is a separate MaxMind file (GeoLite2-ASN.mmdb); the
+	// City database has no ASN data. Both readers are independent: a deploy
+	// may ship either, both, or neither.
+	if cfg.Checker.GeoIPASNDBPath != "" {
+		db, err := geoip2.Open(cfg.Checker.GeoIPASNDBPath)
+		if err != nil {
+			if c.geoDB != nil {
+				c.geoDB.Close()
+			}
+			return nil, fmt.Errorf("open GeoIP ASN database %s: %w", cfg.Checker.GeoIPASNDBPath, err)
+		}
+		c.geoASN = db
 	}
 
 	if cfg.Checker.TestsFile != "" && fileExists(cfg.Checker.TestsFile) {
@@ -176,7 +190,16 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 		}
 	}
 	if cand.Schema != "" && validSchema(cand.Schema) {
-		p := &Proxy{Schema: cand.Schema, Host: cand.Host, Port: cand.Port}
+		// meta is allocated here, before publication: SetGeoIP/SetVLESS run
+		// after the proxy is queued (revalidation) while admin live rows read
+		// GetCountry/GetASN concurrently, and a lazily-initialized plain
+		// pointer field is a data race on the hot read path.
+		p := &Proxy{Schema: cand.Schema, Host: cand.Host, Port: cand.Port, meta: &ProxyMeta{}}
+		// Precompute the identity before the proxy is published: every Key()
+		// on the productive population would otherwise rebuild the URL with
+		// fmt.Sprintf (rankPick calls it once per probe, up to 256 per pick,
+		// under the bucket read lock). Single goroutine here, so no race.
+		p.keyCache = p.URL()
 		if err := c.preDial(p); err != nil {
 			Stats.ChecksFailed.Add(1)
 			return nil, err
@@ -197,7 +220,8 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 		order = preferFirst(order, cand.Prefer)
 	}
 	for _, s := range order {
-		p := &Proxy{Schema: s, Host: cand.Host, Port: cand.Port}
+		p := &Proxy{Schema: s, Host: cand.Host, Port: cand.Port, meta: &ProxyMeta{}}
+		p.keyCache = p.URL() // same precompute as above, same reason
 		if err := c.preDial(p); err != nil {
 			continue
 		}
@@ -388,22 +412,27 @@ func (c *Checker) ipThrough(client *http.Client, p *Proxy) (net.IP, bool, string
 	ch := make(chan res, len(urls))
 	for _, u := range urls {
 		go func(u string) {
+			// Guarded like every other sub-probe: the reader below takes a
+			// fixed number of results with no ctx escape, so a panic here
+			// would hang its peers forever — and an unrecovered one exits the
+			// process with the queue unsaved.
+			defer RecoverPanic("checker: self-ip " + u)
 			body, err := getBodyCtx(ctx, client, u)
 			if err != nil {
-				ch <- res{err: err}
+				GuardedSend(ch, res{err: err})
 				return
 			}
 			ip := c.firstIP(body)
 			if ip == nil {
-				ch <- res{err: errors.New("no IP in service response")}
+				GuardedSend(ch, res{err: errors.New("no IP in service response")})
 				return
 			}
 			if ip.Equal(c.selfIP) {
-				ch <- res{transparent: true}
+				GuardedSend(ch, res{transparent: true})
 				return
 			}
 			vc := needsConnect(p.Schema) && viaConnectURL(u)
-			ch <- res{ip: ip, viaConnect: vc, url: u}
+			GuardedSend(ch, res{ip: ip, viaConnect: vc, url: u})
 		}(u)
 	}
 	var lastErr error
@@ -665,10 +694,17 @@ func (c *Checker) transportFor(p *Proxy) *http.Transport {
 		}
 	}
 
-	// Store in cache with eviction when full. Range has no defined order, so
-	// this is not really FIFO — but the pool of transports is fungible: any
-	// one of them can be dropped at the cost of one fresh connection pool.
-	c.transportCache.Store(key, tr)
+	// Store in cache with eviction when full. LoadOrStore, like the
+	// collector's twin: two workers checking the same proxy concurrently both
+	// miss Load, and a plain Store orphans the loser's transport mid-check
+	// (up to 8 idle conns) while double-counting transportCacheSize for one
+	// key — premature eviction of real entries under exactly the load spikes
+	// the cache exists to absorb.
+	actual, loaded := c.transportCache.LoadOrStore(key, tr)
+	if loaded {
+		tr.CloseIdleConnections() // lost the race; do not leak this handle
+		return actual.(*http.Transport)
+	}
 	if atomic.AddInt64(&c.transportCacheSize, 1) > c.transportCacheMax {
 		// Never evict the entry just inserted: Range order is undefined, so it
 		// can return `key` itself, leaving the new transport uncached.
@@ -722,18 +758,26 @@ func getBodyCtx(ctx context.Context, client *http.Client, u string) (string, err
 }
 
 // lookupGeoIP looks up the country and ASN for the given IP from the local
-// MaxMind database, if one is configured. The ASN field needs a separate
-// GeoLite2-ASN / GeoIP2-ASN reader, which the config does not provide today, so
-// ASN comes back empty rather than invented.
+// MaxMind databases, if configured. Country comes from the City database
+// (geoip_db_path), ASN from the separate ASN database (geoip_asn_db_path):
+// the two are different MaxMind files, and neither field is invented when its
+// database is absent.
 func (c *Checker) lookupGeoIP(ip net.IP) (country, asn string) {
-	if c.geoDB == nil {
-		return "", ""
+	if c.geoDB != nil {
+		if record, err := c.geoDB.City(ip); err == nil {
+			country = record.Country.IsoCode
+		}
 	}
-	record, err := c.geoDB.City(ip)
-	if err != nil {
-		return "", ""
+	if c.geoASN != nil {
+		if record, err := c.geoASN.ASN(ip); err == nil {
+			if record.AutonomousSystemOrganization != "" {
+				asn = fmt.Sprintf("AS%d %s", record.AutonomousSystemNumber, record.AutonomousSystemOrganization)
+			} else if record.AutonomousSystemNumber != 0 {
+				asn = fmt.Sprintf("AS%d", record.AutonomousSystemNumber)
+			}
+		}
 	}
-	return record.Country.IsoCode, ""
+	return country, asn
 }
 
 // matchesTemplate matches a template string either as a regexp or, if the

@@ -14,17 +14,14 @@ func PoolReprobeLoop(ctx context.Context, cfg *Config, pool *CandidatePool, cand
 	t := time.NewTicker(cfg.Collector.PoolRetryInterval.Duration)
 	defer t.Stop()
 
-	// Estimate checker throughput: workers / avg_check_time.
-	// A full check takes ~10-15s wall time, but races internally.
-	// Conservative: each worker completes ~4 checks/minute = 0.067/sec.
-	// So 600 workers ≈ 40 checks/sec theoretical max.
-	// But with retries, timeouts, failures: real throughput ~10-15/sec.
-	// We'll measure actual throughput dynamically.
-	const checksPerWorkerPerMin = 4.0
-	estThroughput := float64(cfg.Checker.Workers) * checksPerWorkerPerMin / 60.0 // checks/sec
-	if estThroughput < 1 {
-		estThroughput = 10 // fallback
-	}
+	// Measure real checker throughput from Stats.Checks deltas between ticks.
+	// The old static estimate (workers × 4 checks/min) sized every batch from
+	// fiction: an idle checker starved the pool of re-probes, a fast one
+	// under-fed it, and the number never matched the configured worker count
+	// after any tuning.
+	lastChecks := Stats.Checks.Load()
+	lastTick := time.Now()
+	estThroughput := 10.0 // fallback for the first tick
 
 	intervalSec := cfg.Collector.PoolRetryInterval.Duration.Seconds()
 	// Target: use 70% of checker capacity for re-probe, rest for collector
@@ -35,6 +32,20 @@ func PoolReprobeLoop(ctx context.Context, cfg *Config, pool *CandidatePool, cand
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			now := time.Now()
+			if dt := now.Sub(lastTick).Seconds(); dt > 0 {
+				if done := Stats.Checks.Load() - lastChecks; done > 0 {
+					estThroughput = float64(done) / dt
+				}
+				// done == 0: keep the previous estimate; a quiet interval
+				// must not collapse the batch floor to zero forever.
+			}
+			lastChecks = Stats.Checks.Load()
+			lastTick = now
+			if estThroughput < 1 {
+				estThroughput = 1
+			}
+
 			// The checker is the bottleneck (a full check costs ~12 requests
 			// through the proxy), so the re-probe must never fill the channel:
 			// a full channel blocks the collector's fresh candidates, which
@@ -73,7 +84,7 @@ func PoolReprobeLoop(ctx context.Context, cfg *Config, pool *CandidatePool, cand
 					emitted, len(cands)-emitted, pool.Len())
 				continue
 			}
-			log.Printf("pool: re-probing %d persisted candidates (total %d, batch target %d, est throughput %.1f/s)",
+			log.Printf("pool: re-probing %d persisted candidates (total %d, batch target %d, throughput %.1f/s)",
 				emitted, pool.Len(), targetBatch, estThroughput)
 		}
 	}

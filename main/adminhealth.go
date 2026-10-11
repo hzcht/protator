@@ -21,6 +21,7 @@ import (
 func (a *admin) healthView(tls bool) map[string]interface{} {
 	m := map[string]interface{}{
 		"uptime_seconds":  int(time.Since(a.started).Seconds()),
+		"version":         protatorVersion,
 		"queue_live":      a.bucket.Len(),
 		"queue_hot":       a.bucket.HotLen(),
 		"queue_proven":    a.bucket.ProvenCount(),
@@ -38,7 +39,7 @@ func (a *admin) healthView(tls bool) map[string]interface{} {
 		m["worker_restarts"] = a.workers.Restarts()
 	}
 	if a.beats != nil {
-		m["beats"] = a.beats.view(a.cfg.Storage.RevalidateInterval.Duration, a.cfg.Collector.CycleSleep.Duration)
+		m["beats"] = a.beats.view(a.cfg.Storage.RevalidateInterval.Duration, a.cfg.Collector.CycleSleep.Duration, a.cfg.Storage.SaveInterval.Duration)
 	}
 	counters := proxy.Stats.Snapshot()
 	for _, k := range []string{
@@ -103,6 +104,11 @@ func (a *admin) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"pool_candidates": int64(a.pool.Len()),
 		"goroutines":      int64(runtime.NumGoroutine()),
 	}
+	// The supervisor's headline signal belongs in the scrapeable surface, not
+	// just in /health: a climbing restart count is the bug report.
+	if a.workers != nil {
+		gauges["worker_restarts"] = a.workers.Restarts()
+	}
 	if a.candidates != nil {
 		gauges["candidate_channel_len"] = int64(len(a.candidates))
 		gauges["candidate_channel_cap"] = int64(cap(a.candidates))
@@ -165,7 +171,10 @@ func writeMetricsText(w http.ResponseWriter, counters map[string]int64, rates ma
 	}
 	for _, k := range keys {
 		if v, ok := rates[k]; ok {
-			write(k[:len(k)-len("_total")]+"_per_sec", strconv.FormatFloat(v, 'f', 4, 64))
+			// TrimSuffix, not a blind slice: a future counter whose key is
+			// shorter than "_total" (or lacks the suffix) made the slice
+			// panic the metrics endpoint.
+			write(strings.TrimSuffix(k, "_total")+"_per_sec", strconv.FormatFloat(v, 'f', 4, 64))
 		}
 	}
 	gkeys := make([]string, 0, len(gauges))
@@ -295,11 +304,39 @@ func (a *admin) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 			given = ""
 		}
 		if !constantTimeEqual(given, token) {
+			proxy.Stats.AdminAuthFailures.Add(1)
 			writeError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// requireAdminTokenWS is requireAdminToken for the WebSocket endpoint, whose
+// handler is an http.Handler (x/net/websocket) rather than an http.HandlerFunc.
+// The gate runs on the HTTP upgrade request, before the hijack: a rejected
+// handshake never becomes a socket, and the page passes ?token= in the WS URL.
+func (a *admin) requireAdminTokenWS(next http.Handler) http.Handler {
+	token := a.cfg.Server.AdminToken
+	if token == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		given := r.Header.Get("Authorization")
+		if v := strings.TrimPrefix(given, "Bearer "); v != given && v != "" {
+			given = v
+		} else if v := r.URL.Query().Get("token"); v != "" {
+			given = v
+		} else {
+			given = ""
+		}
+		if !constantTimeEqual(given, token) {
+			proxy.Stats.AdminAuthFailures.Add(1)
+			writeError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // constantTimeEqual compares two tokens without leaking their common prefix

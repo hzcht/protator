@@ -49,6 +49,40 @@ func TestParseProxyLine(t *testing.T) {
 	}
 }
 
+// AppendURL is what every queue save writes; URL() is what every dial and
+// picker call uses. They must render the same string for every schema —
+// AppendURL's VLESS branch once omitted host:port, so the save wrote
+// "vless://uuid@?flow=…" and ParseProxyLine dropped the entry on reload:
+// the save/reload cycle silently deleted every VLESS proxy.
+func TestAppendURLMatchesURL(t *testing.T) {
+	cases := []string{
+		"1.2.3.4:8080",
+		"http://1.2.3.4:8080",
+		"https://1.2.3.4:8443",
+		"socks4://1.2.3.4:4145",
+		"socks5://1.2.3.4:1080",
+		"[2001:db8::1]:1080",
+		"vless://d342d11e-d424-4583-b36e-524ab1f0afa4@1.2.3.4:443?flow=xtls-rprx-vision&sni=example.com",
+	}
+	for _, line := range cases {
+		p, err := ParseProxyLine(line)
+		if err != nil {
+			t.Fatalf("%q: %v", line, err)
+		}
+		if got := string(p.AppendURL(nil)); got != p.URL() {
+			t.Errorf("AppendURL(%q) = %q, URL() = %q", line, got, p.URL())
+		}
+		// And the rendered line must survive a reload round-trip.
+		q, err := ParseProxyLine(p.URL())
+		if err != nil {
+			t.Fatalf("reload %q (from %q): %v", p.URL(), line, err)
+		}
+		if q.Schema != p.Schema || q.Host != p.Host || q.Port != p.Port {
+			t.Errorf("round-trip %q: got %+v, want %+v", line, q, p)
+		}
+	}
+}
+
 func TestExtractUniversal(t *testing.T) {
 	e, _ := NewExtractor(nil)
 	body := `

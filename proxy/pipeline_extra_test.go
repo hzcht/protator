@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"path/filepath"
+	"runtime"
 	"runtime/metrics"
 	"sync"
 	"testing"
@@ -46,9 +47,26 @@ func TestRunCheckLoopBlocksWhenIdle(t *testing.T) {
 	// and has drained the channel before the idle window starts.
 	cands <- Candidate{Host: "127.0.0.1", Port: 18080, Schema: "http"}
 
+	// Drain GC debt from the setup above: a mark phase firing inside the
+	// measurement window on a many-core box burns tens of CPU-seconds across
+	// assist goroutines and looks like a spin this test cannot attribute.
+	runtime.GC()
 	before := cpuSeconds()
 	time.Sleep(150 * time.Millisecond)
 	spent := cpuSeconds() - before
+
+	// A single spinning goroutine burns ~0.15 CPU-seconds over this window
+	// (100% of one core); the 0.1 threshold catches it. A larger reading is
+	// other process work (GC mark phase on a many-core box, runtime), not
+	// this worker — retry once with a drained heap before failing. The
+	// worker keeps running through the retry; it is stopped only after the
+	// final measurement.
+	if spent > 0.1 {
+		runtime.GC()
+		before = cpuSeconds()
+		time.Sleep(150 * time.Millisecond)
+		spent = cpuSeconds() - before
+	}
 
 	close(stop)
 	finished := make(chan struct{})

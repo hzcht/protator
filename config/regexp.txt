@@ -60,7 +60,7 @@ port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 <td[^>]*class="[^"]*port[^"]*"[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*class="[^"]*ip[^"]*"[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>
 
 # data-ip / data-port attributes (modern sites)
-<td[^>]*data-ip\s*=\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^>]*>\s*.*?<td[^>]*data-port\s*=\s*"([0-9]{1,5})"[^>]*>
+<td[^>]*data-ip\s*=\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^>]*>\s*.{0,1000}?<td[^>]*data-port\s*=\s*"([0-9]{1,5})"[^>]*>
 
 # data-ip / data-port in same cell
 <td[^>]*data-ip\s*=\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^>]*data-port\s*=\s*"([0-9]{1,5})"[^>]*>
@@ -107,10 +107,10 @@ port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 "port"\s*:\s*"?([0-9]{1,5})"?[^}]{0,300}?"ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"
 
 # hide.mn style: <td>1.2.3.4</td><td>8080</td> with specific parent
-<table[^>]*class="[^"]*proxy[^"]*"[^>]*>.*?<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+<table[^>]*class="[^"]*proxy[^"]*"[^>]*>.{0,1000}?<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
 
 # free-proxy-list.net style: table with id="proxylisttable" or class
-<table[^>]*(?:id|class)="[^"]*proxy[^"]*"[^>]*>.*?<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
+<table[^>]*(?:id|class)="[^"]*proxy[^"]*"[^>]*>.{0,1000}?<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
 
 # premproxy.com / premiumproxy.net style: numbered list with IP:port in text
 <li[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})\s*</li>
@@ -168,17 +168,15 @@ port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 # 3proxy/DeleGate config style: "1.2.3.4 8080" or "socks5 1.2.3.4 1080"
 (?:socks?5?|http|https)?\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+([0-9]{1,5})\b
 
-# Shadowsocks/V2Ray/Clash base64 config fragments (decoded bodies)
-# ss://method:pass@1.2.3.4:8080
-ss://[A-Za-z0-9+/=]+@([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})
-# vmess://... (base64 JSON with add/port)
-vmess://[A-Za-z0-9+/=]{20,}
-
-# trojan://pass@1.2.3.4:443
-trojan://[^@]+@([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})
-
-# VLESS: vless://uuid@1.2.3.4:443?...
-vless://[^@]+@([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})
+# NOTE on credentialed URLs (ss://, trojan://, vless://): they used to live
+# here as host:port extractors, but a credential shape without its credential
+# is a candidate that can never validate — ss/trojan have no dial path at all,
+# and vless needs the UUID plus query params that the candidate pipeline does
+# not carry (extractor → Candidate → checker → pool all drop them). Every such
+# match burned a full multi-protocol check for nothing, so the patterns are
+# gone. Bringing any of them back means wiring the credential end to end
+# first: capture group(s) → Candidate fields → checker → dialer → pool
+# persistence, not just a regex.
 
 # CSV export: "1.2.3.4","8080","HTTP"
 "([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"([0-9]{1,5})"

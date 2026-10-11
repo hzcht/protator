@@ -3,6 +3,8 @@ package proxy
 import (
 	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -50,6 +52,10 @@ type ServerConfig struct {
 	ResponseHeader  Duration `toml:"response_header_timeout"`
 	MaxIdleConns    int      `toml:"max_idle_conns"`
 	IdleConnTimeout Duration `toml:"idle_conn_timeout"`
+	// ^ Both govern the checker's and the collector's clients (which keep
+	// their own idle pools). The serving transport forces
+	// DisableKeepAlives — every client request gets a fresh chain — so these
+	// knobs do nothing on the serving path despite living in [server].
 	// Serving-path resilience: every client request gets a freshly picked
 	// proxy; on dial failure it is retried with a different one.
 	ServeRetries  int `toml:"serve_retries"`
@@ -62,6 +68,10 @@ type ServerConfig struct {
 	// serving the unverified bulk of the queue.
 	PickServeWindow Duration `toml:"pick_serve_window"`
 	PickFreshWindow Duration `toml:"pick_fresh_window"`
+	// Fail closed when nothing is proven: refuse the request instead of serving
+	// it through an unvalidated proxy. Off by default (availability over
+	// strictness); an operator who would rather 502 than "maybe" turns it on.
+	ServeRequireProven bool `toml:"serve_require_proven"`
 	// Maximum wall-clock budget for a single client request across all
 	// failover attempts (0 = unbounded, rely on parent deadlines).
 	ServeTotalTimeout Duration `toml:"serve_total_timeout"`
@@ -85,6 +95,17 @@ type ServerConfig struct {
 	// content" and re-requested through another proxy.
 	ServeBlockDetect   bool `toml:"serve_block_detect"`
 	ServeBlockMaxBytes int  `toml:"serve_block_max_bytes"`
+	// Wall-clock budget for the interstitial sniff itself. The detector reads
+	// up to serve_block_max_bytes+1 of the *response body* inside RoundTrip,
+	// before any of it reaches the client; an upstream that answers headers
+	// and then stalls mid-body (chunked, or a lying Content-Length) would
+	// otherwise hold the client's headers hostage for the rest of
+	// serve_total_timeout (25s) before failover. On expiry the body is
+	// closed and the attempt is charged as a response-level failure and
+	// retried through another proxy. 0/negative falls back to 3s (there is
+	// no legitimate "unbounded" mode — disable the detector instead via
+	// serve_block_detect = false).
+	ServeSniffTimeout Duration `toml:"serve_sniff_timeout"`
 	// Session stickiness. ConnKey pins the upstream proxy per client TCP
 	// connection (recommended); SessionKey (from the client-supplied
 	// "X-Sticky-Session" header, stripped before forwarding) pins across
@@ -141,9 +162,14 @@ type CheckerConfig struct {
 	// (dialProxy) to the first self-IP URL before accepting a proxy.
 	E2EProbe bool `toml:"e2e_probe"`
 	// GeoIPDBPath is the path to a MaxMind GeoIP2-City.mmdb file.
-	// If set, the checker will look up the country and ASN for each
-	// validated proxy's exit IP and attach it to the proxy for admin display.
+	// If set, the checker looks up the country for each validated proxy's
+	// exit IP and attaches it for admin display and the country filter.
 	GeoIPDBPath string `toml:"geoip_db_path"`
+	// GeoIPASNDBPath is the path to a MaxMind GeoLite2-ASN.mmdb (or
+	// GeoIP2-ASN) file — a separate database from the City one. If set, the
+	// checker looks up the ASN ("AS12345 Provider") for each validated
+	// proxy's exit IP. Empty = ASN stays blank (the City file has no ASN).
+	GeoIPASNDBPath string `toml:"geoip_asn_db_path"`
 }
 
 // CollectorConfig controls proxy list collection.
@@ -157,7 +183,6 @@ type CollectorConfig struct {
 	UseBrowser   bool     `toml:"use_browser"`
 	BrowserHead  bool     `toml:"browser_headless"`
 	CycleSleep   Duration `toml:"cycle_sleep"`
-	SiteLogDir   string   `toml:"site_log_dir"`
 	// Failing sites are reduced to cheap direct attempts for this long
 	// after this many consecutive failures.
 	SiteCooldown Duration `toml:"site_cooldown"`
@@ -226,11 +251,13 @@ type StorageConfig struct {
 	DebugProxiesMax  int    `toml:"debug_proxies_max"`
 }
 
-// LoggingConfig controls log verbosity and per-category file logging.
+// LoggingConfig controls per-category file logging.
 type LoggingConfig struct {
-	Level string `toml:"level"`
 	// Dir holds per-category log files (collector.log, checker.log,
-	// serve.log, system.log). Empty = files disabled, stderr only.
+	// serve.log, system.log). fillDefaults forces data/logs when empty; to
+	// disable file logging entirely, point Dir at a path you can write and
+	// ignore the files — there is no "stderr only" mode (the sink always
+	// mirrors to stderr anyway).
 	Dir string `toml:"dir"`
 	// Every category file is rotated once it reaches MaxBytes; the newest
 	// file is <dir>/<cat>.log and rotated generations are <cat>.log.1..Keep
@@ -269,8 +296,22 @@ func validSchema(s string) bool {
 // LoadConfig reads and validates a TOML config file.
 func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{path: path}
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
+	md, err := toml.DecodeFile(path, cfg)
+	if err != nil {
 		return nil, fmt.Errorf("decode config %s: %w", path, err)
+	}
+	// BurntSushi silently ignores keys that match no struct field. That is
+	// how revalidate_seed_rate/revalidate_seed_max living under [collector]
+	// (while decoding into StorageConfig) shipped dead for weeks: the
+	// operator's values never reached the program and nothing said so.
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, k := range undecoded {
+			keys = append(keys, k.String())
+		}
+		sort.Strings(keys)
+		log.Printf("config: %s has keys this build does not understand (typo, wrong section, or a future/removed option): %s",
+			path, strings.Join(keys, ", "))
 	}
 	if err := cfg.fillDefaults(); err != nil {
 		return nil, err
@@ -304,10 +345,13 @@ func (c *Config) fillDefaults() error {
 	if c.Server.IdleConnTimeout.Duration <= 0 {
 		c.Server.IdleConnTimeout = Duration{time.Second * 90}
 	}
-	if c.Server.WriteTimeout.Duration <= 0 {
+	// < 0, not <= 0: config.toml documents 0 as "no timeout" (net/http
+	// semantics), and read_timeout already honored that — write/idle
+	// overwriting 0 with a default made the documented knob a lie.
+	if c.Server.WriteTimeout.Duration < 0 {
 		c.Server.WriteTimeout = Duration{time.Second * 60}
 	}
-	if c.Server.IdleTimeout.Duration <= 0 {
+	if c.Server.IdleTimeout.Duration < 0 {
 		c.Server.IdleTimeout = Duration{time.Second * 90}
 	}
 	if c.Server.ServeRetries < 1 {
@@ -335,17 +379,25 @@ func (c *Config) fillDefaults() error {
 			"between revalidation passes the picker will have no proven proxies to choose from",
 			f, r)
 	}
-	if c.Server.ServeTotalTimeout.Duration <= 0 {
+	// Serve timeouts: the consumers all gate on "> 0 means on", and
+	// config.toml documents 0 as "disabled". Only a negative value (which
+	// TOML cannot express, i.e. only a programmatic misconfig) falls back to
+	// the default — the old "<= 0" made the documented "0 disables" knobs
+	// impossible to turn off.
+	if c.Server.ServeTotalTimeout.Duration < 0 {
 		c.Server.ServeTotalTimeout = Duration{time.Second * 25}
 	}
-	if c.Server.ServeConnectProbe.Duration <= 0 {
+	if c.Server.ServeConnectProbe.Duration < 0 {
 		c.Server.ServeConnectProbe = Duration{time.Second * 3}
 	}
-	if c.Server.ServeResponseProbe.Duration <= 0 {
+	if c.Server.ServeResponseProbe.Duration < 0 {
 		c.Server.ServeResponseProbe = Duration{time.Second * 3}
 	}
 	if c.Server.ServeBlockMaxBytes <= 0 {
 		c.Server.ServeBlockMaxBytes = 16384
+	}
+	if c.Server.ServeSniffTimeout.Duration <= 0 {
+		c.Server.ServeSniffTimeout = Duration{time.Second * 3}
 	}
 	if c.Server.ServePinTTL.Duration <= 0 {
 		c.Server.ServePinTTL = Duration{time.Minute * 10}
@@ -356,10 +408,20 @@ func (c *Config) fillDefaults() error {
 	if c.Server.ShutdownTimeout.Duration <= 0 {
 		c.Server.ShutdownTimeout = Duration{time.Second * 10}
 	}
+	// A half-configured TLS pair used to silently fall back to the in-memory
+	// self-signed cert at listener start: the operator set a path, saw no
+	// error, and got a cert that changes every boot.
+	if (c.Server.TLSCertFile == "") != (c.Server.TLSKeyFile == "") {
+		return fmt.Errorf("tls_cert_file and tls_key_file must be set together (got cert=%q key=%q)",
+			c.Server.TLSCertFile, c.Server.TLSKeyFile)
+	}
 
 	if c.Socks5.DialTimeout.Duration <= 0 {
 		c.Socks5.DialTimeout = Duration{time.Second * 12}
 	}
+	// <= 0 on purpose, unlike the serve knobs: 0 here would arm a zero read
+	// deadline (deadlines fire at time zero) and kill every SOCKS5 session
+	// instantly, so 0 means "use the default", not "off".
 	if c.Socks5.IdleTimeout.Duration <= 0 {
 		c.Socks5.IdleTimeout = Duration{time.Minute * 5}
 	}
@@ -477,8 +539,12 @@ func (c *Config) fillDefaults() error {
 	if c.Logging.MaxBytes <= 0 {
 		c.Logging.MaxBytes = 32 << 20
 	}
+	// Clamped, not just defaulted: a typo'd keep of 10^6 meant a rotation
+	// renamed a million files, once per rotation.
 	if c.Logging.Keep < 1 {
 		c.Logging.Keep = 5
+	} else if c.Logging.Keep > 100 {
+		c.Logging.Keep = 100
 	}
 	return nil
 }

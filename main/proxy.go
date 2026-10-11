@@ -10,16 +10,29 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"protator/proxy"
 )
 
+// Version answers "which build is in production". There were no tags before
+// versioning started, so this begins at 0.1.0-dev and the first tag defines
+// 0.1.0; until then every build reports the same -dev version, which is
+// honest: without a tag there is nothing else to name them by.
+const protatorVersion = "0.1.0-dev"
+
 func main() {
 	cfgPath := flag.String("config", "config/config.toml", "path to TOML config")
 	checkOnly := flag.Bool("check", false, "validate config and required files, then exit")
+	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		log.Printf("protator %s", protatorVersion)
+		return
+	}
 
 	cfg, err := proxy.LoadConfig(*cfgPath)
 	if err != nil {
@@ -35,11 +48,25 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Keep a plain cancel for the cooperative admin shutdown: stop() from
+	// NotifyContext unregisters the signal handlers as a side effect, which
+	// a repeated /api/shutdown POST must not do.
+	procCancel := func() { stop() }
 
 	// Per-category file logs with rotation (main/logfiles.go). Every line is
 	// mirrored to stderr so console / instance_err.log workflows keep working.
 	sink := newFileLogSink(cfg.Logging)
 	log.SetOutput(sink)
+
+	// A crash between CreateTemp and rename leaves atomic-write temp files
+	// forever (their cleanup defer never ran). Sweep them before any writer
+	// starts: at this point every matching file is an orphan by definition.
+	proxy.SweepOrphanTMP(
+		filepath.Dir(cfg.Storage.QueueFile),
+		filepath.Dir(cfg.Storage.CandidatesFile),
+		filepath.Dir(cfg.Collector.SitesFile),
+		filepath.Dir(cfg.Storage.DebugProxiesFile),
+	)
 
 	// One dampener shared by all listeners and goproxy loggers (see
 	// logging.go): filters stdlib TLS-handshake noise and coalesces the
@@ -63,7 +90,7 @@ func main() {
 	// Shared dialer: every CONNECT/tunnel/direct dial is routed through the
 	// live queue with per-attempt retries and eviction (proxy/upstream.go).
 	fwd := proxy.NewForwardDialer(bucket, cfg)
-	defer saveQueue(cfg, bucket)
+	defer func() { saveQueue(cfg, bucket) }()
 	// Flush the pool's buffered appends on the way out: without this the
 	// last few KB of candidates never reach disk.
 	defer pool.Close()
@@ -82,7 +109,7 @@ func main() {
 	// shutdown log both report them.
 	beats := newBeats()
 	startBeatTracker(ctx, beats)
-	startAdminServer(ctx, cfg, bucket, pool, collector, checker, debug, sink, beats, workers, wakeCollector, candidates, logNoise)
+	startAdminServer(ctx, cfg, bucket, pool, collector, checker, debug, sink, beats, workers, wakeCollector, candidates, logNoise, procCancel)
 	startBackgroundLoops(ctx, cfg, bucket, pool, checker, debug, candidates, wakeCollector, beats)
 
 	<-ctx.Done()
@@ -102,8 +129,10 @@ func main() {
 	// they learn to stop, and without it they keep appending through the
 	// per-line fallback to files those deferred calls have just closed. It has
 	// to happen after the drain so the last request's dial result is still
-	// accounted for, and before the saves so they see every write.
-	workers.stopAndWait()
+	// accounted for, and before the saves so they see every write. The wait is
+	// bounded by the same shutdown budget: a worker inside a 230s check must
+	// not turn SIGTERM into a SIGKILL that skips the saves.
+	workers.stopAndWait(cfg.Server.ShutdownTimeout.Duration)
 	log.Printf("checker: worker pool stopped (%d restarts total)", workers.Restarts())
 
 	log.Println("stopped")
@@ -116,6 +145,9 @@ func main() {
 // failure per run instead of a different one each time several files are
 // missing.
 func checkConfig(cfg *proxy.Config) error {
+	// Only files the daemon does NOT create on demand. The candidates pool
+	// used to be on this list: a fresh deploy (no data/ yet) failed -check
+	// for a file the first run would have created itself.
 	required := []struct {
 		name string
 		path string
@@ -123,16 +155,54 @@ func checkConfig(cfg *proxy.Config) error {
 		{"sites", cfg.Collector.SitesFile},
 		{"regexp", cfg.Collector.RegexFile},
 		{"checkers", cfg.Checker.TestsFile},
-		{"candidates", cfg.Storage.CandidatesFile},
 	}
 	for _, f := range required {
 		if _, err := os.Stat(f.path); err != nil {
 			return fmt.Errorf("%s file %s: %w", f.name, f.path, err)
 		}
 	}
+	// Validate the tests file the way the daemon does: a Stat used to let a
+	// file with zero [[tests]] entries pass -check and then log.Fatalf at
+	// boot — the exact moment the pre-deploy validation was supposed to help.
+	if _, err := proxy.LoadTests(cfg.Checker.TestsFile); err != nil {
+		return fmt.Errorf("checkers %s: %w", cfg.Checker.TestsFile, err)
+	}
 	if err := os.MkdirAll(cfg.Logging.Dir, 0o755); err != nil {
 		return fmt.Errorf("log dir %s: %w", cfg.Logging.Dir, err)
 	}
+	// A typo'd GeoIP path otherwise fails much later, inside the checker
+	// constructor — after the queue was already seeded. The country/ASN filters
+	// stay empty until a database is configured; that is a product decision
+	// (ship the DB or drop the filters), but a wrong path is always a bug.
+	if cfg.Checker.GeoIPDBPath != "" {
+		if _, err := os.Stat(cfg.Checker.GeoIPDBPath); err != nil {
+			return fmt.Errorf("geoip_db_path %s: %w", cfg.Checker.GeoIPDBPath, err)
+		}
+	}
+	if cfg.Checker.GeoIPASNDBPath != "" {
+		if _, err := os.Stat(cfg.Checker.GeoIPASNDBPath); err != nil {
+			return fmt.Errorf("geoip_asn_db_path %s: %w", cfg.Checker.GeoIPASNDBPath, err)
+		}
+	}
+	// The TLS pair outlives every other config: warn here, not at 3am when the
+	// https:// dials start failing with errors that read like proxy death.
+	if cfg.Server.TLSCertFile != "" && cfg.Server.TLSKeyFile != "" {
+		cert, err := proxy.LoadOrCreateTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("tls pair %s/%s: %w", cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile, err)
+		}
+		if exp, ok := proxy.CertNotAfter(cert); ok {
+			if left := time.Until(exp); left <= 0 {
+				return fmt.Errorf("tls certificate expired %s ago", -left)
+			} else if left < proxy.CertWarnDays {
+				log.Printf("check: WARNING tls certificate expires in %s", left.Round(24*time.Hour))
+			}
+		}
+	}
+	// Same exposure warning the daemon prints at start: a pre-deploy -check
+	// that stays silent about a non-loopback tokenless admin listener misses
+	// the one finding that is cheapest to fix before the box goes live.
+	warnAdminExposure(cfg.Server.AdminListen, cfg.Server.AdminToken)
 	return nil
 }
 
@@ -156,6 +226,9 @@ func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.Can
 	// picking an upstream. Set before the first Seed so the very first client
 	// request already aims at the working tail.
 	bucket.SetFreshnessWindows(cfg.Server.PickServeWindow.Duration, cfg.Server.PickFreshWindow.Duration)
+	// Fail-closed serving: with nothing proven, requests fail instead of going
+	// out through an unvalidated proxy. Off by default.
+	bucket.SetRequireProven(cfg.Server.ServeRequireProven)
 	log.Printf("queue: pick windows serve=%s fresh=%s (revalidate_interval=%s)",
 		cfg.Server.PickServeWindow.Duration, cfg.Server.PickFreshWindow.Duration,
 		cfg.Storage.RevalidateInterval.Duration)

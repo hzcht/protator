@@ -129,8 +129,11 @@ type Proxy struct {
 	// before the proxy is handed to the bucket; read-only afterwards.
 	source string
 
-	// keyCache is the pre-computed URL string for Key(). Set once at creation
-	// (or on first Key() call) to avoid fmt.Sprintf on the hot path.
+	// keyCache is the pre-computed URL string for Key(). Set once, on the
+	// constructing goroutine before the proxy is published (ParseProxyLine,
+	// Checker.Check), so every later Key() is a field read. Key() deliberately
+	// does not fill it in lazily: that write would race the readers `Proxy`
+	// must serve lock-free on every dial.
 	keyCache string
 
 	// Cold fields (admin/debug only) — allocated separately to keep Proxy small.
@@ -221,11 +224,11 @@ func (p *Proxy) SetVLESS(uuid, flow, sni, pbk, sid, spider string) {
 	p.meta.setVLESS(uuid, flow, sni, pbk, sid, spider)
 }
 
-// ensureMeta lazily initializes the meta pointer. It races if two goroutines
-// call it on the same Proxy concurrently, so in practice it is only reached
-// from the single checker goroutine that just validated the candidate; an
-// already-set pointer is published to other goroutines via the bucket's lock
-// before they can read it.
+// ensureMeta is a fallback for Proxy values built outside the known
+// construction sites (checker literals, ParseProxyLine — both allocate meta
+// eagerly now). SetGeoIP/SetVLESS still call it, but on the normal path it is
+// a nil check that never writes: the pointer is published before the bucket
+// ever sees the Proxy, so concurrent readers never race the field.
 func (p *Proxy) ensureMeta() {
 	if p.meta == nil {
 		p.meta = &ProxyMeta{}
@@ -432,9 +435,15 @@ func (p *Proxy) AppendURL(buf []byte) []byte {
 		s = "http"
 	}
 	if s == "vless" && p.GetVLESSUUID() != "" {
+		// Must include the addr, same as URL(): without host:port the queue
+		// save rendered "vless://uuid@?flow=…", ParseProxyLine failed at
+		// splitHostPort("") on reload and silently dropped the entry — the
+		// save/reload cycle deleted every VLESS proxy while URLLen (which
+		// counts the addr) and AppendGood(p.URL()) stayed correct.
 		buf = append(buf, "vless://"...)
 		buf = append(buf, p.GetVLESSUUID()...)
 		buf = append(buf, '@')
+		buf = p.appendAddr(buf)
 		return append(buf, buildVLESSQuery(p)...)
 	}
 	buf = append(buf, s...)
@@ -558,7 +567,12 @@ func ParseProxyLine(line string) (*Proxy, error) {
 	if port < 1 || port > 65535 {
 		return nil, fmt.Errorf("port out of range %d", port)
 	}
-	p := &Proxy{Schema: schema, Host: host, Port: port}
+	// meta is allocated eagerly: ParseProxyLine is one of the few remaining
+	// construction sites, and a Proxy published with meta == nil lets
+	// revalidation's SetGeoIP/SetVLESS race concurrent admin reads of the
+	// same plain pointer field (ensureMeta's "before publication" contract
+	// is broken by the revalidate path).
+	p := &Proxy{Schema: schema, Host: host, Port: port, meta: &ProxyMeta{}}
 	if schema == "vless" {
 		p.SetVLESS(vlessUUID, vlessFlow, vlessSNI, vlessPbk, vlessSid, vlessSpider)
 	}

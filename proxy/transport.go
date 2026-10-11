@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,13 @@ import (
 // picked for the *current* dial attempt (needed to attribute response-level
 // failures — a proxy that dials fine but never answers).
 //
+// cur/connOK are written from the transport's dial goroutine, not from the
+// RoundTrip goroutine, and net/http deliberately detaches an in-flight dial
+// from the request context on cancel (WithoutCancel) — so a client abort or a
+// serve_total_timeout fire races the RoundTrip error path's read of these
+// fields unless they are atomic. Only tried (a slice) is single-writer:
+// RoundTrip appends, and the next attempt's snapshot is sequenced after it.
+//
 // The tried set is a slice, not a fixed [4]string: serve_retries is
 // configurable and unbounded above, so a fixed array silently dropped every
 // entry past index 3 — the failover sequence then re-picked a proxy it had
@@ -22,8 +30,8 @@ import (
 // fresh slice is one allocation instead of a 64-byte array copy.
 type attemptState struct {
 	tried  []string
-	cur    *Proxy
-	connOK bool
+	cur    atomic.Pointer[Proxy]
+	connOK atomic.Bool
 }
 
 func newAttemptState() *attemptState {
@@ -35,8 +43,8 @@ func (s *attemptState) dial(p *Proxy) {
 	if s == nil {
 		return
 	}
-	s.cur = p
-	s.connOK = false
+	s.cur.Store(p)
+	s.connOK.Store(false)
 }
 
 // setConnOK marks that the tunnel through the current proxy was established.
@@ -44,14 +52,14 @@ func (s *attemptState) setConnOK() {
 	if s == nil {
 		return
 	}
-	s.connOK = true
+	s.connOK.Store(true)
 }
 
 func (s *attemptState) proxyUsed() (*Proxy, bool) {
 	if s == nil {
 		return nil, false
 	}
-	return s.cur, s.connOK
+	return s.cur.Load(), s.connOK.Load()
 }
 
 func (s *attemptState) mark(p *Proxy) {
@@ -93,27 +101,37 @@ type ProxyTransport struct {
 	base    http.RoundTripper
 	retries int // additional attempts after the first
 	totalT  time.Duration
+	sniffT  time.Duration
 	block   *blockDetector
 }
 
 // NewProxyTransport builds the serving transport. It must be used as
 // goproxy.Tr (equivalent of ForwardDialer.NewTransport, plus resilience).
 func NewProxyTransport(cfg *Config, fwd *ForwardDialer) *ProxyTransport {
+	// Exactly N extra attempts for serve_retries = N (dial path does the
+	// same). The old clamp forced at least one retry even for
+	// serve_retries = 1, i.e. two attempts on plain HTTP — the knob lied.
 	retries := cfg.Server.ServeRetries - 1
-	if retries < 1 {
-		retries = 1
+	if retries < 0 {
+		retries = 0
 	}
 	return &ProxyTransport{
 		fwd:     fwd,
 		base:    fwd.NewTransport(),
 		retries: retries,
 		totalT:  cfg.Server.ServeTotalTimeout.Duration,
+		sniffT:  cfg.Server.ServeSniffTimeout.Duration,
 		block:   newBlockDetector(cfg.Server.ServeBlockDetect, cfg.Server.ServeBlockMaxBytes),
 	}
 }
 
 // RoundTrip implements http.RoundTripper.
 func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// One unit per client request (P47), not per transport dial call: the
+	// retry loop below may re-dial, but the operator-facing "requests" is
+	// what the client asked for. requests_total in Snapshot sums this with
+	// the CONNECT and SOCKS5 units.
+	Stats.HTTPRequests.Add(1)
 	ctx := req.Context()
 	if t.totalT > 0 {
 		var cancel context.CancelFunc
@@ -131,7 +149,29 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	var lastErr error
 	for attempt := 0; attempt <= t.retries; attempt++ {
-		req.Body = requestBodyForRetry(req)
+		if attempt > 0 {
+			// Replaying a body is only safe when the caller supplied GetBody
+			// (a front-end HTTP/1.1 server request never has one, and the
+			// previous RoundTrip already closed Body). Re-arming the consumed
+			// reader makes the retry die on the *new* proxy's watch and
+			// strangles an innocent exit with ServeFailures. A dial-level
+			// failure (connOK false) never touched the body, so that retry is
+			// still safe with the original reader.
+			if _, connOK := st.proxyUsed(); connOK {
+				if req.GetBody == nil {
+					if req.Body != nil {
+						break
+					}
+				} else {
+					b, gerr := req.GetBody()
+					if gerr != nil {
+						lastErr = gerr
+						break
+					}
+					req.Body = b
+				}
+			}
+		}
 		resp, err := t.base.RoundTrip(req)
 		if err == nil && resp != nil {
 			// servedBlock tracks a block page on the response being returned:
@@ -140,25 +180,56 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			// promote burned IPs into the hot tail, and the picker would
 			// sample them first.
 			servedBlock := false
-			if t.block.shouldCheck(resp) && t.block.readAndMark(resp) {
-				servedBlock = true
-				Stats.BlockPages.Add(1)
-				if attempt < t.retries {
-					// Block page instead of content: attribute to the proxy
-					// and re-request through another one.
+			if t.block.shouldCheck(resp) {
+				blocked, stalled := t.block.readAndMarkBudget(resp, t.sniffT)
+				if stalled {
+					// Headers arrived but the body stalled inside the sniff;
+					// the sniff already closed it. Same failure class as a
+					// response that never answered: charge the proxy and fail
+					// over. Returning this response would hand the client a
+					// closed body, and waiting out the stall would hold its
+					// headers hostage until serve_total_timeout kills the
+					// whole request instead of this one attempt.
+					lastErr = errors.New("upstream stalled during block-page sniff")
 					resp.Body.Close()
-					if p, ok := st.proxyUsed(); p != nil && ok {
+					if p, ok := st.proxyUsed(); p != nil {
+						if ok {
+							Stats.ServeFailures.Add(1)
+							if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
+								t.fwd.bucket.Remove(p)
+								Stats.Evictions.Add(1)
+							}
+							dropPin()
+						}
 						st.mark(p)
-						dropPin()
-					}
-					lastErr = errors.New("upstream served interstitial block page")
-					if ctx.Err() != nil {
+					} else {
 						break
 					}
-					continue
+					if attempt < t.retries && ctx.Err() == nil {
+						continue
+					}
+					break
 				}
-				// Last attempt: the page goes back as-is below, with the
-				// positive feedback withheld.
+				if blocked {
+					servedBlock = true
+					Stats.BlockPages.Add(1)
+					if attempt < t.retries {
+						// Block page instead of content: attribute to the proxy
+						// and re-request through another one.
+						resp.Body.Close()
+						if p, ok := st.proxyUsed(); p != nil && ok {
+							st.mark(p)
+							dropPin()
+						}
+						lastErr = errors.New("upstream served interstitial block page")
+						if ctx.Err() != nil {
+							break
+						}
+						continue
+					}
+					// Last attempt: the page goes back as-is below, with the
+					// positive feedback withheld.
+				}
 			}
 			if t.block.isDeviceJunk(resp) {
 				// The "proxy" answered like a plain internet device (Plex,
@@ -175,6 +246,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					dropPin()
 					if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
 						t.fwd.bucket.Remove(p)
+						Stats.Evictions.Add(1)
 					}
 				}
 				if attempt < t.retries && ctx.Err() == nil {
@@ -293,15 +365,83 @@ func (bd *blockDetector) isDeviceJunk(resp *http.Response) bool {
 // blocker markers. Returns false for oversized bodies (a real page).
 func (bd *blockDetector) readAndMark(resp *http.Response) bool {
 	r := io.LimitReader(resp.Body, int64(bd.max)+1)
-	buf, _ := io.ReadAll(r)
+	buf, err := io.ReadAll(r)
+	// A read error here (stall until serve_total_timeout killed the upstream)
+	// used to be discarded: the partial buffer was rewound and handed to the
+	// client as a complete response — silent truncation. Replay the error
+	// after the buffered prefix so the client's next read fails honestly.
+	var tail io.Reader
+	if err != nil {
+		tail = io.MultiReader(bytes.NewReader(buf), stickyErr{err}, resp.Body)
+	} else {
+		tail = io.MultiReader(bytes.NewReader(buf), resp.Body)
+	}
 	resp.Body = &rewoundBody{
-		Reader: io.MultiReader(bytes.NewReader(buf), resp.Body),
+		Reader: tail,
 		closer: resp.Body,
 	}
 	if len(buf) > bd.max {
 		return false
 	}
 	return bd.matches(buf)
+}
+
+// stickyErr replays a mid-sniff read error after the buffered prefix.
+type stickyErr struct{ err error }
+
+func (e stickyErr) Read([]byte) (int, error) { return 0, e.err }
+
+// readAndMarkBudget is readAndMark under a wall-clock bound. A chunked
+// interstitial check reads up to max+1 body bytes inside RoundTrip, before
+// any of it reaches the client; an upstream that answers headers and then
+// stalls mid-body would otherwise hold the client's headers hostage for the
+// rest of serve_total_timeout (25s) — on every retry attempt. On expiry the
+// body is closed (unblocking the in-flight read), the sniff's verdict is
+// discarded, and stalled=true tells the caller to charge the proxy and fail
+// over like any other response-level failure. A budget <= 0 keeps the old
+// unbounded behavior (there is no legitimate "hang the client" mode in
+// production — fillDefaults always provides a budget).
+func (bd *blockDetector) readAndMarkBudget(resp *http.Response, budget time.Duration) (blocked, stalled bool) {
+	if budget <= 0 {
+		return bd.readAndMark(resp), false
+	}
+	// Capture the body before the goroutine starts: on the stalled path it
+	// replaces resp.Body with a rewound wrapper, and closing must target the
+	// original to actually abort the transport read.
+	orig := resp.Body
+	done := make(chan bool, 1)
+	go func() {
+		blocked := false
+		defer func() {
+			// The send must happen exactly once, even on panic: the caller
+			// waits on done after closing the body, and a missing send would
+			// hang the request goroutine forever.
+			defer RecoverPanic("serve: sniff")
+			done <- blocked
+		}()
+		blocked = bd.readAndMark(resp)
+	}()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case blocked = <-done:
+		return blocked, false
+	case <-timer.C:
+	}
+	// The timer may have fired after the sniff already finished (both cases
+	// ready: select picks randomly). Prefer the real verdict over a false
+	// stall that would burn a healthy proxy.
+	select {
+	case blocked = <-done:
+		return blocked, false
+	default:
+	}
+	// Stuck mid-body. Closing the original aborts the read; the sniff
+	// goroutine then finishes (its rewound wrapper is dead either way — the
+	// response is discarded). The buffered channel means it cannot leak.
+	_ = orig.Close()
+	<-done
+	return false, true
 }
 
 func (bd *blockDetector) matches(body []byte) bool {
@@ -324,18 +464,3 @@ type rewoundBody struct {
 }
 
 func (b *rewoundBody) Close() error { return b.closer.Close() }
-
-// requestBodyForRetry restores a replayable request body between failover
-// attempts. The first RoundTrip consumes/closes the original body; with a
-// GetBody producer the next attempt gets a fresh reader. Streams without a
-// GetBody fall back to an empty body (documented retry limitation).
-func requestBodyForRetry(req *http.Request) io.ReadCloser {
-	if req.Body == nil || req.GetBody == nil {
-		return req.Body
-	}
-	b, err := req.GetBody()
-	if err != nil {
-		return req.Body
-	}
-	return b
-}

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"math/bits"
 	"math/rand/v2"
 	"time"
@@ -81,6 +82,93 @@ func (b *Bucket) freshnessRank(now int64, p *Proxy) int64 {
 		return freshWarm
 	}
 	return freshStale
+}
+
+// SetRequireProven switches the picker to fail-closed mode: when no entry
+// carries proof of life inside the pick windows, PickHealthy returns
+// ErrNoProven instead of falling back to the unverified bulk of the queue.
+// Off by default; an operator who would rather see a failed request than a
+// request served through an unvalidated proxy turns it on.
+func (b *Bucket) SetRequireProven(on bool) {
+	b.mu.Lock()
+	b.requireProven = on
+	b.mu.Unlock()
+}
+
+// ErrNoProven is the fail-closed verdict: the queue is non-empty, but nothing
+// in it carries proof of life inside the pick windows, and requireProven is
+// on. Callers fail the request (the HTTP front turns this into a 502) instead
+// of serving it through an entry nobody ever checked.
+var ErrNoProven = errors.New("no proven proxy in the queue")
+
+// pickProvenLocked serves only from entries with proof of life inside the
+// windows: the fresh slice of the hot tail first, then the proven pool. It
+// never samples the unverified bulk — that is the whole point of the flag.
+// The proven pool itself is taken as evidence (it was fresh at most
+// freshRebuildInterval ago, and betterPick still ranks by actual freshness),
+// while the hot tail is filtered strictly: without that, sampling could miss
+// its few fresh entries and return a stale one. Callers hold at least a read
+// lock.
+func (b *Bucket) pickProvenLocked(proven []*Proxy, probes int, skip map[string]struct{}, now int64) (*Proxy, error) {
+	if fresh := b.freshHotLocked(now); len(fresh) > 0 {
+		if best := b.rankPick(fresh, probes, skip, now); best != nil {
+			return best, nil
+		}
+	}
+	if best := b.rankPick(proven, probes, skip, now); best != nil {
+		return best, nil
+	}
+	return nil, ErrNoProven
+}
+
+// IsProven reports whether p carries proof of life inside the pick windows
+// right now. Used by the fail-closed path to validate a pinned proxy before
+// serving through it: stickiness is a routing preference, not proof of life,
+// and a pin outlives the proof that created it.
+func (b *Bucket) IsProven(p *Proxy) bool {
+	if p == nil {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.freshnessRank(nowNanos(), p) != freshStale
+}
+
+// hotHasFreshLocked reports whether the curated tail holds at least one entry
+// whose proof of life is still inside the pick windows. Callers hold at least
+// a read lock.
+//
+// Membership alone says nothing: entries are promoted once and age in place
+// (revalidation deliberately does NOT re-promote), so after any lull the tail
+// can be full of entries no fresher than boot seeds. Picking the tier by
+// non-emptiness then serves exclusively from a dead tail while thousands of
+// freshly verified entries sit in the proven pool, ignored — and /ready keeps
+// answering 200 for a queue where every dial fails. The scan is O(hotMax) and
+// usually exits on the first entry: index 0 is the most recently proven.
+func (b *Bucket) hotHasFreshLocked(now int64) bool {
+	for _, p := range b.hot {
+		if b.freshnessRank(now, p) != freshStale {
+			return true
+		}
+	}
+	return false
+}
+
+// freshHotLocked returns the hot-tail entries whose proof of life is still
+// inside the pick windows, or nil. Callers hold at least a read lock.
+//
+// This is the strict version of hotHasFreshLocked, for the fail-closed path:
+// returning the tier is not enough there, because rejection sampling can miss
+// its few fresh entries and hand back a stale one — serving through an entry
+// with no live proof, which is exactly what the flag forbids.
+func (b *Bucket) freshHotLocked(now int64) []*Proxy {
+	var out []*Proxy
+	for _, p := range b.hot {
+		if b.freshnessRank(now, p) != freshStale {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // rankPick samples pool up to probes times and returns the best entry by

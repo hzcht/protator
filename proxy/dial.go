@@ -159,9 +159,16 @@ func socksDialTimeout(p *Proxy, timeout time.Duration, ctx context.Context, netw
 	dial := socks.Dial(socksProxyURL(p, timeout))
 	ch := make(chan socksDialRes, 1)
 	go func() {
-		defer RecoverPanic("socks: dial")
-		conn, err := dial(network, addr)
-		ch <- socksDialRes{conn, err}
+		// The send must be unconditional: a recovered panic skipped it, and
+		// closeLateSocksDial (started on the timeout/cancel paths) parked on
+		// <-ch forever — the single-slot channel is a fixed-count handoff and
+		// needs the same GuardedSend shape as the checker's sub-probes.
+		var res socksDialRes
+		defer func() {
+			RecoverPanic("socks: dial")
+			ch <- res
+		}()
+		res.conn, res.err = dial(network, addr)
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

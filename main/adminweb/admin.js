@@ -24,8 +24,16 @@ function toast(msg, isErr) {
 let TOKEN = null;
 try {
   const q = new URLSearchParams(location.search).get('token');
-  if (q) { TOKEN = q; localStorage.setItem('protator_token', q); }
-  else { TOKEN = localStorage.getItem('protator_token') || null; }
+  if (q) {
+    TOKEN = q;
+    localStorage.setItem('protator_token', q);
+    // Strip ?token= from the address bar and history: the token is now in
+    // localStorage, and a secret that stays in the URL lands in browser
+    // history, shoulder-surfing screenshots and proxy logs.
+    const u = new URL(location.href);
+    u.searchParams.delete('token');
+    history.replaceState(null, '', u.pathname + u.search + u.hash);
+  } else { TOKEN = localStorage.getItem('protator_token') || null; }
 } catch (e) { /* private mode: tokens simply do not persist */ }
 
 function withToken(url) {
@@ -76,7 +84,9 @@ async function loadHealth() {
     tile('uptime', Math.floor(h.uptime_seconds / 60) + 'm'),
     tile('tls', h.tls ? 'yes' : 'no'),
   );
-  $('#wake').disabled = !!h.beats && h.beats.collector_stale;
+  // The wake button is the *remedy* for a stale collector: enable it when
+  // the collector is stale (the moment it is needed), not disable it.
+  $('#wake').disabled = !!h.beats && !h.beats.collector_stale;
   $('#wake').title = h.beats && h.beats.collector_stale
     ? 'Collector has not run a cycle recently - collecting now is the fix'
     : 'Force a collector cycle now (the site list is re-read)';
@@ -164,7 +174,9 @@ function renderProxies(proxies) {
     row.dataset.url = p.url;
     tb.append(row);
   }
-  $('#proxyCount').textContent = listed.length + ' in scope';
+  // Do not touch #proxyCount here: loadProxies writes the richer "N best of
+  // M in scope" line, and this render (also driven by WS state) used to
+  // clobber it with "N in scope" so the total never reached the user.
 }
 
 function applyProxiesDelta(added, removed, updated) {
@@ -371,7 +383,11 @@ function connectWS() {
   ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'state' || msg.type === 'update') {
+      // 'delta' is what the server actually broadcasts (adminws.go); the old
+      // gate only accepted 'state'/'update' — 'update' is never sent — so
+      // every delta was parsed and discarded and the live table only changed
+      // on the 30s HTTP poll.
+      if (msg.type === 'state' || msg.type === 'update' || msg.type === 'delta') {
         applyWSMessage(msg);
       }
     } catch (e) { console.error('WS parse error', e); }

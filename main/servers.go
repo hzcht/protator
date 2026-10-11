@@ -94,12 +94,26 @@ func serveListener(srv *http.Server, ln net.Listener, name, addr string) {
 	}
 }
 
-// startHTTPSServer launches the TLS forward proxy with the generated
-// long-lived CA-signed cert (proxy.LoadOrCreateTLS).
+// startHTTPSServer launches the TLS forward proxy with the loaded (or
+// generated, in-memory, self-signed) cert from proxy.LoadOrCreateTLS.
 func startHTTPSServer(cfg *proxy.Config, fwd *proxy.ForwardDialer, logNoise *log.Logger) *http.Server {
 	cert, err := proxy.LoadOrCreateTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
 	if err != nil {
 		log.Fatalf("tls:  %v", err)
+	}
+	// An expired pair fails every https:// upstream dial with a TLS error that
+	// reads exactly like proxy death. Shout while there is still time to
+	// regenerate (delete the pair, or point at a new one) instead.
+	if exp, ok := proxy.CertNotAfter(cert); ok {
+		left := time.Until(exp)
+		if left <= 0 {
+			log.Printf("tls:  CRITICAL certificate expired %s ago; https:// upstream dials will fail", -left)
+		} else {
+			log.Printf("tls:  certificate expires in %s", left.Round(24*time.Hour))
+			if left < proxy.CertWarnDays {
+				log.Printf("tls:  WARNING certificate expires in %s; regenerate before it lapses", left.Round(24*time.Hour))
+			}
+		}
 	}
 	srv := &http.Server{
 		Addr:    cfg.Server.ListenHTTPS,
@@ -193,7 +207,17 @@ func buildGoproxy(cfg *proxy.Config, fwd *proxy.ForwardDialer, noise *log.Logger
 		if host == "" {
 			host = req.Host
 		}
-		_ = fwd.ServeConnect(req.Context(), client, "tcp", host)
+		// Pin the whole client connection to one upstream, as the config
+		// promises ("the ConnKey pin then holds a single upstream for the
+		// whole page"). The non-CONNECT DoFunc above skips CONNECT before it
+		// reaches WithConnKey, so without this every host on one browser
+		// connection got a different exit IP and PinPool stayed empty for
+		// HTTPS traffic.
+		ctx := req.Context()
+		if key := req.RemoteAddr; key != "" {
+			ctx = proxy.WithConnKey(ctx, key)
+		}
+		_ = fwd.ServeConnect(ctx, client, "tcp", host)
 	})
 	return gop
 }

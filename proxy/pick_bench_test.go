@@ -17,7 +17,14 @@ func benchBucket(n int) *Bucket {
 	b := NewBucket(0)
 	proxies := make([]*Proxy, n)
 	for i := range proxies {
-		proxies[i] = &Proxy{Schema: "http", Host: "10.0.0.1", Port: 8000 + i%65535}
+		// One host per index: reusing a single host with Port: 8000+i%65535
+		// collides past 65535 entries and Seed dedups them, so queue=70000
+		// silently measured 65535.
+		proxies[i] = &Proxy{Schema: "http", Host: fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff), Port: 8080}
+		// Production proxies arrive with the identity precomputed (the checker
+		// sets it before publication); without it the bench measures a Sprintf
+		// per Key() that production never pays.
+		proxies[i].keyCache = proxies[i].URL()
 	}
 	b.Seed(proxies)
 	// Prove a slice of them, so the picker has a tier worth sampling: the
@@ -48,8 +55,10 @@ func BenchmarkPickHealthy(b *testing.B) {
 	}
 }
 
-// BenchmarkLiveListPage is the admin path: ranking a page of the queue under a
-// country filter is the most expensive read the page can ask for.
+// BenchmarkLiveListPage is the admin path: ranking a page of the queue is the
+// most expensive read the list renders. (Country/ASN filtering happens one
+// layer up, in admin live(), not in LiveListPage — there is no filter to pass
+// here.)
 func BenchmarkLiveListPage(b *testing.B) {
 	bucket := benchBucket(70000)
 	b.Run("scope=checked limit=1000", func(b *testing.B) {
@@ -96,13 +105,24 @@ func BenchmarkCandidatePoolAddAtCap(b *testing.B) {
 // and eviction used to scan the whole table under the lock every dial needs.
 func BenchmarkPinPoolSetAtCap(b *testing.B) {
 	p := NewPinPool(time.Minute, 10000)
+	// Prebuilt outside the timed loop: building the key with Sprintf and the
+	// proxy literal on every iteration measured the benchmark's own allocation
+	// instead of the Set. Twice the cap, rotating, so every Set still evicts.
+	const rotating = 20000
+	keys := make([]string, rotating)
+	vals := make([]*Proxy, rotating)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%d", i)
+		vals[i] = &Proxy{Schema: "http", Host: "10.0.0.1", Port: 8000 + i}
+		vals[i].keyCache = vals[i].URL()
+	}
 	for i := 0; i < 10000; i++ {
-		p.Set(fmt.Sprintf("k%d", i), &Proxy{Schema: "http", Host: "10.0.0.1", Port: 8000 + i%65535})
+		p.Set(keys[i], vals[i])
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.Set(fmt.Sprintf("new-%d", i), &Proxy{Schema: "http", Host: "10.0.0.1", Port: 9000 + i%65535})
+		p.Set(keys[i%rotating], vals[i%rotating])
 	}
 }
 

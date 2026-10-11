@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -139,7 +140,11 @@ func (d *ForwardDialer) DialContext(ctx context.Context, network, addr string) (
 	skip := d.triedFrom(st)
 	pinKey := pinKeyFrom(ctx)
 
-	Stats.Requests.Add(1)
+	// No request counter here (P47): this function serves two fronts with
+	// different units — plain HTTP (one dial call per client request via
+	// dialHTTP) and SOCKS5 (one dial call per session via handle). Each front
+	// now counts its own unit at its own entry point (HTTPRequests in
+	// RoundTrip, SOCKS5Sessions in handle); counting here again would double.
 	var lastErr error
 	for attempt := 0; attempt < d.serveRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -191,7 +196,15 @@ func (d *ForwardDialer) pickProxy(ctx context.Context, skip map[string]struct{},
 	if pinKey != "" {
 		if p := d.pins.Get(pinKey); p != nil {
 			if _, used := skip[p.Key()]; !used {
-				return p, nil
+				// Fail-closed mode validates the pin too: a pin outlives the
+				// proof that created it, and serving through it would be the
+				// unvalidated-proxy outcome the flag forbids. A stale pin is
+				// dropped so the pick below remaps to fresh proof.
+				if d.bucket.requireProven && !d.bucket.IsProven(p) {
+					d.pins.Del(pinKey)
+				} else {
+					return p, nil
+				}
 			}
 		}
 	}
@@ -257,6 +270,19 @@ func (c *proxyConn) Close() error {
 	return c.Conn.Close()
 }
 
+// CloseWrite forwards a write-side half-close through the wrapper chain.
+// net.Conn does not carry CloseWrite, so the type assertions in pipe() and
+// the CONNECT forwarder would silently skip *proxyConn and a peer's FIN would
+// never reach the real socket — the whole half-close propagation depends on
+// this passthrough. Underlying conns without half-close support (none in the
+// production wiring) keep the old full-teardown behavior.
+func (c *proxyConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 // Dial implements goproxy's ConnectDial func(network, addr).
 func (d *ForwardDialer) Dial(network, addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d.dialTimeout)
@@ -306,20 +332,33 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 		defer cancel()
 	}
 
-	// One counter per client CONNECT, and one per upstream dial attempt. This
-	// path does not go through DialContext (it dials the target itself so it
-	// can supervise the tunnel), so without these the majority of real traffic
-	// - every HTTPS request a browser makes - is invisible to the metrics.
-	Stats.Requests.Add(1)
+	// One counter per client CONNECT (P47). This path does not go through
+	// DialContext (it dials the target itself so it can supervise the
+	// tunnel), so without this the majority of real traffic - every HTTPS
+	// request a browser makes - is invisible to the metrics.
+	Stats.ConnectRequests.Add(1)
+
+	// Session stickiness for tunnels: the non-CONNECT front pins via
+	// WithConnKey on the request context, and the config promises the same
+	// ("the ConnKey pin then holds a single upstream for the whole page").
+	// Without this every CONNECT host on one client connection got a
+	// different exit IP and PinPool stayed empty for the majority traffic.
+	pinKey := pinKeyFrom(ctx)
 
 	skip := make(map[string]struct{}, d.serveRetries)
 	replay := bytes.NewBuffer(nil)
 	sent200 := false
 
 	markFailed := func(p *Proxy) {
+		Stats.ServeFailures.Add(1) // blackhole/dial-dead tunnels are the class
+		// this counter documents; without it the probe supervision fired with
+		// evictions but no failures in the metrics.
 		if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 			d.bucket.Remove(p)
 			Stats.Evictions.Add(1)
+		}
+		if pinKey != "" {
+			d.pins.Del(pinKey) // remap the rest of the session to a fresh pick
 		}
 	}
 
@@ -327,7 +366,7 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 		if err := total.Err(); err != nil {
 			return err
 		}
-		p, err := d.pickProxy(total, skip, "")
+		p, err := d.pickProxy(total, skip, pinKey)
 		if err != nil {
 			return err
 		}
@@ -355,14 +394,25 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 				markFailed(p) // blackholed / died early: charge and evict
 				continue
 			}
+			if pinKey != "" {
+				d.pins.Set(pinKey, p)
+			}
 			return nil
 		}
 		// Supervision disabled: plain pass-through relay, the old behavior.
 		p.MarkServeOK(time.Since(start))
 		d.bucket.Promote(p)
+		if pinKey != "" {
+			d.pins.Set(pinKey, p)
+		}
 		p.MarkInFlight()
 		pc := &proxyConn{Conn: conn, p: p}
-		relay(client, pc, d.idleTimeout)
+		// Count the bytes here too: relay() discarded them, so a probe-off
+		// deployment read bytes_in/out = 0 while serving flat out.
+		toUp, toDown := relayCount(client, pc, d.idleTimeout)
+		Stats.BytesOut.Add(toUp)
+		Stats.BytesIn.Add(toDown)
+		Stats.ServedOK.Add(1)
 		_ = pc.Close()
 		return nil
 	}
@@ -387,19 +437,27 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	// volume = bytes relayed both ways; upstreamEnded = the far side (through
 	// the proxy) closed the tunnel first. Together they drive the post-relay
 	// verdict: "the exit delivered content" vs "a device answered and hung up".
+	// lastAct is the most recent byte moved by *either* direction: a read
+	// timeout is only an end-of-session when both halves have been silent,
+	// or a large upload (client→target, far side quiet for the whole
+	// idle window) would be torn down mid-transfer.
 	volume := new(int64)
+	lastAct := new(int64)
+	atomic.StoreInt64(lastAct, time.Now().UnixNano())
 	var upstreamEnded bool
 
 	// client -> tunnel. Early client bytes are buffered up to the replay cap,
 	// so a proven-dead tunnel can be retried — but only while the whole hand
 	// shape still fits in the buffer; an overflowing client is never replayed
 	// (TLS would be silently corrupted).
+	var clientEOF atomic.Bool
 	go func() {
 		defer close(fwdDone)
 		defer RecoverPanic("connect: client->tunnel")
 		if replay.Len() > 0 {
 			// A retry: replay the early client bytes into the fresh tunnel
 			// before anything new (the previous tunnel ate them).
+			_ = conn.SetWriteDeadline(time.Now().Add(d.idleTimeout))
 			if _, werr := conn.Write(replay.Bytes()); werr != nil {
 				return
 			}
@@ -414,6 +472,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 			_ = client.SetReadDeadline(time.Now().Add(probeTO))
 			n, rerr := client.Read(buf)
 			if n > 0 {
+				atomic.StoreInt64(lastAct, time.Now().UnixNano())
 				if replay.Len()+n > connectReplayMax {
 					select {
 					case overflowed <- struct{}{}:
@@ -422,6 +481,9 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 				} else {
 					_, _ = replay.Write(buf[:n])
 				}
+				// Write deadline, same rationale as pipe(): a far side that
+				// stops reading pins this leg (and the whole session) forever.
+				_ = conn.SetWriteDeadline(time.Now().Add(d.idleTimeout))
 				if _, werr := conn.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -431,6 +493,17 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 			if rerr != nil {
 				if isTimeoutErr(rerr) {
 					continue
+				}
+				if errors.Is(rerr, io.EOF) {
+					// Clean half-close: the client is done sending but still
+					// reading. Propagate the FIN so the far side can finish
+					// its response; the tail below then waits for the reverse
+					// leg instead of killing the tunnel with the response
+					// still in flight.
+					clientEOF.Store(true)
+					if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+						_ = cw.CloseWrite()
+					}
 				}
 				return // client closed or errored
 			}
@@ -470,6 +543,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	case n > 0:
 		// Far target answered: the tunnel is alive. Write the first bytes
 		// through and keep the forwarder as the permanent client->tunnel leg.
+		_ = client.SetWriteDeadline(time.Now().Add(d.idleTimeout))
 		if _, werr := client.Write(first[:n]); werr != nil {
 			abort()
 			return false // client gone; nothing left to repair
@@ -506,15 +580,29 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 			_ = conn.SetReadDeadline(time.Now().Add(d.idleTimeout))
 			m, rerr := conn.Read(buf)
 			if m > 0 {
+				atomic.StoreInt64(lastAct, time.Now().UnixNano())
 				atomic.AddInt64(volume, int64(m))
 				Stats.BytesIn.Add(int64(m))
+				_ = client.SetWriteDeadline(time.Now().Add(d.idleTimeout))
 				if _, werr := client.Write(buf[:m]); werr != nil {
 					_ = pc.Close()
 					return
 				}
 			}
 			if rerr != nil {
-				if !isTimeoutErr(rerr) && !isSelfClosedErr(rerr) {
+				if isTimeoutErr(rerr) {
+					// This direction was silent, but the other one may still
+					// be mid-transfer (a large upload keeps the client→target
+					// leg busy while the far side says nothing). Only treat
+					// silence as end-of-session when *both* halves have been
+					// quiet for the window; otherwise a git push dies at 90s.
+					if time.Since(time.Unix(0, atomic.LoadInt64(lastAct))) < d.idleTimeout {
+						continue
+					}
+					_ = pc.Close()
+					return
+				}
+				if !isSelfClosedErr(rerr) {
 					// The far side ended the tunnel (EOF / reset): relay that
 					// to the client instead of leaving it hanging — clients
 					// delimit `Connection: close` responses by the EOF. This
@@ -529,18 +617,39 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 		}
 	}()
 	<-fwdDone // forwarder exits when the client closes or the tunnel dies
-	_ = pc.Close()
-	<-revDone
-	if upstreamEnded && atomic.LoadInt64(volume) < connectMinOKBytes && time.Since(start) < connectMinOKTime {
+	if clientEOF.Load() {
+		// Clean client half-close: the FIN is already propagated, and the
+		// far side may still be sending the response. Wait for the reverse
+		// leg to finish (far-side EOF, write error, or the idle window all
+		// end it) before tearing the tunnel down — closing here truncated
+		// every request/half-close/read protocol (git-over-TLS, SMTP-style
+		// exchanges, HTTP/1.0 request-then-shutdown clients).
+		<-revDone
+	} else {
+		_ = pc.Close() // hard client death: kill the tunnel now
+		<-revDone
+	}
+	vol := atomic.LoadInt64(volume)
+	switch {
+	case upstreamEnded && !clientEOF.Load() && vol < connectMinOKBytes && time.Since(start) < connectMinOKTime:
+		// The far side completed the tunnel with almost nothing: a device
+		// answering and hanging up, not a working exit. A far-side EOF that
+		// merely answers our own propagated FIN (clientEOF) is the normal
+		// end of a completed exchange — e.g. an echo target closing after a
+		// small request — and must not be mistaken for a device hang-up.
 		Stats.ServeFailures.Add(1)
 		if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 			d.bucket.Remove(p)
 			Stats.Evictions.Add(1)
 		}
-	} else {
+	case vol > 0:
 		Stats.ServedOK.Add(1)
 		p.MarkServeOK(time.Since(start))
 		d.bucket.Promote(p)
+	default:
+		// Nothing moved either way (port probe, instant client close): no
+		// proof either way. The old else-arm counted these as ServedOK and
+		// promoted them into the curated tail — port scans earned hot slots.
 	}
 	return false
 }

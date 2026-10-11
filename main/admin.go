@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -109,11 +110,22 @@ func newAdminServer(a *admin, logNoise *log.Logger) *http.Server {
 // routes builds the admin HTTP surface. Split out of startAdminServer so tests
 // can exercise the exact same handlers.
 //
-// The token gate (requireAdminToken) covers everything except /health and
-// /ready: those are supervisor probes that must keep answering when no human
-// can authenticate, and they reveal nothing the process does not already treat
-// as public by serving traffic.
-func (a *admin) routes() *http.ServeMux {
+// The token gate (requireAdminToken) covers everything that carries live
+// data, except /health and /ready: those are supervisor probes that must keep
+// answering when no human can authenticate, and they reveal nothing the
+// process does not already treat as public by serving traffic.
+// Deliberately public too: / serves the static shell and /static/* the CSS/JS
+// — they carry no live data, and a browser cannot attach a token to a
+// subresource, so gating them would break the page exactly when the token is
+// set. The token prompt lives in that JS.
+//
+// When no token is configured (the default), mutating methods additionally
+// pass requireSameOrigin: a simple cross-site POST (no preflight, no cookies
+// needed) can hit every state-changing endpoint from any page the operator
+// visits, and DNS rebinding gets the reads too. Browsers send
+// Sec-Fetch-Site/Origin on these requests; a same-origin browser page passes,
+// curl and scripts (no Origin, no Sec-Fetch-Site) pass, cross-site pages do not.
+func (a *admin) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/health", a.handleHealth)
@@ -124,20 +136,65 @@ func (a *admin) routes() *http.ServeMux {
 	mux.HandleFunc("/api/sources", a.requireAdminToken(a.handleSources))
 	mux.HandleFunc("/api/sources/cooldown", a.requireAdminToken(a.handleSourceResetCooldown))
 	mux.HandleFunc("/api/collector/wake", a.requireAdminToken(a.handleCollectorWake))
+	mux.HandleFunc("/api/shutdown", a.requireAdminToken(a.handleShutdown))
 	mux.HandleFunc("/api/sites", a.requireAdminToken(a.handleSites))
 	mux.HandleFunc("/api/proxies", a.requireAdminToken(a.handleProxies))
 	mux.HandleFunc("/api/proxies/revalidate", a.requireAdminToken(a.handleProxiesRevalidate))
 	mux.HandleFunc("/api/stats/history", a.requireAdminToken(a.handleStatsHistory))
-	mux.Handle("/ws", websocket.Handler(a.handleWebSocket)) // WebSocket for live updates
+	// The WebSocket carries the same live inventory as /api/proxies, so it
+	// goes through the same gate. The check runs on the HTTP upgrade request
+	// before the hijack: the page appends ?token= to the WS URL (admin.js),
+	// and a rejected handshake never becomes a socket.
+	mux.Handle("/ws", a.requireAdminTokenWS(websocket.Handler(a.handleWebSocket)))
 	// pprof, behind the same token: profiling the live process is a routine
 	// debugging step, and an admin listener that cannot answer it sends the
 	// developer back to SSH into a production box.
 	for path, handler := range pprofHandlers {
 		mux.HandleFunc(path, a.requireAdminToken(handler))
 	}
-	mux.HandleFunc("/static/admin.css", a.requireAdminToken(a.handleCSS))
-	mux.HandleFunc("/static/admin.js", a.requireAdminToken(a.handleJS))
-	return mux
+	mux.HandleFunc("/static/admin.css", a.handleCSS)
+	mux.HandleFunc("/static/admin.js", a.handleJS)
+	return a.requireSameOrigin(mux)
+}
+
+// requireSameOrigin rejects browser requests that carry a cross-site
+// Sec-Fetch-Site or an Origin pointing at another host, on mutating methods
+// only. It is the CSRF/DNS-rebinding net that runs when admin_token is empty
+// (with a token, the Authorization header already forces a preflight for
+// cross-site XHR). Non-browser clients send neither header and pass.
+func (a *admin) requireSameOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" && sfs != "same-origin" && sfs != "none" {
+				writeError(w, http.StatusForbidden, "cross-site request rejected")
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || u.Host == "" || !sameHost(u.Host, r.Host) {
+					writeError(w, http.StatusForbidden, "cross-origin request rejected")
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameHost compares the hostname parts of an Origin host and the request Host.
+// Ports are ignored on purpose: the admin listener is one mixed port that
+// answers both HTTP and HTTPS, so scheme+host already pin the origin, and
+// comparing default-port spellings ("host" vs "host:443") only creates false
+// rejections.
+func sameHost(originHost, requestHost string) bool {
+	strip := func(h string) string {
+		if h2, _, err := net.SplitHostPort(h); err == nil {
+			return h2
+		}
+		return h
+	}
+	return strip(originHost) == strip(requestHost)
 }
 
 // startAdminServer exposes the local admin UI and JSON metrics on
@@ -157,11 +214,12 @@ func (a *admin) routes() *http.ServeMux {
 //	POST /api/proxies/revalidate  force a re-check of the given proxies
 //	POST /api/sources/cooldown     clear a source's failure cooldown
 //	POST /api/collector/wake       force a collector cycle now
+//	POST /api/shutdown             graceful process shutdown (drain + save)
 //
 // Everything but /health and /ready requires server.admin_token when that is
 // set. It carries no proxy traffic; bind it to 127.0.0.1 unless the machine is
 // firewalled.
-func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, collector *proxy.Collector, checker *proxy.Checker, debug *proxy.DebugProxies, sink *fileLogSink, beats *beats, workers *checkerWorkers, wake chan<- struct{}, candidates <-chan proxy.Candidate, logNoise *log.Logger) {
+func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, collector *proxy.Collector, checker *proxy.Checker, debug *proxy.DebugProxies, sink *fileLogSink, beats *beats, workers *checkerWorkers, wake chan<- struct{}, candidates <-chan proxy.Candidate, logNoise *log.Logger, procCancel func()) {
 	if cfg.Server.AdminListen == "" {
 		return
 	}
@@ -182,6 +240,7 @@ func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Buck
 		candidates: candidates, ctx: ctx, started: time.Now(), cfgPath: cfg.Path(),
 		tlsConfigured: tlsConfig != nil,
 		ws:            newWSHub(),
+		procCancel:    procCancel,
 	}
 
 	ln, err := listenMixed(cfg.Server.AdminListen, tlsConfig)

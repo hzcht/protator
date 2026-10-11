@@ -4,6 +4,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"protator/proxy"
 )
@@ -31,6 +32,7 @@ type checkerWorkers struct {
 	candidates <-chan proxy.Candidate
 
 	stop     chan struct{}
+	stopOnce sync.Once
 	exited   chan exitMsg
 	wg       sync.WaitGroup
 	restarts atomic.Int64
@@ -66,28 +68,69 @@ func startCheckerWorkers(cfg *proxy.Config, checker *proxy.Checker, pool *proxy.
 	return w
 }
 
+// Worker restart backoff. A deterministic per-candidate panic makes a worker
+// exit with ExitPanicStreak after panicStreakLimit candidates, and restarting
+// it immediately turns one bug into start/panic/log cycles as fast as
+// candidates arrive. The delay grows while a worker's deaths come quickly
+// (under workerCalmTime apart) and resets after a healthy lifetime, so a rare
+// bad page still costs one immediate restart.
+const (
+	workerCalmTime    = 30 * time.Second
+	workerBackoffBase = time.Second
+	workerBackoffMax  = time.Minute
+)
+
+// workerBackoff maps consecutive quick deaths to a delay: 0s, 0s, 1s, 2s,
+// 4s … capped at workerBackoffMax. The first death restarts immediately —
+// that is the normal case, not a storm.
+func workerBackoff(quickDeaths int) time.Duration {
+	if quickDeaths < 2 {
+		return 0
+	}
+	shift := quickDeaths - 2
+	if shift > 6 {
+		shift = 6
+	}
+	d := workerBackoffBase << shift
+	if d > workerBackoffMax || d <= 0 {
+		d = workerBackoffMax
+	}
+	return d
+}
+
 // supervise keeps the worker count constant. It exits once stop is closed and
 // every worker it started has returned.
 func (w *checkerWorkers) supervise(n int) {
 	defer w.wg.Done()
+	defer proxy.RecoverPanic("checker: supervisor")
 	live := 0
+	startedAt := make(map[int]time.Time, n)
+	quickDeaths := make(map[int]int)
 	for i := 0; i < n; i++ {
 		w.start(i)
+		startedAt[i] = time.Now()
 		live++
 	}
+	stopped := false
 	for live > 0 {
 		select {
 		case <-w.stop:
+			stopped = true
 			// Workers return on their own once stop is closed; keep draining
 			// their exit reports so their goroutines are never blocked on the
 			// channel on the way out.
 			<-w.exited
 			live--
 		case msg := <-w.exited:
-			// A closed candidate channel is the one exit a restart cannot fix:
-			// the worker would return immediately and the supervisor would
-			// spin, logging a restart per iteration.
-			if msg.reason == proxy.ExitStopped || msg.reason == proxy.ExitChannelClosed {
+			// Never restart after shutdown started: once stop is closed both
+			// select cases are ready and Go picks randomly, so without this a
+			// pending panic-streak report would spawn a worker into a
+			// shutting-down process (and inflate the restart metric with
+			// shutdown noise).
+			// A closed candidate channel is the other exit a restart cannot
+			// fix: the worker would return immediately and the supervisor
+			// would spin, logging a restart per iteration.
+			if stopped || msg.reason == proxy.ExitStopped || msg.reason == proxy.ExitChannelClosed {
 				live--
 				if msg.reason == proxy.ExitChannelClosed {
 					log.Printf("checker: worker %d found the candidate channel closed; not restarting", msg.id)
@@ -95,8 +138,26 @@ func (w *checkerWorkers) supervise(n int) {
 				continue
 			}
 			w.restarts.Add(1)
-			log.Printf("checker: worker %d exited (%s, total restarts %d); restarting",
-				msg.id, msg.reason, w.restarts.Load())
+			if time.Since(startedAt[msg.id]) < workerCalmTime {
+				quickDeaths[msg.id]++
+			} else {
+				quickDeaths[msg.id] = 0
+			}
+			if delay := workerBackoff(quickDeaths[msg.id]); delay > 0 {
+				log.Printf("checker: worker %d exited (%s, total restarts %d); backing off %s",
+					msg.id, msg.reason, w.restarts.Load(), delay)
+				select {
+				case <-w.stop:
+					stopped = true
+					live--
+					continue
+				case <-time.After(delay):
+				}
+			} else {
+				log.Printf("checker: worker %d exited (%s, total restarts %d); restarting",
+					msg.id, msg.reason, w.restarts.Load())
+			}
+			startedAt[msg.id] = time.Now()
 			w.start(msg.id)
 		}
 	}
@@ -109,6 +170,7 @@ func (w *checkerWorkers) start(id int) {
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
+		defer proxy.RecoverPanic("checker: worker")
 		reason := w.run(id)
 		select {
 		case w.exited <- exitMsg{id: id, reason: reason}:
@@ -129,17 +191,38 @@ func (w *checkerWorkers) runWorker(id int) proxy.ExitReason {
 	return reason
 }
 
-// stopAndWait closes the stop channel and waits for every worker to return.
-// It must run before pool.Close and the good-proxy audit close: the workers
-// are the last writer of both files.
-func (w *checkerWorkers) stopAndWait() {
-	select {
-	case <-w.stop:
-		return // already stopped
-	default:
+// stopAndWait closes the stop channel and waits for every worker to return,
+// up to timeout. It must run before pool.Close and the good-proxy audit close:
+// the workers are the last writer of both files.
+//
+// The wait is bounded because a worker inside Checker.Check can outlive any
+// reasonable shutdown (total_timeout alone is 230s): an unbounded wait turns
+// SIGTERM into a SIGKILL further down the line, which skips the deferred
+// saves. On timeout the wait is abandoned with a log line; the stranded
+// workers finish their in-flight check and exit on their own, and the pool and
+// audit paths are safe for concurrent use after close (per-line append
+// fallback, reopen-on-write), only slower.
+//
+// Safe for concurrent callers: the close happens once.
+func (w *checkerWorkers) stopAndWait(timeout time.Duration) {
+	w.stopOnce.Do(func() { close(w.stop) })
+	if timeout <= 0 {
+		w.wg.Wait()
+		return
 	}
-	close(w.stop)
-	w.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		defer proxy.RecoverPanic("checker: shutdown wait")
+		defer close(done)
+		w.wg.Wait()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		log.Printf("checker: workers did not stop within %s; continuing shutdown without them (in-flight checks are abandoned)", timeout)
+	}
 }
 
 // Restarts reports how many workers have been restarted. Exposed for the admin

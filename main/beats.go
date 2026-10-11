@@ -37,7 +37,7 @@ func newBeats() *beats {
 // one moved. The tracker is one goroutine for the whole process, so the cost
 // does not scale with the number of tracked subsystems.
 func startBeatTracker(ctx context.Context, b *beats) {
-	var lastCycles, lastPasses int64
+	var lastCycles, lastDones int64
 	go func() {
 		defer proxy.RecoverPanic("beats")
 		t := time.NewTicker(5 * time.Second)
@@ -52,8 +52,15 @@ func startBeatTracker(ctx context.Context, b *beats) {
 					lastCycles = c
 					b.collector.Store(now)
 				}
-				if p := proxy.Stats.RevalPasses.Load(); p != lastPasses {
-					lastPasses = p
+				// RevalLoopDone counts *completed* periodic passes, not
+				// starts (RevalPasses): a healthy pass legitimately outruns
+				// 2×interval+30s, so a start-stamped beat reported
+				// revalidate_stale at the tail of every long pass — and a
+				// wedged loop looked fresh as long as it kept starting
+				// passes. Admin-forced revals bump ForcedReval, which is
+				// deliberately not sampled here.
+				if d := proxy.Stats.RevalLoopDone.Load(); d != lastDones {
+					lastDones = d
 					b.revalidate.Store(now)
 				}
 			}
@@ -68,11 +75,15 @@ type beatsView struct {
 	SaveAgeS        float64 `json:"save_age_s"`
 	CollectorStale  bool    `json:"collector_stale"`
 	RevalidateStale bool    `json:"revalidate_stale"`
+	SaveStale       bool    `json:"save_stale"`
 }
 
 // view renders the beats. Stale means older than two of the subsystem's own
-// intervals: one interval late is scheduling jitter, two is stuck.
-func (b *beats) view(revalidateInterval, cycleSleep time.Duration) beatsView {
+// intervals: one interval late is scheduling jitter, two is stuck. The save
+// beat only moves on a dirty save, so a quiet-but-healthy queue would show an
+// ever-growing age with no verdict without SaveStale: it uses the same rule
+// against the save interval.
+func (b *beats) view(revalidateInterval, cycleSleep, saveInterval time.Duration) beatsView {
 	now := time.Now().UnixNano()
 	col := time.Duration(now - b.collector.Load())
 	rev := time.Duration(now - b.revalidate.Load())
@@ -83,6 +94,7 @@ func (b *beats) view(revalidateInterval, cycleSleep time.Duration) beatsView {
 		SaveAgeS:        save.Seconds(),
 		CollectorStale:  col > 2*cycleSleep+30*time.Second,
 		RevalidateStale: rev > 2*revalidateInterval+30*time.Second,
+		SaveStale:       save > 2*saveInterval+30*time.Second,
 	}
 }
 

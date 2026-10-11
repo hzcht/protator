@@ -3,10 +3,12 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"protator/proxy"
 )
@@ -67,19 +69,41 @@ func newFileLogSink(cfg proxy.LoggingConfig) *fileLogSink {
 // Tail returns recent log lines for a category (see the categories the Write
 // routing picks: collector, checker, serve, system). It never opens a file, so
 // it works even when file logging is disabled.
+//
+// Unknown categories return nil without creating a ring: the map would
+// otherwise grow one entry per distinct ?category= value, and the admin
+// handler passes that query parameter straight through.
 func (s *fileLogSink) Tail(category string, n int) []string {
 	s.mu.Lock()
 	t := s.tail[category]
 	s.mu.Unlock()
 	if t == nil {
+		if !knownLogCategory(category) {
+			return nil
+		}
 		t = &logTail{}
 		s.mu.Lock()
-		s.tail[category] = t
+		if existing := s.tail[category]; existing != nil {
+			t = existing // lost the race; use the winner's ring
+		} else {
+			s.tail[category] = t
+		}
 		s.mu.Unlock()
 	}
 	// The ring lives per category, so a lookup that misses must not lose the
 	// lines already buffered: register it once, then read.
 	return t.last(n)
+}
+
+// knownLogCategory reports whether category is one of the routed log
+// categories. Anything else has no ring and never will.
+func knownLogCategory(category string) bool {
+	for _, c := range logCategories {
+		if c == category {
+			return true
+		}
+	}
+	return false
 }
 
 // Write implements io.Writer for the stdlib log package. The logger emits one
@@ -115,6 +139,7 @@ func (s *fileLogSink) Write(p []byte) (int, error) {
 	}
 	if f := s.file(cat); f != nil {
 		if _, err := f.Write(p); err != nil {
+			proxy.Stats.LogWriteFailures.Add(1)
 			return len(p), err
 		}
 	}
@@ -172,8 +197,12 @@ func (s *fileLogSink) file(cat string) *rotatingFile {
 		return nil
 	}
 	if err := os.MkdirAll(s.cfg.Dir, 0o755); err != nil {
-		// Should never happen in practice; fall back to stderr-only so a
-		// logging failure can't take the collector down.
+		// Log once (to stderr — the sink is what failed) and disable file
+		// logging: without the disable flag every subsequent line retried
+		// the MkdirAll, and without the log the operator never learned why
+		// the files were missing. Stderr-only is the safe fallback.
+		log.Printf("filelog: cannot create log dir %s: %v; continuing with stderr only", s.cfg.Dir, err)
+		s.disabled = true
 		return nil
 	}
 	f := newRotatingFile(filepath.Join(s.cfg.Dir, cat+".log"), s.cfg.MaxBytes, s.cfg.Keep)
@@ -234,17 +263,31 @@ func (r *rotatingFile) open() error {
 func (r *rotatingFile) rotate() {
 	r.f.Close()
 	r.f = nil
+	// Best-effort with a short retry: on Windows a rename fails while another
+	// handle (log viewer, tail -f, an antivirus scan) still holds the file.
+	// Losing the rename meant the generation chain silently stopped while the
+	// live file kept growing — worth one retry, not a policy change.
+	rename := func(old, new string) {
+		for i := 0; i < 3; i++ {
+			if err := os.Rename(old, new); err == nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		proxy.Stats.LogRotateFailures.Add(1)
+	}
 	for i := r.keep - 1; i >= 1; i-- {
 		if _, err := os.Stat(r.gen(i)); err == nil {
-			_ = os.Rename(r.gen(i), r.gen(i+1))
+			rename(r.gen(i), r.gen(i+1))
 		}
 	}
 	if _, err := os.Stat(r.path); err == nil {
-		_ = os.Rename(r.path, r.gen(1))
+		rename(r.path, r.gen(1))
 	}
 	r.size = 0
 	if err := r.open(); err != nil {
 		// Rare; next Write retries opening.
+		proxy.Stats.LogRotateFailures.Add(1)
 	}
 }
 

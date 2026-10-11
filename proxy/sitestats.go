@@ -106,8 +106,18 @@ func (r *SiteRegistry) Failed(url string) bool {
 	if s == nil {
 		return false // untracked: nothing to cool down, fetch it normally
 	}
-	if s.CoolUntil.IsZero() || !time.Now().Before(s.CoolUntil) {
+	if s.CoolUntil.IsZero() {
+		return false // not cooling: leave the streak alone (limit not yet reached)
+	}
+	if !time.Now().Before(s.CoolUntil) {
 		s.CoolUntil = time.Time{}
+		// Decay the failure streak with the cooldown. Without this Fails
+		// stays >= failLimit forever after the first cooldown, so the very
+		// next failure re-arms a full 30-minute cooldown — site_max_fails
+		// silently becomes "3 fails ever, then 1 fail per cooldown" and a
+		// flapping source never regains retries/browser fallback.
+		// ResetCooldown zeroes Fails for the same reason.
+		s.Fails = 0
 		return false
 	}
 	return true
