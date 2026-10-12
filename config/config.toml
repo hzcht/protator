@@ -166,6 +166,9 @@ tls_handshake_timeout = "30s"
 response_timeout = "60s"
 total_timeout = "230s"
 # Protocols probed for candidates found without an explicit protocol.
+# vless/trojan are deliberately absent: without their credentials (UUID,
+# password) a probe can never validate, so they only enter through explicit
+# trojan:// / vless:// share links carrying the credential.
 probe_order = ["http", "socks5", "socks4", "https"]
 # Header-echo endpoints for transparent-leak detection: a proxy that forwards
 # our client IP in X-Forwarded-For / Via headers is rejected. Empty = off.

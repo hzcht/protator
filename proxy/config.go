@@ -287,7 +287,7 @@ func (c *Config) Path() string { return c.path }
 
 func validSchema(s string) bool {
 	switch s {
-	case "http", "https", "socks4", "socks5", "vless":
+	case "http", "https", "socks4", "socks5", "vless", "trojan":
 		return true
 	}
 	return false

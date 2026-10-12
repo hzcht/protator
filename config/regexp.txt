@@ -29,8 +29,9 @@
 # 1.2.3.4 ... port: 8080
 ([0-9]{1,3}(?:\.[0-9]{1,3}){3})[^0-9]{0,40}port\s*[=:]\s*([0-9]{1,5})
 
-# <a href="/1.2.3.4/8080">  (path style: ip/port)
-href="?/[^"]*"?([0-9]{1,3}(?:\.[0-9]{1,3}){3})/([0-9]{1,5})
+# <a href="/1.2.3.4/8080">  (path style: ip/port; attribute gap bounded so
+# one huge href cannot pin the scan)
+href="?/[^"]{0,200}?([0-9]{1,3}(?:\.[0-9]{1,3}){3})/([0-9]{1,5})
 
 # port-8080\n1.2.3.4  (port BEFORE ip — auto-swapped)
 port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
@@ -121,8 +122,9 @@ port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 # IPv6 in tables (rare but possible)
 <td[^>]*>\s*\[([0-9a-fA-F:]{2,45})\]\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>
 
-# Port before IP with "port-" prefix (proxylist.org sometimes)
-port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
+# Port before IP with "port-" prefix (proxylist.org sometimes; gap bounded —
+# the port and the address belong to one label, not one page)
+port-([0-9]{1,5})[^0-9]{0,200}([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 
 # JavaScript object literal: {ip:"1.2.3.4",port:8080}
 \{[^}]*ip\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^}]*port\s*:\s*([0-9]{1,5})[^}]*\}
@@ -170,13 +172,23 @@ port-([0-9]{1,5})[^0-9]*([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 
 # NOTE on credentialed URLs (ss://, trojan://, vless://): they used to live
 # here as host:port extractors, but a credential shape without its credential
-# is a candidate that can never validate — ss/trojan have no dial path at all,
-# and vless needs the UUID plus query params that the candidate pipeline does
+# is a candidate that can never validate — ss has no dial path at all, and
+# vless needs the UUID plus query params that the candidate pipeline did
 # not carry (extractor → Candidate → checker → pool all drop them). Every such
 # match burned a full multi-protocol check for nothing, so the patterns are
 # gone. Bringing any of them back means wiring the credential end to end
 # first: capture group(s) → Candidate fields → checker → dialer → pool
 # persistence, not just a regex.
+#
+# TROJAN IS WIRED (P87): trojan://password@host:port share links are parsed
+# by the dedicated extractor in proxy/extract.go (parseTrojanURL, TCP only —
+# ws/grpc/reality entries are rejected there, not in the checker), the
+# password+SNI ride Candidate → Proxy → dialTrojan → pool/proxy.lst, and the
+# same host:port with different passwords are distinct entries end to end.
+# VLESS IS WIRED (P88): vless://uuid@host:port links are parsed the same way
+# (parseVLESSURL; TCP/raw, TLS + reality + security=none — dialVLESS runs the
+# handshake on raw TCP for the latter), completing the chain the dial path
+# already had. ss:// stays out: no dial path, same rule applies.
 
 # CSV export: "1.2.3.4","8080","HTTP"
 "([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"([0-9]{1,5})"

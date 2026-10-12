@@ -337,3 +337,6 @@ https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt
 # from being a problem when they 404.
 https://t.me/s/proxylist
 https://t.me/s/proxy_list
+# ---- Trojan share links (trojan://password@host:port, TCP only) ----
+# Credentialed entries: each line carries its own password, validated end to end.
+https://raw.githubusercontent.com/MustafaBaqer/VestraNet-Nodes/refs/heads/main/protocols/trojan.txt

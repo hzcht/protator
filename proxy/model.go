@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ProxyMeta holds cold fields (admin/debug only) — not accessed on the hot serving path.
+// ProxyMeta holds cold fields (admin/debug only) вЂ” not accessed on the hot serving path.
 // Keeping these separate reduces Proxy size from ~200B to ~120B, reducing GC pressure.
 //
 // Every field is an atomic pointer because Proxy cannot carry a mutex: it is
@@ -27,6 +27,14 @@ type ProxyMeta struct {
 	vlessPbk    atomic.Pointer[string] // REALITY public key
 	vlessSid    atomic.Pointer[string] // REALITY short ID
 	vlessSpider atomic.Pointer[string] // spider header (for vision)
+	vlessNoTLS  atomic.Pointer[bool]   // security=none: plaintext, no TLS
+
+	trojanPassword atomic.Pointer[string] // as it appears in the URL (still
+	// percent-encoded): the handshake decodes it once, and storing the raw
+	// form keeps URL()/ParseProxyLine a lossless round trip even when the
+	// password contains URL-significant bytes like # or @.
+	trojanSNI   atomic.Pointer[string]
+	trojanNoTLS atomic.Pointer[bool] // security=none: plaintext, no TLS
 }
 
 func (p *ProxyMeta) Country() string {
@@ -85,6 +93,34 @@ func (p *ProxyMeta) VLESSSpider() string {
 	return ""
 }
 
+func (p *ProxyMeta) VLESSNoTLS() bool {
+	if b := p.vlessNoTLS.Load(); b != nil {
+		return *b
+	}
+	return false
+}
+
+func (p *ProxyMeta) TrojanPassword() string {
+	if s := p.trojanPassword.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) TrojanSNI() string {
+	if s := p.trojanSNI.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+func (p *ProxyMeta) TrojanNoTLS() bool {
+	if b := p.trojanNoTLS.Load(); b != nil {
+		return *b
+	}
+	return false
+}
+
 func (p *ProxyMeta) set(country, asn string) {
 	// Publish empty values too, so a reader never sees the pre-set state of a
 	// field that was explicitly cleared.
@@ -92,7 +128,7 @@ func (p *ProxyMeta) set(country, asn string) {
 	p.asn.Store(ptrTo(asn))
 }
 
-func (p *ProxyMeta) setVLESS(uuid, flow, sni, pbk, sid, spider string) {
+func (p *ProxyMeta) setVLESS(uuid, flow, sni, pbk, sid, spider string, noTLS bool) {
 	// A fresh local slot per field: readers concurrently Load the same
 	// pointer, and an atomic.Pointer cannot be copied, so the value has to be
 	// published through one that outlives this call.
@@ -102,9 +138,18 @@ func (p *ProxyMeta) setVLESS(uuid, flow, sni, pbk, sid, spider string) {
 	p.vlessPbk.Store(ptrTo(pbk))
 	p.vlessSid.Store(ptrTo(sid))
 	p.vlessSpider.Store(ptrTo(spider))
+	p.vlessNoTLS.Store(ptrToBool(noTLS))
+}
+
+func (p *ProxyMeta) setTrojan(password, sni string, noTLS bool) {
+	p.trojanPassword.Store(ptrTo(password))
+	p.trojanSNI.Store(ptrTo(sni))
+	p.trojanNoTLS.Store(ptrToBool(noTLS))
 }
 
 func ptrTo(s string) *string { return &s }
+
+func ptrToBool(b bool) *bool { return &b }
 
 // Proxy describes a single validated upstream proxy.
 //
@@ -112,7 +157,7 @@ func ptrTo(s string) *string { return &s }
 // and from the checker (every validation), so weighted selection stays cheap
 // on the hot path.
 type Proxy struct {
-	Schema string `json:"schema"` // http, https, socks4, socks5, vless
+	Schema string `json:"schema"` // http, https, socks4, socks5, vless, trojan
 	Host   string `json:"host"`
 	Port   int    `json:"port"`
 
@@ -136,7 +181,7 @@ type Proxy struct {
 	// must serve lock-free on every dial.
 	keyCache string
 
-	// Cold fields (admin/debug only) — allocated separately to keep Proxy small.
+	// Cold fields (admin/debug only) вЂ” allocated separately to keep Proxy small.
 	meta *ProxyMeta
 }
 
@@ -219,13 +264,51 @@ func (p *Proxy) GetVLESSSpider() string {
 }
 
 // SetVLESS sets VLESS-specific fields (called by checker after validation).
-func (p *Proxy) SetVLESS(uuid, flow, sni, pbk, sid, spider string) {
+func (p *Proxy) SetVLESS(uuid, flow, sni, pbk, sid, spider string, noTLS bool) {
 	p.ensureMeta()
-	p.meta.setVLESS(uuid, flow, sni, pbk, sid, spider)
+	p.meta.setVLESS(uuid, flow, sni, pbk, sid, spider, noTLS)
+}
+
+// GetVLESSNoTLS reports security=none (plaintext VLESS, no TLS layer).
+func (p *Proxy) GetVLESSNoTLS() bool {
+	if p.meta == nil {
+		return false
+	}
+	return p.meta.VLESSNoTLS()
+}
+
+// GetTrojanPassword returns the trojan password in URL form, or "".
+func (p *Proxy) GetTrojanPassword() string {
+	if p.meta == nil {
+		return ""
+	}
+	return p.meta.TrojanPassword()
+}
+
+// GetTrojanSNI returns the trojan SNI override, or "" (dial falls back to host).
+func (p *Proxy) GetTrojanSNI() string {
+	if p.meta == nil {
+		return ""
+	}
+	return p.meta.TrojanSNI()
+}
+
+// GetTrojanNoTLS reports security=none (plaintext trojan, no TLS layer).
+func (p *Proxy) GetTrojanNoTLS() bool {
+	if p.meta == nil {
+		return false
+	}
+	return p.meta.TrojanNoTLS()
+}
+
+// SetTrojan sets trojan-specific fields (called by checker after validation).
+func (p *Proxy) SetTrojan(password, sni string, noTLS bool) {
+	p.ensureMeta()
+	p.meta.setTrojan(password, sni, noTLS)
 }
 
 // ensureMeta is a fallback for Proxy values built outside the known
-// construction sites (checker literals, ParseProxyLine — both allocate meta
+// construction sites (checker literals, ParseProxyLine вЂ” both allocate meta
 // eagerly now). SetGeoIP/SetVLESS still call it, but on the normal path it is
 // a nil check that never writes: the pointer is published before the bucket
 // ever sees the Proxy, so concurrent readers never race the field.
@@ -238,6 +321,9 @@ func (p *Proxy) ensureMeta() {
 // IsVLESS reports whether the proxy uses the VLESS protocol.
 func (p *Proxy) IsVLESS() bool { return p.Schema == "vless" }
 
+// IsTrojan reports whether the proxy uses the Trojan protocol.
+func (p *Proxy) IsTrojan() bool { return p.Schema == "trojan" }
+
 // MarkInFlight increments the count of live tunnels through this proxy.
 // Decremented when the wrapped connection closes. Used by the load-aware
 // picker to spread concurrent requests over healthy proxies.
@@ -248,7 +334,7 @@ func (p *Proxy) MarkInFlightDone() { atomic.AddInt64(&p.inFlight, -1) }
 func (p *Proxy) InFlight() int64 { return atomic.LoadInt64(&p.inFlight) }
 
 // MarkDialOK records a successful upstream dial: a latency sample only. Health
-// is settled later by MarkServeOK / MarkServeFail once the outcome is known —
+// is settled later by MarkServeOK / MarkServeFail once the outcome is known вЂ”
 // a dial that merely connected must never clear a failure streak, or every
 // response-level charge (blackhole, device answer) would be wiped by the next
 // request's dial to the same proxy.
@@ -356,7 +442,7 @@ func (p *Proxy) stampCheck(ns int64) {
 type Candidate struct {
 	Host   string
 	Port   int
-	Schema string // http/https/socks4/socks5/vless or ""
+	Schema string // http/https/socks4/socks5/vless/trojan or ""
 	Prefer string // probe-protocol hint (from the source URL); non-binding
 	Source string // site the candidate was found on: persisted by the pool
 	// and, on validation, stamped onto the proxy for per-source accounting
@@ -368,10 +454,32 @@ type Candidate struct {
 	VLESSPbk    string
 	VLESSSid    string
 	VLESSSpider string
+	VLESSNoTLS  bool // security=none: plaintext, no TLS
+
+	// Trojan-specific fields (when schema == "trojan"): password in URL
+	// form, SNI override (empty = host), plaintext flag (security=none).
+	TrojanPassword string
+	TrojanSNI      string
+	TrojanNoTLS    bool
 }
 
 func (c Candidate) key() string {
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	base := fmt.Sprintf("%s:%d", c.Host, c.Port)
+	// Credentialed protocols: the same host:port with a different password
+	// is a different proxy (trojan lists reuse hosts across passwords), so
+	// the credential joins the identity вЂ” otherwise extraction dedup keeps
+	// only the first password per host:port and the rest are never tried.
+	switch c.Schema {
+	case "vless":
+		if c.VLESSUUID != "" {
+			return "vless:" + c.VLESSUUID + "@" + base
+		}
+	case "trojan":
+		if c.TrojanPassword != "" {
+			return "trojan:" + c.TrojanPassword + "@" + base
+		}
+	}
+	return base
 }
 
 // Addr returns host:port (bracket-form aware).
@@ -387,6 +495,9 @@ func (p *Proxy) URL() string {
 	}
 	if s == "vless" && p.GetVLESSUUID() != "" {
 		return fmt.Sprintf("vless://%s@%s", p.GetVLESSUUID(), p.Addr()) + buildVLESSQuery(p)
+	}
+	if s == "trojan" && p.GetTrojanPassword() != "" {
+		return fmt.Sprintf("trojan://%s@%s", p.GetTrojanPassword(), p.Addr()) + buildTrojanQuery(p)
 	}
 	return fmt.Sprintf("%s://%s", s, p.Addr())
 }
@@ -408,6 +519,9 @@ func (p *Proxy) URLLen() int {
 	}
 	if s == "vless" && p.GetVLESSUUID() != "" {
 		return len("vless://") + len(p.GetVLESSUUID()) + 1 + addr + len(buildVLESSQuery(p))
+	}
+	if s == "trojan" && p.GetTrojanPassword() != "" {
+		return len("trojan://") + len(p.GetTrojanPassword()) + 1 + addr + len(buildTrojanQuery(p))
 	}
 	return len(s) + 3 + addr // "://"
 }
@@ -436,8 +550,8 @@ func (p *Proxy) AppendURL(buf []byte) []byte {
 	}
 	if s == "vless" && p.GetVLESSUUID() != "" {
 		// Must include the addr, same as URL(): without host:port the queue
-		// save rendered "vless://uuid@?flow=…", ParseProxyLine failed at
-		// splitHostPort("") on reload and silently dropped the entry — the
+		// save rendered "vless://uuid@?flow=вЂ¦", ParseProxyLine failed at
+		// splitHostPort("") on reload and silently dropped the entry вЂ” the
 		// save/reload cycle deleted every VLESS proxy while URLLen (which
 		// counts the addr) and AppendGood(p.URL()) stayed correct.
 		buf = append(buf, "vless://"...)
@@ -445,6 +559,15 @@ func (p *Proxy) AppendURL(buf []byte) []byte {
 		buf = append(buf, '@')
 		buf = p.appendAddr(buf)
 		return append(buf, buildVLESSQuery(p)...)
+	}
+	if s == "trojan" && p.GetTrojanPassword() != "" {
+		// Same addr rule as VLESS above: the password alone is not an
+		// address, and a reload must recover host:port plus credentials.
+		buf = append(buf, "trojan://"...)
+		buf = append(buf, p.GetTrojanPassword()...)
+		buf = append(buf, '@')
+		buf = p.appendAddr(buf)
+		return append(buf, buildTrojanQuery(p)...)
 	}
 	buf = append(buf, s...)
 	buf = append(buf, "://"...)
@@ -481,6 +604,27 @@ func buildVLESSQuery(p *Proxy) string {
 	if p.GetVLESSSpider() != "" {
 		params = append(params, "spider="+p.GetVLESSSpider())
 	}
+	if p.GetVLESSNoTLS() {
+		params = append(params, "security=none")
+	}
+	if len(params) > 0 {
+		return "?" + strings.Join(params, "&")
+	}
+	return ""
+}
+
+// buildTrojanQuery renders the persisted trojan parameters: only the SNI
+// override (empty = dial falls back to host) and the plaintext marker.
+// The password rides in userinfo, not here; transport type is always TCP
+// (ws/grpc entries are rejected at extraction, so there is nothing to keep).
+func buildTrojanQuery(p *Proxy) string {
+	var params []string
+	if p.GetTrojanSNI() != "" {
+		params = append(params, "sni="+p.GetTrojanSNI())
+	}
+	if p.GetTrojanNoTLS() {
+		params = append(params, "security=none")
+	}
 	if len(params) > 0 {
 		return "?" + strings.Join(params, "&")
 	}
@@ -502,7 +646,8 @@ func (p *Proxy) Key() string {
 }
 
 // ParseProxyLine parses queue lines into a Proxy.
-// Accepted forms: "host:port", "scheme://host:port", "scheme://user:pass@host:port".
+// Accepted forms: "host:port", "scheme://host:port", "scheme://user:pass@host:port",
+// "vless://uuid@host:port?...", "trojan://password@host:port?...".
 func ParseProxyLine(line string) (*Proxy, error) {
 	s := strings.TrimSpace(line)
 	if s == "" || strings.HasPrefix(s, "#") {
@@ -513,14 +658,26 @@ func ParseProxyLine(line string) (*Proxy, error) {
 	rest := s
 	if i := strings.Index(s, "://"); i >= 0 {
 		schema = strings.ToLower(s[:i])
+		// Umbrella spellings (socks5h://, socks4a://) normalize to dialer
+		// names: the extractor already does this, but queue/pool files may
+		// carry the raw spelling and validSchema would reject them. Mapped
+		// explicitly (not via normScheme, whose default is "http" for the
+		// extractor's unknown-schema case — routing trojan/vless through it
+		// would silently re-tag them as http).
+		switch schema {
+		case "socks5h":
+			schema = "socks5"
+		case "socks4a", "socks":
+			schema = "socks4"
+		}
 		if !validSchema(schema) {
 			return nil, fmt.Errorf("unknown scheme %q", schema)
 		}
 		rest = s[i+3:]
 	}
-
 	// Handle VLESS URL parameters (uuid, flow, sni, pbk, sid, spider)
 	vlessUUID, vlessFlow, vlessSNI, vlessPbk, vlessSid, vlessSpider := "", "", "", "", "", ""
+	vlessNoTLS := false
 	if schema == "vless" {
 		// Format: vless://uuid@host:port?flow=...&sni=...&pbk=...&sid=...&spider=...
 		if at := strings.LastIndex(rest, "@"); at >= 0 {
@@ -545,6 +702,37 @@ func ParseProxyLine(line string) (*Proxy, error) {
 						vlessSid = v
 					case "spider":
 						vlessSpider = v
+					case "security":
+						vlessNoTLS = v == "none"
+					}
+				}
+			}
+		}
+	}
+
+	// Handle trojan URL parameters (password in userinfo, sni, security).
+	// Format: trojan://password@host:port?sni=...&security=none
+	// The password stays in URL form (still percent-encoded): the handshake
+	// decodes it once, and raw storage keeps URL()/ParseProxyLine a lossless
+	// round trip for passwords containing #/@/? (LastIndex(@) still splits
+	// userinfo correctly; # and ? would not survive a decode/re-encode).
+	trojanPassword, trojanSNI, trojanNoTLS := "", "", false
+	if schema == "trojan" {
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			trojanPassword = rest[:at]
+			rest = rest[at+1:]
+		}
+		if q := strings.Index(rest, "?"); q >= 0 {
+			query := rest[q+1:]
+			rest = rest[:q]
+			for _, kv := range strings.Split(query, "&") {
+				if eq := strings.Index(kv, "="); eq >= 0 {
+					k, v := kv[:eq], kv[eq+1:]
+					switch k {
+					case "sni":
+						trojanSNI = v
+					case "security":
+						trojanNoTLS = v == "none"
 					}
 				}
 			}
@@ -574,14 +762,17 @@ func ParseProxyLine(line string) (*Proxy, error) {
 	// is broken by the revalidate path).
 	p := &Proxy{Schema: schema, Host: host, Port: port, meta: &ProxyMeta{}}
 	if schema == "vless" {
-		p.SetVLESS(vlessUUID, vlessFlow, vlessSNI, vlessPbk, vlessSid, vlessSpider)
+		p.SetVLESS(vlessUUID, vlessFlow, vlessSNI, vlessPbk, vlessSid, vlessSpider, vlessNoTLS)
+	}
+	if schema == "trojan" {
+		p.SetTrojan(trojanPassword, trojanSNI, trojanNoTLS)
 	}
 	p.keyCache = p.URL()
 	return p, nil
 }
 
 // splitHostPort splits host:port, handling [ipv6]:port and bare IPv6 without
-// brackets followed by ":port" (which is ambiguous — treat as bracketed form
+// brackets followed by ":port" (which is ambiguous вЂ” treat as bracketed form
 // requirement, i.e. require net.SplitHostPort for correctness).
 func splitHostPort(s string) (string, string, error) {
 	// Bracketed form or domain form: handled by net.SplitHostPort.

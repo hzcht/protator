@@ -534,12 +534,22 @@ func (cp *CandidatePool) Len() int {
 
 // candidateLine normalizes a candidate to its persistent form: bare host:port
 // for http/unknown (probe_order will re-discover the protocol), scheme-prefixed
-// otherwise.
+// otherwise. Credentialed protocols (vless, trojan) persist through a Proxy
+// with meta attached: without it the UUID/password is dropped here and the
+// re-probed candidate can never validate — the exact hole the credentialed
+// extractor note warns about.
 func candidateLine(c Candidate) string {
 	if c.Schema == "" || c.Schema == "http" {
 		return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	}
-	return (&Proxy{Schema: c.Schema, Host: c.Host, Port: c.Port}).URL()
+	p := &Proxy{Schema: c.Schema, Host: c.Host, Port: c.Port, meta: &ProxyMeta{}}
+	if c.Schema == "vless" {
+		p.SetVLESS(c.VLESSUUID, c.VLESSFlow, c.VLESSSNI, c.VLESSPbk, c.VLESSSid, c.VLESSSpider, c.VLESSNoTLS)
+	}
+	if c.Schema == "trojan" {
+		p.SetTrojan(c.TrojanPassword, c.TrojanSNI, c.TrojanNoTLS)
+	}
+	return p.URL()
 }
 
 // poolPersistLine is candidateLine plus the source attribution, separated by

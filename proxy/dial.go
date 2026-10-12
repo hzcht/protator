@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -28,13 +29,15 @@ func isSocks(schema string) bool {
 }
 
 // dialProxy opens a TCP connection to addr tunnelling through proxy p.
-// Works for http/https (CONNECT), socks4/socks5, and vless.
+// Works for http/https (CONNECT), socks4/socks5, vless and trojan.
 func dialProxy(p *Proxy, timeout time.Duration, ctx context.Context, network, addr string) (net.Conn, error) {
 	switch p.Schema {
 	case "socks4", "socks5":
 		return socksDialTimeout(p, timeout, ctx, network, addr)
 	case "vless":
 		return dialVLESS(p, timeout, ctx, network, addr)
+	case "trojan":
+		return dialTrojan(p, timeout, ctx, network, addr)
 	default: // http, https
 		return connectHTTPProxy(p, timeout, ctx, network, addr)
 	}
@@ -235,29 +238,35 @@ func dialVLESS(p *Proxy, timeout time.Duration, ctx context.Context, network, ad
 	sid := p.GetVLESSSid()
 	flow := p.GetVLESSFlow()
 
-	var tconn *utls.Conn
-
-	if pbk != "" {
-		// REALITY: use uTLS with custom ClientHello
-		tconn, err = dialVLESSRealty(conn, ctx, timeout, sni, pbk, sid, flow)
-		if err != nil {
-			conn.Close()
-			return nil, err
+	// The tunnel: TLS (REALITY or standard) by default, raw TCP when the
+	// entry says security=none. The VLESS handshake below runs on whatever
+	// this holds, so both shapes share the rest of the function.
+	var tconn net.Conn = conn
+	if !p.GetVLESSNoTLS() {
+		var ut *utls.Conn
+		if pbk != "" {
+			// REALITY: use uTLS with custom ClientHello
+			ut, err = dialVLESSRealty(conn, ctx, timeout, sni, pbk, sid, flow)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+		} else {
+			// Standard VLESS over TLS
+			tlsConfig := &utls.Config{
+				ServerName:         sni,
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"vless"},
+			}
+			ut = utls.Client(conn, tlsConfig)
+			ut.SetDeadline(time.Now().Add(timeout))
+			if err := ut.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			ut.SetDeadline(time.Time{})
 		}
-	} else {
-		// Standard VLESS over TLS
-		tlsConfig := &utls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"vless"},
-		}
-		tconn = utls.Client(conn, tlsConfig)
-		tconn.SetDeadline(time.Now().Add(timeout))
-		if err := tconn.HandshakeContext(ctx); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		tconn.SetDeadline(time.Time{})
+		tconn = ut
 	}
 
 	// VLESS handshake: send UUID + command
@@ -477,4 +486,116 @@ func parseUUID(s string) ([]byte, error) {
 		return nil, err
 	}
 	return out[:], nil
+}
+
+// dialTrojan establishes a Trojan connection through a trojan proxy.
+// Protocol: TCP dial -> TLS handshake (or plaintext when security=none) ->
+// trojan request (HEX(SHA224(password)) CRLF CMD ATYP ADDR PORT CRLF) ->
+// the tunnel. Trojan sends no handshake reply: a wrong password just gets
+// the connection closed, so dial success only means "the server is there" —
+// real proof comes from the exit-IP fetch (checker) or the first tunneled
+// byte (serving path).
+//
+// TLS uses the stdlib, not uTLS: trojan mimics plain HTTPS and has no
+// REALITY-style fingerprint dance (reality entries are rejected at
+// extraction). InsecureSkipVerify is the norm here, same as the VLESS
+// standard path: these lists are full of self-signed nodes.
+func dialTrojan(p *Proxy, timeout time.Duration, ctx context.Context, network, addr string) (net.Conn, error) {
+	pw := p.GetTrojanPassword()
+	if pw == "" {
+		return nil, errors.New("trojan password required")
+	}
+	// The password is stored in URL form (still percent-encoded); the server
+	// hashes the decoded bytes. A stored form that does not decode is used
+	// as-is rather than failing: hashing something is strictly more useful
+	// than refusing to dial.
+	if decoded, err := url.QueryUnescape(pw); err == nil {
+		pw = decoded
+	}
+	sum := sha256.Sum224([]byte(pw))
+
+	d := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	conn, err := d.DialContext(ctx, network, p.Addr())
+	if err != nil {
+		return nil, err
+	}
+	if !p.GetTrojanNoTLS() {
+		sni := p.GetTrojanSNI()
+		if sni == "" {
+			// The TLS peer is the trojan server, not the destination: fall
+			// back to the proxy host, never to the tunneled target.
+			sni = p.Host
+		}
+		tconn := tls.Client(conn, &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true, //nolint:gosec // self-signed nodes are the norm, same as VLESS
+		})
+		tconn.SetDeadline(time.Now().Add(timeout))
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		tconn.SetDeadline(time.Time{})
+		conn = tconn
+	}
+	if err := trojanHandshake(conn, sum[:], addr, timeout); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// trojanHandshake writes the trojan request for target addr: the hex SHA224
+// of the password, CRLF, CONNECT command, SOCKS-style address, CRLF.
+func trojanHandshake(conn net.Conn, pwHash []byte, addr string, timeout time.Duration) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	port, _ := strconv.Atoi(portStr)
+	if len(host) > 255 {
+		return fmt.Errorf("destination host too long for trojan handshake: %d bytes (max 255)", len(host))
+	}
+	// 56 (hex hash) + 2 + 1 + up to 1+1+255 + 2 + 2.
+	var buf [56 + 2 + 1 + 1 + 1 + 255 + 2 + 2]byte
+	n := 0
+	n += hex.Encode(buf[n:], pwHash)
+	copy(buf[n:], "\r\n")
+	n += 2
+	buf[n] = 0x01 // CONNECT
+	n++
+	ip := net.ParseIP(host)
+	switch {
+	case ip != nil && ip.To4() != nil:
+		buf[n] = 0x01 // IPv4
+		n++
+		copy(buf[n:], ip.To4())
+		n += 4
+	case ip != nil:
+		buf[n] = 0x04 // IPv6
+		n++
+		copy(buf[n:], ip.To16())
+		n += 16
+	default:
+		buf[n] = 0x03 // domain
+		n++
+		buf[n] = byte(len(host))
+		n++
+		copy(buf[n:], host)
+		n += len(host)
+	}
+	binary.BigEndian.PutUint16(buf[n:], uint16(port))
+	n += 2
+	copy(buf[n:], "\r\n")
+	n += 2
+
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	if _, err := conn.Write(buf[:n]); err != nil {
+		return err
+	}
+	// Same rule as vlessHandshake: the tunnel is long-lived from here, and
+	// an armed write deadline kills sessions that write later than that.
+	return conn.SetDeadline(time.Time{})
 }

@@ -195,6 +195,16 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 		// GetCountry/GetASN concurrently, and a lazily-initialized plain
 		// pointer field is a data race on the hot read path.
 		p := &Proxy{Schema: cand.Schema, Host: cand.Host, Port: cand.Port, meta: &ProxyMeta{}}
+		// Credentials ride along before the identity is frozen: a trojan or
+		// vless entry without its password/UUID can never validate, and the
+		// key (hence the transport cache and dedup) includes them — stamping
+		// after keyCache would serve one password's transport to another's.
+		if cand.Schema == "trojan" {
+			p.SetTrojan(cand.TrojanPassword, cand.TrojanSNI, cand.TrojanNoTLS)
+		}
+		if cand.Schema == "vless" {
+			p.SetVLESS(cand.VLESSUUID, cand.VLESSFlow, cand.VLESSSNI, cand.VLESSPbk, cand.VLESSSid, cand.VLESSSpider, cand.VLESSNoTLS)
+		}
 		// Precompute the identity before the proxy is published: every Key()
 		// on the productive population would otherwise rebuild the URL with
 		// fmt.Sprintf (rankPick calls it once per probe, up to 256 per pick,
@@ -691,6 +701,13 @@ func (c *Checker) transportFor(p *Proxy) *http.Transport {
 		to := c.cfg.Checker.ConnectT.Duration
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialVLESS(p, to, ctx, network, addr)
+		}
+	}
+	if p.IsTrojan() {
+		tr.Proxy = nil
+		to := c.cfg.Checker.ConnectT.Duration
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialTrojan(p, to, ctx, network, addr)
 		}
 	}
 

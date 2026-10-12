@@ -256,7 +256,7 @@ func TestURLLenMatchesURL(t *testing.T) {
 		}
 	}
 	v := &Proxy{Schema: "vless", Host: "5.6.7.8", Port: 443}
-	v.SetVLESS("uuid-here", "", "example.com", "pk", "sid", "")
+	v.SetVLESS("uuid-here", "", "example.com", "pk", "sid", "", false)
 	if got, want := v.URLLen(), len(v.URL()); got != want {
 		t.Errorf("vless URLLen = %d, want %d (url %q)", got, want, v.URL())
 	}
