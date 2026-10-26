@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	neturl "net/url"
 	"os"
@@ -193,24 +194,45 @@ func SaveSiteList(l *SiteList) error {
 	return writeFileAtomic(l.Path, l.Render())
 }
 
+// The os.CreateTemp patterns used by the writers in this package. They are
+// also the globs SweepOrphanTMP sweeps, so any writer that needs a new pattern
+// has to add it there too.
+const (
+	tmpPatternSites = ".sites-*.tmp"
+	tmpPatternQueue = ".queue-*.tmp"
+)
+
 func writeFileAtomic(path string, data []byte) error {
+	return writeFileAtomicTo(path, tmpPatternSites, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// writeFileAtomicTo is the one way this codebase replaces a file: render runs
+// against a temp file created in path's directory, the result is flushed,
+// fsynced and renamed over path. A reader therefore sees either the old file
+// or the complete new one, never a truncated one, and a crash before the
+// rename leaves only the temp file — which SweepOrphanTMP sweeps at the next
+// start (the reason every writer must pass one of the known patterns).
+// On any error the temp is removed and path keeps its previous contents.
+func writeFileAtomicTo(path, pattern string, render func(w io.Writer) error) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".sites-*.tmp")
+	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	defer func() {
 		if tmpName != "" {
+			tmp.Close()
 			os.Remove(tmpName)
 		}
 	}()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+	if err := render(tmp); err != nil {
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -226,13 +248,14 @@ func writeFileAtomic(path string, data []byte) error {
 // SweepOrphanTMP removes atomic-write temp files left behind by a crash
 // between CreateTemp and rename: `.sites-*.tmp` (writeFileAtomic — sites.txt
 // and candidates.lst), `.queue-*.tmp` (SaveBucketAtomic — proxy.lst) and the
-// debug-proxies fixed-name temp. The defer os.Remove in each writer never ran,
-// so the files linger forever, eating disk and confusing operators ("is this
-// my queue?"). Only the exact patterns our own writers create are swept — a
-// generic *.tmp glob would eat unrelated user files. Safe at startup: no
-// writer has run yet, so every matching file is an orphan by definition.
+// debug-proxies temp (`<basename>.tmp` + random suffix). The defer os.Remove
+// in each writer never ran, so the files linger forever, eating disk and
+// confusing operators ("is this my queue?"). Only the patterns our own
+// writers create are swept — a generic *.tmp glob would eat unrelated user
+// files. Safe at startup: no writer has run yet, so every matching file is an
+// orphan by definition.
 func SweepOrphanTMP(dirs ...string) {
-	patterns := []string{".sites-*.tmp", ".queue-*.tmp", "debug_proxies.txt.tmp"}
+	patterns := []string{tmpPatternSites, tmpPatternQueue, "debug_proxies.txt.tmp*"}
 	seen := make(map[string]struct{}, len(dirs))
 	for _, dir := range dirs {
 		if dir == "" || dir == "." {
@@ -355,17 +378,6 @@ func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 		}
 	}
 
-	tmp, err := os.CreateTemp(dir, ".queue-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmpName != "" {
-			os.Remove(tmpName)
-		}
-	}()
-
 	// Over budget, keep the tail. The slice is in insertion order, so the head
 	// is the oldest entries and the tail the most recently validated ones — and
 	// on a restart only the tail is worth anything. Keeping the head instead
@@ -405,42 +417,28 @@ func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 		proxies = proxies[lo:]
 	}
 
-	bw := bufio.NewWriterSize(tmp, 1<<20)
-	var size int64
-	// One reusable buffer for the whole save: the URL is built straight into
-	// the writer, so a multi-million-entry save allocates nothing per entry.
-	line := make([]byte, 0, 128)
-	for _, p := range proxies {
-		line = p.AppendURL(line[:0])
-		if size+int64(len(line))+1 > maxBytes {
-			break
+	return writeFileAtomicTo(path, tmpPatternQueue, func(w io.Writer) error {
+		bw := bufio.NewWriterSize(w, 1<<20)
+		var size int64
+		// One reusable buffer for the whole save: the URL is built straight
+		// into the writer, so a multi-million-entry save allocates nothing
+		// per entry.
+		line := make([]byte, 0, 128)
+		for _, p := range proxies {
+			line = p.AppendURL(line[:0])
+			if size+int64(len(line))+1 > maxBytes {
+				break
+			}
+			if _, err := bw.Write(line); err != nil {
+				return err
+			}
+			if err := bw.WriteByte('\n'); err != nil {
+				return err
+			}
+			size += int64(len(line)) + 1
 		}
-		if _, err := bw.Write(line); err != nil {
-			tmp.Close()
-			return err
-		}
-		if err := bw.WriteByte('\n'); err != nil {
-			tmp.Close()
-			return err
-		}
-		size += int64(len(line)) + 1
-	}
-	if err := bw.Flush(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	tmpName = ""
-	return nil
+		return bw.Flush()
+	})
 }
 
 // AppendGood appends a line to the "good proxies" audit file.

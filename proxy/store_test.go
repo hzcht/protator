@@ -301,7 +301,11 @@ func TestSweepOrphanTMP(t *testing.T) {
 	orphans := []string{
 		filepath.Join(dir, ".sites-123456.tmp"),
 		filepath.Join(dir, ".queue-999999.tmp"),
+		// Both shapes of the debug-proxies temp: the pre-refactor fixed name
+		// (already on disk in an old install) and the CreateTemp suffix the
+		// shared writer produces now.
 		filepath.Join(dir, "debug_proxies.txt.tmp"),
+		filepath.Join(dir, "debug_proxies.txt.tmp42424242"),
 	}
 	for _, f := range orphans {
 		if err := os.WriteFile(f, []byte("stale"), 0o644); err != nil {

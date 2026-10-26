@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -51,6 +52,48 @@ func TestPickerPrefersProvenOverSeededBulk(t *testing.T) {
 	// 1.5% minority cannot fix that, so the picker has to be told where to look.
 	if rate < 0.9 {
 		t.Errorf("only %.1f%% of picks hit a proven proxy; the pool is serving the unproven bulk", rate*100)
+	}
+}
+
+// The proven tier is a cached snapshot (freshPool rebuilds at most once per
+// freshRebuildInterval), so for up to two seconds it can still name an entry
+// that has already left the queue. rankPick's verifyLive flag is what stops
+// such an entry from winning a pick: the live slices are consistent under the
+// read lock and never need the check, the cache always does. The flag is the
+// difference between "failed dial" and "ErrNoProven", and this test is what
+// makes removing it visible instead of silent.
+func TestPickerRefusesRemovedProvenEntries(t *testing.T) {
+	b := NewBucket(0)
+	// Two entries that carry proof and will be removed, plus one stale entry
+	// that stays: the queue has to stay non-empty or PickHealthy blocks
+	// waiting for signal instead of reaching the picker at all.
+	var doomed [2]*Proxy
+	for i := range doomed {
+		p := &Proxy{Schema: "http", Host: hostAt(i), Port: 8080}
+		doomed[i] = p
+		b.Add(p)
+		p.MarkServeOK(time.Second)
+	}
+	b.Add(&Proxy{Schema: "http", Host: hostAt(99), Port: 8080})
+
+	// Build the cache while both proven entries are still queued. Anything
+	// slower than freshRebuildInterval would rebuild it as empty and assert
+	// nothing, so check its contents here.
+	if got := b.freshPool(time.Now()); len(got) != 2 {
+		t.Fatalf("proven cache holds %d entries, want 2", len(got))
+	}
+	for _, p := range doomed {
+		b.Remove(p)
+	}
+	if b.Len() != 1 {
+		t.Fatalf("queue holds %d entries, want 1", b.Len())
+	}
+
+	// Fail closed: with nothing proven *and live* left, the honest answer is
+	// ErrNoProven, not a proxy the queue threw away.
+	b.SetRequireProven(true)
+	if _, err := b.PickHealthy(context.Background(), 8, nil); !errors.Is(err, ErrNoProven) {
+		t.Fatalf("pick returned %v, want ErrNoProven: a removed entry must never win a pick", err)
 	}
 }
 

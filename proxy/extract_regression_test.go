@@ -7,21 +7,6 @@ import (
 	"testing"
 )
 
-// liveExtractor builds an extractor from the shipped main/regexp.txt so these
-// tests exercise the real per-site patterns rather than a copy.
-func liveExtractor(t *testing.T) *Extractor {
-	t.Helper()
-	lines, err := LoadRegexLines("../config/regexp.txt")
-	if err != nil {
-		t.Fatalf("LoadRegexLines: %v", err)
-	}
-	e, err := NewExtractor(lines)
-	if err != nil {
-		t.Fatalf("NewExtractor: %v", err)
-	}
-	return e
-}
-
 // The fixture is a verbatim copy of one page of the live geonode API. Records
 // list a dozen keys between "ip" and "port" and quote the port, so a pattern
 // that assumes the two are adjacent extracts nothing.

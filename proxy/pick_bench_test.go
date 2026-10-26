@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -123,6 +125,38 @@ func BenchmarkPinPoolSetAtCap(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		p.Set(keys[i%rotating], vals[i%rotating])
+	}
+}
+
+// BenchmarkExtractPage is the collector's CPU bill: one scraped body through
+// the share-link, universal and shipped site-pattern passes. Two shapes on
+// purpose — the gate in extract() can skip almost everything on a page with
+// no dotted quad, and nothing on a proxy table, and both halves of that trade
+// need to stay visible.
+func BenchmarkExtractPage(b *testing.B) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "proxynova.html"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	e := liveExtractor(b)
+	// No dotted quad, no "://", no "[" — an error page, a stylesheet, a
+	// rate-limit body: what most failed fetches actually return.
+	junk := []byte(strings.Repeat("body{color:#fff;margin:0}.nav a{text-decoration:none}"+
+		"<div class=\"hero\"><h1>Welcome</h1><p>Our best content, updated daily</p></div>", 2000))
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"real-page", raw},
+		{"junk-no-ip", junk},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(tc.body)))
+			for i := 0; i < b.N; i++ {
+				_ = e.Extract(tc.body)
+			}
+		})
 	}
 }
 

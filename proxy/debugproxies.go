@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"os"
+	"io"
 	"path/filepath"
 	"sync"
 )
@@ -52,17 +52,15 @@ func (d *DebugProxies) Add(url string) {
 }
 
 func (d *DebugProxies) writeLocked() {
-	dir := filepath.Dir(d.path)
-	tmp := filepath.Join(dir, filepath.Base(d.path)+".tmp")
-	f, err := os.Create(tmp)
-	if err != nil {
-		return
-	}
-	for _, u := range d.ring {
-		if _, werr := f.Write([]byte(u + "\n")); werr != nil {
-			break
+	// Same atomic write as every other file in this package: temp + fsync +
+	// rename, so a crash mid-write can never leave a half-written list (the
+	// old fixed-name temp also let two processes clobber each other).
+	_ = writeFileAtomicTo(d.path, filepath.Base(d.path)+".tmp", func(w io.Writer) error {
+		for _, u := range d.ring {
+			if _, err := io.WriteString(w, u+"\n"); err != nil {
+				return err
+			}
 		}
-	}
-	f.Close()
-	_ = os.Rename(tmp, d.path)
+		return nil
+	})
 }

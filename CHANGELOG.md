@@ -178,6 +178,66 @@ has no release process yet and an unmarked change is a change nobody can find.
   pitfalls, metrics/profiling/benchmark sections, updated file tree),
   ARCHITECTURE (component map, route table, loop table).
 - `CHANGELOG.md` — new file; this project had no record of what changed.
+- **The six largest files were split by concern** (pure moves, no behaviour
+  change): `bucket.go` 865 → 606 + `bucket_live.go` 265; `extract.go` 864 →
+  380 + `extract_gate.go` / `extract_share.go` / `extract_spys.go` /
+  `extract_base64.go`; `collector.go` 850 → 444 + `collect_fetch.go`;
+  `checker.go` 811 → 400 + `checker_probe.go`; `model.go` 795 → 478 +
+  `model_proto.go`; `adminapi.go` 745 → 293 + `admin_sources.go` 294 +
+  `adminproxies.go` 187. No non-test file is over 704 lines now. Each split
+  cuts at a boundary that already existed in the comments (queue vs its admin
+  rendering, validation decisions vs evidence probes, the fetch vs the
+  collector loop, the hot struct vs its protocol metadata, sources vs proxies
+  in the admin API), so a reader lands in one concern instead of scrolling
+  past 800.
+- **One atomic writer.** `writeFileAtomic`, `SaveBucketAtomic` and the
+  debug-proxies writer each had their own temp/fsync/rename dance — the last
+  one without fsync and under a fixed temp name that `SweepOrphanTMP` did not
+  sweep. All three are now render callbacks over `writeFileAtomicTo(path,
+  pattern, render)` in `proxy/store.go`, and the sweep globs live next to the
+  patterns they sweep (`debug_proxies.txt.tmp` → `debug_proxies.txt.tmp*`, so
+  temps already orphaned by an older build are still removed).
+- **Extractor test fixtures are single-sourced** in `proxy/fixtures_test.go`:
+  `liveExtractor` now takes `testing.TB`, so benchmarks share it, and
+  `LoadRegexLines("../config/regexp.txt") + NewExtractor` is no longer pasted
+  into four files.
+- Dead-code scan across the package (top-level funcs, methods, config fields):
+  nothing unreferenced. `util.RandInt` is the one unused symbol and stays —
+  `AGENTS.md` pins `util/` as a legacy stub.
+
+### Performance
+
+Measured on the standing benchmark suite (`data/perf/bench_baseline.txt` →
+`data/perf/bench_after.txt`, same box, same flags), one CPU profile per path.
+The production-scale reading and what is still on the table are in
+`problems.md` §14.
+
+- **A pick is 3–4× cheaper.** `rankPick` no longer hashes the proxy's URL into
+  the index map for every probe: `b.proxies` and `b.hot` are already
+  consistent under the read lock, so only `freshPool`'s cached snapshot pays
+  the lookup (the new `verifyLive` argument), and the `skip` map is only
+  consulted when it is non-empty. 3.9 µs → 1.3–1.5 µs at queue=1000 and
+  9.4 µs → 2.3–2.6 µs at queue=70000, still 0 allocs. Regression:
+  `TestPickerRefusesRemovedProvenEntries` (fails if the flag is flipped).
+- **`LiveListPage` is 1.75× faster and allocates less.** The comparators and
+  the heap sift moved from closures to package-level functions (inlinable, no
+  indirect call per sift), the row shrank 40 → 32 bytes, and `sort.Slice`'s
+  reflection-based swapping became `slices.SortFunc`. 4.07–4.37 ms → 2.27–2.35
+  ms for a 70k queue at limit=1000, 16 → 12 allocs, same order and tie-breaks.
+- **`Extract` skips passes that provably cannot match** — with an honest
+  split. Every site pattern is a full pass over the body (61 of them measured
+  215 of the 260 ms a real 128 KB page costs). Patterns whose own source
+  begins with the canonical IPv4 group are now skipped when the body has no
+  dotted quad, and the universal passes are gated on one pre-scan of the body
+  (`hasIPv4Token`) plus `://`, `[` and a case-folded `trojan://`/`vless://`
+  search. Same-session A/B: **a body with no dotted quad 410 → 190 ms (2.2×),
+  a real proxy page unchanged** (263 → 269 ms, inside this box's ±20% noise —
+  a literal-prefix gate was built, measured at 1 ms of 185 ms saved, and
+  removed again: Go's regexp already jumps between literal prefixes). The
+  invariant is testable:
+  `TestExtractGatesNeverDropMatches` runs every shipped pattern over eight
+  body shapes and asserts that whatever the gate skipped really was empty.
+  New `BenchmarkExtractPage` covers both a real page and an IP-less one.
 
 ### Known gaps (next)
 

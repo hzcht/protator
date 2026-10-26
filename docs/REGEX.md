@@ -1,7 +1,9 @@
 # Extractor: what it reads and why
 
 `config/regexp.txt` is a list of one-regex-per-line patterns that run against
-every fetched page body. The universal patterns in code (`proxy/extract.go`)
+every fetched page body. The universal patterns in code (`proxy/extract.go`;
+share links in `proxy/extract_share.go`, spys in `proxy/extract_spys.go`, and
+the gate that may skip a pattern in `proxy/extract_gate.go`)
 always run first:
 
 | shape | notes |

@@ -250,14 +250,7 @@ func TestTLSLoadOrCreate(t *testing.T) {
 }
 
 func TestRegexFileCompiles(t *testing.T) {
-	lines, err := LoadRegexLines(filepath.Join("..", "config", "regexp.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	e, err := NewExtractor(lines)
-	if err != nil {
-		t.Fatal(err)
-	}
+	e := liveExtractor(t)
 	if e == nil {
 		t.Fatal("nil extractor")
 	}

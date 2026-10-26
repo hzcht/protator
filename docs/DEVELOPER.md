@@ -39,7 +39,9 @@ protator/
 │   ├── workers.go          # checkerWorkers: validation pool + supervisor
 │   ├── beats.go            # Subsystem heartbeats (last cycle/pass/save) + exposure warning
 │   ├── admin.go            # Admin listener (mixed HTTP/HTTPS) + routes
-│   ├── adminapi.go         # Admin JSON handlers + shared admin struct
+│   ├── adminapi.go         # Shared admin struct + stats ring + wake/shutdown + JSON helpers
+│   ├── admin_sources.go    # /api/sources rows, cooldown reset, /api/sites editor
+│   ├── adminproxies.go     # /api/proxies list+exports, revalidate, drop
 │   ├── adminhealth.go      # /health, /ready, /api/metrics, /api/logs, /api/config, token
 │   ├── adminlive.go        # liveRow, live page, delta, CSV/text exporters
 │   ├── adminws.go          # wsHub: WebSocket connections, diff, coalesced notifier
@@ -50,24 +52,32 @@ protator/
 │   ├── start.ps1           # Ops: start/restart
 │   └── stop.ps1            # Ops: graceful stop
 ├── proxy/                   # Core logic
-│   ├── model.go            # Proxy, Candidate, atomic health stats
-│   ├── bucket.go           # Live queue, hot tail, LiveList, Subscribe
-│   ├── pick.go             # Serving-path policy: proof tiers, rankPick, PickHealthy
+│   ├── model.go            # Proxy, Candidate, atomic health stats, URL/Key/parse
+│   ├── model_proto.go      # ProxyMeta + GeoIP/VLESS/trojan accessors + query builders
+│   ├── bucket.go           # Live queue, hot tail, Subscribe, PickHealthy
+│   ├── bucket_live.go      # LiveList / LiveListPage + liveness scopes (admin surface)
+│   ├── pick.go             # Serving-path policy: proof tiers, rankPick, betterPick
 │   ├── pipeline.go         # RunCheckLoop (candidate -> pool/bucket), RevalidateSeeded
 │   ├── revalidate.go       # RevalidateLoop / RevalidateMany (stale-first)
 │   ├── poolloop.go         # PoolReprobeLoop (adaptive re-probe batch)
-│   ├── checker.go          # Validation pipeline + GeoIP
-│   ├── collector.go        # Site scraping + extraction
+│   ├── checker.go          # Validation pipeline (Check/fullCheck) + GeoIP
+│   ├── checker_probe.go    # Evidence probes: exit IP, leaks, e2e serve, transport
+│   ├── collector.go        # Site scraping: rotation, cycles, emit, dedup
+│   ├── collect_fetch.go    # One fetch: transport cache + response classification
 │   ├── upstream.go         # ForwardDialer with failover + passive feedback
 │   ├── dial.go             # CONNECT, SOCKS, VLESS (uTLS + REALITY)
-│   ├── extract.go          # Regex + spys XOR + document.write JS + whole-body base64
+│   ├── extract.go          # Extractor + the passes of Extract()
+│   ├── extract_gate.go     # Which passes may be skipped (and the scans that decide)
+│   ├── extract_share.go    # trojan:// + vless:// share links
+│   ├── extract_spys.go     # spys.one JS-obfuscated port reconstruction
+│   ├── extract_base64.go   # Whole-body base64 pass + its false-positive guard
 │   ├── pool.go             # CandidatePool (rotating, async compaction)
 │   ├── debugproxies.go     # Rolling window of freshly validated proxies
 │   ├── sitestats.go        # SiteRegistry (telemetry + cooldown + priority)
 │   ├── stats.go            # Process-wide counter registry (proxy.Stats)
 │   ├── guard.go            # RecoverPanic / GuardedSend (panic -> log + counter)
 │   ├── config.go           # TOML config structs + fillDefaults
-│   ├── store.go            # File I/O (sites, queue, regex, atomic saves)
+│   ├── store.go            # File I/O (sites, queue, regex) + writeFileAtomicTo
 │   ├── socks5_server.go    # RFC 1928 SOCKS5 front-end
 │   ├── tlsutil.go          # Cert loading / self-signed generation
 │   ├── browser.go          # Playwright headless fallback
@@ -280,7 +290,8 @@ Embedded assets in `main/adminassets.go` as string constants (`indexHTML`, `admi
 ### Adding a new tab
 1. Add `<section id="newtab" class="panel">` in `indexHTML`
 2. Add tab button in `<nav class="tabs">`
-2. Add API handler in `adminapi.go` (`handleNewtab`)
+2. Add API handler in the file for its subject (`admin_sources.go`,
+   `adminproxies.go`, `adminapi.go`), wire it in `routes()` in `admin.go` (`handleNewtab`)
 3. Add JS `loadNewtab()` + render function in `adminJS`
 4. Register route in `admin.go:routes()`
 

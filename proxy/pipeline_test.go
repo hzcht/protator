@@ -164,14 +164,7 @@ func TestExtractSpys(t *testing.T) {
 }
 
 func TestExtractProxydbHref(t *testing.T) {
-	lines, err := LoadRegexLines(filepath.Join("..", "config", "regexp.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	e, err := NewExtractor(lines)
-	if err != nil {
-		t.Fatal(err)
-	}
+	e := liveExtractor(t)
 	row := `<tr><td><a href="/45.144.53.63/6015#https" title="x">45.144.53.63</a></td>` +
 		`<td><div style="display:none">12</div><a href="/45.144.53.63/6015#https">6015</a></td></tr>`
 	byHost := map[string]int{}
@@ -200,10 +193,7 @@ func TestNormalizeSiteURL(t *testing.T) {
 // TestAllRegexpTxtPatternsCompiles verifies every non-comment line in
 // regexp.txt compiles as a valid Go regexp.
 func TestAllRegexpTxtPatternsCompiles(t *testing.T) {
-	lines, err := LoadRegexLines(filepath.Join("..", "config", "regexp.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	lines := shippedRegexLines(t)
 	for i, line := range lines {
 		if _, err := regexp.Compile(line); err != nil {
 			t.Fatalf("line %d: regex %q failed: %v", i+1, line, err)
@@ -213,14 +203,7 @@ func TestAllRegexpTxtPatternsCompiles(t *testing.T) {
 
 // TestAdditionalPatterns verifies a few of the new patterns work on synthetic HTML.
 func TestAdditionalPatterns(t *testing.T) {
-	lines, err := LoadRegexLines(filepath.Join("..", "config", "regexp.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	e, err := NewExtractor(lines)
-	if err != nil {
-		t.Fatal(err)
-	}
+	e := liveExtractor(t)
 
 	tests := []struct {
 		name string

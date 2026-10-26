@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net"
-	"net/url"
 	"regexp"
 	"strings"
 )
@@ -52,6 +50,18 @@ var (
 // universal patterns above plus the per-site patterns from regexp.txt.
 type Extractor struct {
 	patterns []*regexp.Regexp
+	// startsIPv4[i] is true when patterns[i] literally begins with the
+	// canonical IPv4 group, so it cannot match a body without a dotted quad.
+	// Derived at compile time; see startsWithIPv4Group.
+	//
+	// A gate exists because every site pattern is a full pass over the body
+	// (61 of them measured 215 of the 260 ms a real 128 KB page costs). It may
+	// only ever be wrong in the safe direction: a gate that lets an impossible
+	// pattern through costs time, one that drops a possible match silently
+	// loses candidates — so it is a necessary condition derived from the
+	// pattern's own source, never a guess, and TestExtractGatesNeverDropMatches
+	// asserts the empty side of it.
+	startsIPv4 []bool
 }
 
 // NewExtractor compiles the extra regexes from regexp.txt.
@@ -63,6 +73,7 @@ func NewExtractor(regexLines []string) (*Extractor, error) {
 			return nil, fmt.Errorf("bad regex %q: %w", line, err)
 		}
 		e.patterns = append(e.patterns, re)
+		e.startsIPv4 = append(e.startsIPv4, startsWithIPv4Group(line))
 	}
 	return e, nil
 }
@@ -137,76 +148,109 @@ func (e *Extractor) extract(text string) []Candidate {
 			buf[i] = ' '
 		}
 	}
-	for _, loc := range reTrojanURL.FindAllStringIndex(text, -1) {
-		if c, ok := parseTrojanURL(text[loc[0]:loc[1]]); ok {
-			emit(c)
+	// Gate 0: both share-link patterns are "scheme://…" under (?i), so a
+	// case-folded literal search decides whether they can match at all. This
+	// runs before blanking — blanking is what removes them from the text the
+	// later passes see.
+	if containsFoldASCII(text, "trojan://") {
+		for _, loc := range reTrojanURL.FindAllStringIndex(text, -1) {
+			if c, ok := parseTrojanURL(text[loc[0]:loc[1]]); ok {
+				emit(c)
+			}
+			blank(loc[0], loc[1])
 		}
-		blank(loc[0], loc[1])
 	}
-	for _, loc := range reVLESSURL.FindAllStringIndex(text, -1) {
-		if c, ok := parseVLESSURL(text[loc[0]:loc[1]]); ok {
-			emit(c)
+	if containsFoldASCII(text, "vless://") {
+		for _, loc := range reVLESSURL.FindAllStringIndex(text, -1) {
+			if c, ok := parseVLESSURL(text[loc[0]:loc[1]]); ok {
+				emit(c)
+			}
+			blank(loc[0], loc[1])
 		}
-		blank(loc[0], loc[1])
 	}
 	if buf != nil {
 		text = string(buf)
 	}
 
-	// 1) scheme://ip:port (explicit protocol)
-	for _, m := range reSchemeV4.FindAllStringSubmatch(text, -1) {
-		if len(m) != 4 {
-			continue
-		}
-		port, ok := parsePort(m[3])
-		if !ok {
-			continue
-		}
-		emit(Candidate{Host: m[2], Port: port, Schema: normScheme(m[1])})
-	}
-	// 2) bare ip:port — use indices to reject partial IP matches (e.g. 29.30.31.3 from 29.30.31.32)
-	for _, m := range reBareV4.FindAllStringSubmatchIndex(text, -1) {
-		if len(m) != 6 {
-			continue
-		}
-		host := text[m[2]:m[3]]
-		if !validHost(host) {
-			continue
-		}
-		// Reject partial IP matches: if the IP is followed by .digit in the original text,
-		// it's a prefix of a longer dotted quad (e.g. 29.30.31.3 from 29.30.31.32).
-		if m[3] < len(text) && text[m[3]] == '.' {
-			if m[3]+1 < len(text) && text[m[3]+1] >= '0' && text[m[3]+1] <= '9' {
+	// One pre-scan decides for everything below that needs a dotted quad
+	// (reBareV4, the spys pass and every site pattern whose source starts with
+	// the IPv4 group). Computed after blanking: blanking only ever removes
+	// text, so a quad seen before it might already be gone.
+	ipv4 := hasIPv4Token(text)
+
+	// 1) scheme://ip:port (explicit protocol) — every match contains "://"
+	if strings.Contains(text, "://") {
+		for _, m := range reSchemeV4.FindAllStringSubmatch(text, -1) {
+			if len(m) != 4 {
 				continue
 			}
+			port, ok := parsePort(m[3])
+			if !ok {
+				continue
+			}
+			emit(Candidate{Host: m[2], Port: port, Schema: normScheme(m[1])})
 		}
-		portStr := text[m[4]:m[5]]
-		port, ok := parsePort(portStr)
-		if !ok {
-			continue
-		}
-		emit(Candidate{Host: host, Port: port})
 	}
-	// 3) [ipv6]:port
-	for _, m := range reBareV6.FindAllStringSubmatch(text, -1) {
-		if len(m) != 3 {
-			continue
+	// 2) bare ip:port — use indices to reject partial IP matches (e.g. 29.30.31.3 from 29.30.31.32)
+	// Without a dotted quad in the body neither this pass nor the spys pass
+	// can produce anything, so both are skipped by the one pre-scan above.
+	if ipv4 {
+		for _, m := range reBareV4.FindAllStringSubmatchIndex(text, -1) {
+			if len(m) != 6 {
+				continue
+			}
+			host := text[m[2]:m[3]]
+			if !validHost(host) {
+				continue
+			}
+			// Reject partial IP matches: if the IP is followed by .digit in the original text,
+			// it's a prefix of a longer dotted quad (e.g. 29.30.31.3 from 29.30.31.32).
+			if m[3] < len(text) && text[m[3]] == '.' {
+				if m[3]+1 < len(text) && text[m[3]+1] >= '0' && text[m[3]+1] <= '9' {
+					continue
+				}
+			}
+			portStr := text[m[4]:m[5]]
+			port, ok := parsePort(portStr)
+			if !ok {
+				continue
+			}
+			emit(Candidate{Host: host, Port: port})
 		}
-		host := m[1]
-		if net.ParseIP(host) == nil {
-			continue
-		}
-		port, ok := parsePort(m[2])
-		if !ok {
-			continue
-		}
-		emit(Candidate{Host: host, Port: port})
 	}
-	// 3b) spys.one-style JS-obfuscated ports (computed, no browser needed)
-	extractSpys(text, emit)
+	// 3) [ipv6]:port — every match starts with "["
+	if strings.Contains(text, "[") {
+		for _, m := range reBareV6.FindAllStringSubmatch(text, -1) {
+			if len(m) != 3 {
+				continue
+			}
+			host := m[1]
+			if net.ParseIP(host) == nil {
+				continue
+			}
+			port, ok := parsePort(m[2])
+			if !ok {
+				continue
+			}
+			emit(Candidate{Host: host, Port: port})
+		}
+	}
+	// 3b) spys.one-style JS-obfuscated ports (computed, no browser needed).
+	// reSpysWrite starts with the IPv4 group, so it needs the same quad.
+	if ipv4 {
+		extractSpys(text, emit)
+	}
 
-	// 4) site-specific patterns from regexp.txt
-	for _, re := range e.patterns {
+	// 4) site-specific patterns from regexp.txt. Each one is a full pass over
+	// the body — 61 of them measured 215 of the 260 ms a real 128 KB page
+	// costs — so the ones whose own source proves them impossible to match are
+	// skipped. Patterns that merely start with a literal ("<td…") are NOT
+	// gated: Go's regexp already jumps from literal-prefix to literal-prefix
+	// internally, and measuring that gate at 1 ms of 184 ms said so.
+	for i, re := range e.patterns {
+		if e.skips(i, ipv4) {
+			continue
+		}
 		idxs := re.FindAllStringSubmatchIndex(text, -1)
 		for _, m := range idxs {
 			switch {
@@ -245,263 +289,6 @@ func (e *Extractor) extract(text string) []Candidate {
 	return out
 }
 
-// maxBase64Body bounds what will be decoded. A 200 MB page is not a base64
-// blob worth the CPU, and a mirror that publishes that much encoded text is not
-// a mirror.
-const maxBase64Body = 8 << 20
-
-// tryBase64Text decodes body when the whole thing is one base64 blob. It
-// returns "" for anything else: the payload has to be *entirely* base64
-// alphabet plus whitespace, because a single stray byte means decoding a page
-// whose real content is the plain text on the first pass anyway.
-//
-// Padding is optional. Many mirrors emit unpadded base64 (long URLs, streaming
-// writers), and rejecting those loses the source entirely.
-func tryBase64Text(body []byte) string {
-	if len(body) < 64 || len(body) > maxBase64Body {
-		return ""
-	}
-	// Sample first: the walk below rejects at the first non-alphabet byte, so
-	// a body that is base64 for megabytes and junk at the end costs a full
-	// scan to learn what four probes already show. Whitespace is skipped at
-	// the sample points for the same reason the walk skips it.
-	for _, i := range []int{0, len(body) / 4, len(body) / 2, 3 * len(body) / 4} {
-		c := body[i]
-		if c == '\r' || c == '\n' || c == '\t' || c == ' ' || isBase64Byte(c) {
-			continue
-		}
-		return ""
-	}
-	var buf []byte
-	for _, c := range body {
-		switch {
-		case c == '\r', c == '\n', c == '\t', c == ' ':
-			// Whitespace between lines is normal in a wrapped blob.
-		case isBase64Byte(c):
-			buf = append(buf, c)
-		default:
-			return "" // real page content: the plain-text pass owns this
-		}
-	}
-	dec, err := base64.RawStdEncoding.DecodeString(string(buf))
-	if err != nil {
-		if dec, err = base64.StdEncoding.DecodeString(string(buf)); err != nil {
-			return ""
-		}
-	}
-	if !looksLikeProxyText(dec) {
-		return ""
-	}
-	return string(dec)
-}
-
-func isBase64Byte(c byte) bool {
-	switch {
-	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-		return true
-	case c == '+', c == '/', c == '=':
-		return true
-	}
-	return false
-}
-
-// parseTrojanURL parses one trojan:// share link into a Candidate.
-// Format: trojan://password@host:port?sni=...&type=...&security=...#remarks
-//
-// Only raw-TCP trojan is accepted (type empty/tcp/raw, security anything but
-// reality): ws/grpc/xhttp need a different transport and reality needs the
-// uTLS handshake — entries for those would burn a full check for a dial that
-// cannot succeed, so they are rejected here, not in the checker.
-//
-// The password is kept in URL form (still percent-encoded): the handshake
-// decodes it once, and raw storage keeps the queue file a lossless round
-// trip for passwords containing #/@/?.
-func parseTrojanURL(token string) (Candidate, bool) {
-	rest := token
-	if len(rest) < len("trojan://") || !strings.EqualFold(rest[:9], "trojan://") {
-		return Candidate{}, false
-	}
-	rest = rest[9:]
-	if i := strings.IndexByte(rest, '#'); i >= 0 {
-		rest = rest[:i] // remarks (emoji, source tags)
-	}
-	query := ""
-	if i := strings.IndexByte(rest, '?'); i >= 0 {
-		query, rest = rest[i+1:], rest[:i]
-	}
-	var typ, security, sni string
-	if query != "" {
-		q, err := url.ParseQuery(query)
-		if err != nil {
-			return Candidate{}, false
-		}
-		typ = strings.ToLower(q.Get("type"))
-		security = strings.ToLower(q.Get("security"))
-		sni = q.Get("sni")
-	}
-	switch typ {
-	case "", "tcp", "raw":
-	default:
-		return Candidate{}, false
-	}
-	if security == "reality" {
-		return Candidate{}, false
-	}
-	// LastIndex: passwords may contain @ (observed in the wild).
-	at := strings.LastIndex(rest, "@")
-	if at <= 0 {
-		return Candidate{}, false // no credentials: can never validate
-	}
-	pw := rest[:at]
-	if len(pw) == 0 || len(pw) > 256 {
-		return Candidate{}, false
-	}
-	host, portStr, err := net.SplitHostPort(rest[at+1:])
-	if err != nil {
-		return Candidate{}, false
-	}
-	port, ok := parsePort(portStr)
-	if !ok {
-		return Candidate{}, false
-	}
-	if !validShareHost(host) {
-		return Candidate{}, false
-	}
-	return Candidate{
-		Schema: "trojan", Host: host, Port: port,
-		TrojanPassword: pw, TrojanSNI: sni, TrojanNoTLS: security == "none",
-	}, true
-}
-
-// parseVLESSURL parses one vless:// share link into a Candidate.
-// Format: vless://uuid@host:port?encryption=none&security=tls&sni=...&flow=...&pbk=...&sid=...&type=...#remarks
-//
-// Same transport rule as trojan (TCP/raw only; ws/grpc/xhttp rejected), plus
-// security=none is accepted — dialVLESS runs the handshake on raw TCP then.
-// REALITY (security=reality with pbk) rides the existing uTLS path.
-func parseVLESSURL(token string) (Candidate, bool) {
-	rest := token
-	if len(rest) < len("vless://") || !strings.EqualFold(rest[:8], "vless://") {
-		return Candidate{}, false
-	}
-	rest = rest[8:]
-	if i := strings.IndexByte(rest, '#'); i >= 0 {
-		rest = rest[:i] // remarks
-	}
-	query := ""
-	if i := strings.IndexByte(rest, '?'); i >= 0 {
-		query, rest = rest[i+1:], rest[:i]
-	}
-	var typ, security, flow, sni, pbk, sid, spider string
-	if query != "" {
-		q, err := url.ParseQuery(query)
-		if err != nil {
-			return Candidate{}, false
-		}
-		typ = strings.ToLower(q.Get("type"))
-		security = strings.ToLower(q.Get("security"))
-		flow = q.Get("flow")
-		sni = q.Get("sni")
-		pbk = q.Get("pbk")
-		sid = q.Get("sid")
-		spider = q.Get("spider")
-	}
-	switch typ {
-	case "", "tcp", "raw":
-	default:
-		return Candidate{}, false
-	}
-	switch security {
-	case "", "tls", "reality", "none":
-	default:
-		return Candidate{}, false
-	}
-	// LastIndex: UUIDs do not contain @, but be liberal like the trojan
-	// parser — a malformed cut hurts less than a dropped node.
-	at := strings.LastIndex(rest, "@")
-	if at <= 0 {
-		return Candidate{}, false // no UUID: can never validate
-	}
-	uuid := rest[:at]
-	if len(uuid) == 0 || len(uuid) > 128 {
-		return Candidate{}, false
-	}
-	host, portStr, err := net.SplitHostPort(rest[at+1:])
-	if err != nil {
-		return Candidate{}, false
-	}
-	port, ok := parsePort(portStr)
-	if !ok {
-		return Candidate{}, false
-	}
-	if !validShareHost(host) {
-		return Candidate{}, false
-	}
-	return Candidate{
-		Schema: "vless", Host: host, Port: port,
-		VLESSUUID: uuid, VLESSFlow: flow, VLESSSNI: sni,
-		VLESSPbk: pbk, VLESSSid: sid, VLESSSpider: spider,
-		VLESSNoTLS: security == "none",
-	}, true
-}
-
-// validShareHost accepts IP literals and DNS names for share-link
-// extractors (trojan, vless). Single-label names are rejected: they are
-// local junk (or a password fragment), never a public server.
-func validShareHost(host string) bool {
-	if host == "" || len(host) > 253 {
-		return false
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return true
-	}
-	if !strings.Contains(host, ".") {
-		return false
-	}
-	for _, label := range strings.Split(host, ".") {
-		if len(label) == 0 || len(label) > 63 {
-			return false
-		}
-		for i := 0; i < len(label); i++ {
-			c := label[i]
-			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
-				c >= '0' && c <= '9' || c == '-' || c == '_' {
-				continue
-			}
-			return false
-		}
-		if label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-	}
-	return true
-}
-
-// looksLikeProxyText is the false-positive guard for the base64 pass. A body
-// made of base64 alphabet characters decodes to noise almost every time, and
-// extracting from noise is pure CPU. What a proxy list looks like: repeated
-// port numbers after addresses, one per line.
-func looksLikeProxyText(b []byte) bool {
-	digits, colons, newlines := 0, 0, 0
-	for _, c := range b {
-		if c == 0 {
-			return false // binary payload, not a list
-		}
-		switch c {
-		case '\n':
-			newlines++
-		case ':':
-			colons++
-		}
-		if c >= '0' && c <= '9' {
-			digits++
-		}
-	}
-	return newlines >= 2 && digits >= 8 || colons >= 16 && digits >= 16
-}
-
-// portBefore returns the last valid port number in the text preceding a match
-// group (used by single-group patterns like "port-8080 ... 1.2.3.4").
 func portBefore(s string) (int, bool) {
 	end := len(s)
 	for end > 0 {
@@ -590,126 +377,4 @@ func schemaNear(text string, start, end int) string {
 		return "https"
 	}
 	return ""
-}
-
-// extractSpys decodes spys.one-style JS-obfuscated ports without a browser:
-// each document.write("..."+(a^b)+(c^d)...) term after an IP evaluates to one
-// port digit, with the variables defined in script blocks on the same page.
-func extractSpys(text string, emit func(Candidate) bool) {
-	writes := reSpysWrite.FindAllStringSubmatchIndex(text, -1)
-	if len(writes) == 0 {
-		return
-	}
-	env := collectSpysVars(text)
-	for _, m := range writes {
-		if len(m) < 6 {
-			continue
-		}
-		host := text[m[2]:m[3]]
-		if !validHost(host) {
-			continue
-		}
-		terms := reSpysTerm.FindAllStringSubmatch(text[m[4]:m[5]], -1)
-		if len(terms) == 0 {
-			continue
-		}
-		var digits strings.Builder
-		memo := make(map[string]int, 32)
-		ok := true
-		for _, t := range terms {
-			a, aok := spysResolve(t[1], env, memo, 0)
-			b, bok := spysResolve(t[2], env, memo, 0)
-			if !aok || !bok {
-				ok = false
-				break
-			}
-			d := a ^ b
-			if d < 0 || d > 9 {
-				ok = false // not a port digit: pattern misapplied
-				break
-			}
-			digits.WriteByte(byte('0' + d))
-		}
-		if !ok {
-			continue
-		}
-		port, ok := parsePort(digits.String())
-		if !ok {
-			continue
-		}
-		emit(Candidate{Host: host, Port: port, Schema: schemaNear(text, m[0], m[1])})
-	}
-}
-
-// collectSpysVars gathers name=value assignments from page script blocks.
-func collectSpysVars(text string) map[string]string {
-	raw := make(map[string]string, 64)
-	for _, sm := range reSpysScript.FindAllStringSubmatch(text, -1) {
-		if len(sm) != 2 {
-			continue
-		}
-		for _, am := range reSpysAssign.FindAllStringSubmatch(sm[1], -1) {
-			if len(am) != 3 {
-				continue
-			}
-			raw[am[1]] = am[2]
-		}
-	}
-	return raw
-}
-
-// spysResolve evaluates a variable to an int (literal or xor expression).
-func spysResolve(name string, raw map[string]string, memo map[string]int, depth int) (int, bool) {
-	if v, ok := memo[name]; ok {
-		return v, true
-	}
-	if depth > 4 {
-		return 0, false
-	}
-	expr, ok := raw[name]
-	if !ok {
-		return 0, false
-	}
-	if v, ok := spysOperand(expr, raw, memo, depth); ok {
-		memo[name] = v
-		return v, true
-	}
-	return 0, false
-}
-
-// spysOperand evaluates either an int literal or a binary a^b expression.
-func spysOperand(expr string, raw map[string]string, memo map[string]int, depth int) (int, bool) {
-	expr = strings.TrimSpace(expr)
-	if expr == "" {
-		return 0, false
-	}
-	if strings.Contains(expr, "^") {
-		parts := strings.SplitN(expr, "^", 2)
-		a, aok := spysValue(strings.TrimSpace(parts[0]), raw, memo, depth+1)
-		b, bok := spysValue(strings.TrimSpace(parts[1]), raw, memo, depth+1)
-		if !aok || !bok {
-			return 0, false
-		}
-		return a ^ b, true
-	}
-	return spysValue(expr, raw, memo, depth+1)
-}
-
-// spysValue resolves a single token: int literal or variable reference.
-func spysValue(tok string, raw map[string]string, memo map[string]int, depth int) (int, bool) {
-	isNum := len(tok) > 0
-	for i := 0; i < len(tok); i++ {
-		if tok[i] < '0' || tok[i] > '9' {
-			isNum = false
-			break
-		}
-	}
-	if isNum {
-		var v int
-		for i := 0; i < len(tok); i++ {
-			v = v*10 + int(tok[i]-'0')
-		}
-		return v, true
-	}
-	return spysResolve(tok, raw, memo, depth)
 }

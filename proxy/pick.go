@@ -111,11 +111,13 @@ var ErrNoProven = errors.New("no proven proxy in the queue")
 // lock.
 func (b *Bucket) pickProvenLocked(proven []*Proxy, probes int, skip map[string]struct{}, now int64) (*Proxy, error) {
 	if fresh := b.freshHotLocked(now); len(fresh) > 0 {
-		if best := b.rankPick(fresh, probes, skip, now); best != nil {
+		if best := b.rankPick(fresh, probes, skip, now, false); best != nil {
 			return best, nil
 		}
 	}
-	if best := b.rankPick(proven, probes, skip, now); best != nil {
+	// verified: proven is a cached snapshot, not the live queue, so every
+	// sample still has to be checked against the index (see rankPick).
+	if best := b.rankPick(proven, probes, skip, now, true); best != nil {
 		return best, nil
 	}
 	return nil, ErrNoProven
@@ -175,7 +177,18 @@ func (b *Bucket) freshHotLocked(now int64) []*Proxy {
 // (proof freshness, consecutive failures, latency, in-flight load), or nil if
 // every sample was in skip or no longer in the queue. Callers hold at least a
 // read lock.
-func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, nowNanos int64) *Proxy {
+//
+// verifyLive says whether a sample must be re-checked against b.index. That
+// lookup is not cheap: it hashes the proxy's whole URL string, once per probe
+// (profiled at 50% of PickHealthy at 70k entries), so it is only worth paying
+// for a pool that can be stale. The live slices (b.proxies, b.hot) are mutated
+// exclusively under the write lock, so while this read lock is held every one
+// of their elements IS in the index — pass false for them. A cached snapshot
+// that may lag freshRebuildInterval behind (freshPool's proven cache) can
+// still hold an entry removed since; it must never win a pick, because
+// dropping the sample costs one wasted attempt and serving it costs a failed
+// dial — pass true there.
+func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, nowNanos int64, verifyLive bool) *Proxy {
 	n := len(pool)
 	if n == 0 {
 		return nil
@@ -194,16 +207,20 @@ func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, n
 	var bestFresh, bestFails, bestLat, bestLoad int64
 	for i := 0; i < probes; i++ {
 		p := pool[rand.IntN(n)]
-		// The proven pool and the hot tail are snapshots: freshPool may lag up
-		// to freshRebuildInterval behind, so a removed proxy can still sit in
-		// `pool` here. It must never win a pick — dropping it costs one wasted
-		// sample, serving it costs a failed dial.
-		key := p.Key()
-		if _, live := b.index[key]; !live {
-			continue
-		}
-		if _, bad := skip[key]; bad {
-			continue
+		// Both guards are folded behind their own precondition: an empty skip
+		// map is the common case (the first pick of a request has no failover
+		// history yet), and hashing p.Key() for a lookup that cannot reject
+		// anything was costing a Key() call per probe on its own.
+		if verifyLive || len(skip) > 0 {
+			key := p.Key()
+			if verifyLive {
+				if _, live := b.index[key]; !live {
+					continue
+				}
+			}
+			if _, bad := skip[key]; bad {
+				continue
+			}
 		}
 		f := p.ConsecFails()
 		l := p.latencyEMAValue()
