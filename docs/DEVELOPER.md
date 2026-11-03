@@ -150,7 +150,32 @@ go test ./main/ -run TestAdmin -v
 ### Test Conventions
 - Use `t.TempDir()` for all file I/O
 - No network access in unit tests (use in-test CONNECT proxy from `proxy/pipeline_test.go`)
-- `go test -race` does NOT work (no gcc/cgo) — don't try to fix
+- `go test -race` does not build on the Windows box itself (no gcc/cgo) — run it through WSL, see "Race detector via WSL" below
+
+### Race detector via WSL
+
+The Windows box has no gcc, so `-race` cannot compile there. The
+OracleLinux_7_9 (WSL1) distro runs the full race suite:
+
+```powershell
+wsl -d OracleLinux_7_9 -u root -- bash -lc 'cd /mnt/i/proj/protator && go test -race ./... -count=1'
+```
+
+- Toolchain: go1.27.3 in `/usr/local/go` (shims in `/usr/local/bin`), side by
+  side with yum's go1.20.12 — the latter is too old even to parse the module's
+  `go 1.26.1` directive, don't let `go version` inside WSL fool you. gcc
+  4.8.5 / glibc 2.17 are enough for TSAN; verified on WSL1.
+- Quoting through PowerShell: single-quote the whole bash command. Double
+  quotes make PowerShell expand `$(...)` before bash ever sees it, and the
+  leaked Windows `PATH` (parens and all) then breaks bash parsing.
+- For anything multi-step, write a script file and run
+  `tr -d '\r' < script.sh > /tmp/s.sh && bash /tmp/s.sh`: CRLF from Windows
+  writers kills bash, and inline one-liners have twice silently skipped
+  statements when a connection dropped.
+- Full suite under `-race` takes a few minutes; a single package probe ~25 s.
+  A WSL binary built with `go build -o ... ./main` also runs the real server
+  under Linux for memory/CPU measurements — work on a scratch copy of
+  `config/` + `data/`, never the production files.
 
 ## 6. Logging Conventions
 
@@ -168,7 +193,7 @@ log.Printf("revalidate: dropped %s (%v)", p.URL(), err)
 
 ## 7. Configuration
 
-Defaults live in `Config.fillDefaults()` (`proxy/config.go`); `main/config.toml` mirrors them with comments. **Change both** when adding new tunables.
+Defaults live in `Config.fillDefaults()` (`proxy/config.go`); `config/config.toml` mirrors them with comments. **Change both** when adding new tunables.
 
 ### Key configs for developers
 ```toml
@@ -188,7 +213,7 @@ max_candidates_per_site = 1000
 
 | Pitfall | Consequence | Fix |
 |---------|-------------|-----|
-| Run `go run ./main` from repo root | Config files not found | Always `cd main; go run .` |
+| Run from `main/` ("it seems to work") | A stale gitignored `main/config/` duplicate from the old layout gets read instead — outdated knobs, wrong site list; on a fresh clone it just fails | Run from repo root: `go run ./main -config config/config.toml` |
 | Add mutex to `Proxy` | Serving path contention, allocations | Use `sync/atomic` only |
 | Make `emit` non-blocking | Lost candidates under load | Keep blocking; channel buffer is backpressure |
 | Shorten `pick_fresh_window` below `revalidate_interval` | Picker falls back to unproven bulk | Keep `pick_fresh_window > revalidate_interval` |
@@ -260,7 +285,7 @@ logs/serve.log       - dial events, failover, evictions
 logs/system.log      - queue stats, pool reprobe, revalidation, admin, noise
 ```
 
-## 10. VLESS Development
+## 10. VLESS / Trojan Development
 
 ### VLESS URL format
 ```
@@ -272,28 +297,30 @@ vless://<uuid>@<host>:<port>?flow=<flow>&sni=<sni>&pbk=<base64url>&sid=<sid>&spi
 2. Client: `dialVLESSRealty` → x25519 keypair → HKDF-SHA256 keys → uTLS Chrome HelloID
 3. Encrypted ClientHello sent as single padded packet
 
-### Testing VLESS locally
+### Testing VLESS / trojan locally
 ```go
-// In test, create a VLESS proxy config
-p := &proxy.Proxy{
-    Schema: "vless",
-    Host: "test.example.com",
-    Port: 443,
-}
-p.SetVLESS("uuid...", "xtls-rprx-vision", "test.example.com", "pbk...", "sid...", "")
+// VLESS: uuid + flow/sni/pbk/sid/spider + noTLS (security=none) — 7 args
+p := &proxy.Proxy{Schema: "vless", Host: "test.example.com", Port: 443}
+p.SetVLESS("uuid...", "xtls-rprx-vision", "test.example.com", "pbk...", "sid...", "spider...", false)
+
+// Trojan: password + optional SNI ("" = host) + noTLS (security=none) — 3 args
+t := &proxy.Proxy{Schema: "trojan", Host: "node.example.com", Port: 443}
+t.SetTrojan("password", "node.example.com", false)
 ```
+
+Credentials must be stamped on the `Proxy` **before** it is published to the
+bucket (`Check` does this pre-publication): they are part of the identity the
+same way host:port is — two trojan entries on one host with different
+passwords are distinct candidates, pool lines and queue rows everywhere.
 
 ## 11. Admin UI Development
 
-Embedded assets in `main/adminassets.go` as string constants (`indexHTML`, `adminCSS`, `adminJS`). No external assets/CDN.
+The UI lives in real files — `main/adminweb/{index.html,admin.css,admin.js}` — embedded by `main/adminassets.go` (`indexHTML`/`adminCSS`/`adminJS` are the embedded vars, not the source). Edit the files and rebuild the binary; no external assets/CDN.
 
 ### Adding a new tab
-1. Add `<section id="newtab" class="panel">` in `indexHTML`
-2. Add tab button in `<nav class="tabs">`
-2. Add API handler in the file for its subject (`admin_sources.go`,
-   `adminproxies.go`, `adminapi.go`), wire it in `routes()` in `admin.go` (`handleNewtab`)
-3. Add JS `loadNewtab()` + render function in `adminJS`
-4. Register route in `admin.go:routes()`
+1. Add `<section id="newtab" class="panel">` + the tab button in `<nav class="tabs">` in `adminweb/index.html`
+2. Add the API handler in the file for its subject (`admin_sources.go`, `adminproxies.go`, `adminapi.go`) and wire it into `routes()` in `admin.go`
+3. Add `loadNewtab()` + render function in `adminJS` (i.e. in `adminweb/admin.js`)
 
 ### WebSocket protocol
 ```json
@@ -333,8 +360,8 @@ go build ./...
 # Format check
 gofmt -l main proxy util
 
-# Single test with race detector (requires gcc - won't work here)
-# go test -race ./proxy/ -run TestName
+# Single test with race detector (no gcc on Windows — run via WSL, see §5)
+wsl -d OracleLinux_7_9 -u root -- bash -lc 'cd /mnt/i/proj/protator && go test -race ./proxy/ -run TestName -count=1'
 
 # Profile the running process (served on the admin port, behind admin_token)
 go tool pprof http://127.0.0.1:9090/debug/pprof/profile?seconds=30

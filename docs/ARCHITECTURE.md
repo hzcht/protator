@@ -127,7 +127,7 @@ flowchart TB
     PORT{"port 1-65535?<br/>not bogon/private?"}
     PRE["TCP pre-dial (tcp_timeout ~4s)<br/>fast reject of dead hosts"]
     SCHEMA{"explicit schema?"}
-    PROBE["probe in probe_order<br/>(http, socks5, socks4, https, vless)"]
+    PROBE["probe in probe_order<br/>(http, socks5, socks4, https —<br/>trojan/vless always carry an explicit schema)"]
     ANON["anonymity race<br/>all self-IP services in parallel<br/>first non-self IP wins"]
     TRANS{"all answers = our IP?"}
     CONTENT["content race<br/>all checkers.toml tests in parallel<br/>first full template match wins"]
@@ -169,7 +169,9 @@ For `schema="vless"` the checker:
 | Entrypoint | `main/proxy.go` | Loads config, seeds bucket, starts the supervised checker worker pool, collector, revalidator, saver, stats logger, 3 listeners + admin. Helpers: `buildGoproxy`, `saveQueue`. The validation pipeline itself (`RunCheckLoop`, `RevalidateSeeded`) lives in `proxy/pipeline.go`. |
 | Bucket | `proxy/bucket.go` + `proxy/pick.go` + `proxy/bucket_live.go` | Concurrency-safe live queue (dedup by full URL, `Random`, `Subscribe` change notifications — a subscriber list: the forward dialer and the admin WebSocket both register, neither replaces the other), curated `hot` tail plus the cached proven pool (`freshPool`), per-source counts, `PickHealthy`/`Random`. The serving-path policy (proof tiers, `rankPick`, `betterPick`) is `pick.go`; the admin rendering surface (`LiveList`/`LiveListPage`, hot/served/checked/all) is `bucket_live.go`. |
 | ForwardDialer | `proxy/upstream.go` | `DialContext` with failover + passive feedback; `loop` set dials known-proxy addresses directly (anti self-loop); `NewTransport` (no keep-alives). |
-| Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT, optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections), `dialVLESS` (uTLS + REALITY + VLESS handshake). |
+| ProxyTransport | `proxy/transport.go` | Request-level failover for plain HTTP (retries with a fresh transport, body rewound for retries), interstitial + block-page detection with a bounded `serve_sniff_timeout` sniff, device-junk/network-error classification. |
+| Sticky sessions | `proxy/sticky.go` | `PinPool`: pins a proxy to a connection/session key (`serve_pin_ttl`, optional `X-Sticky-Session` header), LRU eviction + reverse index; a pinned proxy's death rotates to a fresh one. |
+| Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT, optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections), `dialVLESS` (uTLS + REALITY + VLESS handshake; `security=none` runs it on raw TCP), `dialTrojan` (TLS-or-plaintext + SHA224 password handshake). |
 | Checker | `proxy/checker.go` + `proxy/checker_probe.go` | Section 3: decisions (`Check`, `Revalidate`, `fullCheck`, bogon/self-IP rules). The evidence probes against the outside world — exit IP, content/leak verdicts, the end-to-end serving probe, the per-proxy transport, GeoIP (MaxMind MMDB) — are `checker_probe.go`. |
 | Collector | `proxy/collector.go` + `proxy/collect_fetch.go` | Section 1 left side. Cycle/scheduling: cookie jar, browser-grade headers, per-site cooldown, priority-ordered site walk with `max_sites_per_cycle` / `max_candidates_per_site` caps, blocking `emit`. One fetch: 429/503 + `Retry-After`, binary content-type guard, captcha/block-page classification, per-proxy transport cache, JS-protection hints in logs. |
 | Site telemetry | `proxy/sitestats.go` | `SiteRegistry`: per-source emitted/found/alive/fails, cooldown, deterministic rotation of untried sources, bounded to 200k tracked URLs. |
@@ -220,13 +222,15 @@ a loud warning, because the page can edit `sites.txt` and drop proxies.
 
 | Route | Purpose |
 |-------|---------|
-| `GET /` | Page with four tabs: live proxies (+ retest), per-source stats (+ cooldown reset), 24h history graphs, `sites.txt` editor. Header: `Collect now` and metric tiles. |
+| `GET /` | Page with five tabs: live proxies (+ retest/drop), per-source stats (+ cooldown reset), 24h history graphs, `sites.txt` editor, logs tail. Header: `Collect now`, `Shutdown` and metric tiles. |
 | `GET /health` | Counters + loop heartbeats (last collector cycle / revalidation pass / queue save) + gauges (queue, proven, pool, channel depth, goroutines, WS clients) as JSON. |
 | `GET /ready` | 200 while the queue has **proven** proxies (`Bucket.ProvenCount`), 503 otherwise. Never on `Len()`: an unverified queue must not report healthy. |
 | `GET /api/sources` | One row per tracked source: alive, yield %, emitted, found, cycles, fails, cooldown, last note. |
 | `GET /api/proxies?scope=…` | `hot` (curated tail), `served` (carried real traffic), `checked` (validated recently), `all` (whole queue). `&format=text|csv|jsonl`, `&country=US`, `&asn=AS12345`. |
 | `GET/POST/DELETE /api/sites` | Read and edit `sites.txt` in place: validated, normalized, atomic write, `.bak` kept, empty list refused. Bulk delete via `DELETE` with `{"urls": [...]}`. |
 | `POST /api/proxies/revalidate` | Force revalidation of selected proxies: `{"urls": [...], "keys": [...]}`. |
+| `POST /api/proxies/drop` | Remove selected proxies from the live queue immediately: `{"urls": [...]}` → `{"dropped": N, "not_found": [...]}`. |
+| `POST /api/shutdown` | Graceful stop: drain listeners, stop workers, final queue save, pool flush. |
 | `POST /api/sources/cooldown` | Clear a source's failure cooldown, so the next cycle fetches it in full. |
 | `POST /api/collector/wake` | Force a collector cycle now (the same channel the empty-queue watchdog uses). |
 | `GET /api/metrics` | `proxy.Stats` counters + per-second rates + gauges; `&format=text` for Prometheus. |
@@ -297,7 +301,20 @@ port (2 bytes, big endian)
 ### 9.3 uTLS fingerprinting
 Uses `github.com/refraction-networking/utls` with `HelloChrome_Auto` to match
 real browser TLS fingerprint. REALITY servers validate the fingerprint before
-decrypting the ClientHello.
+decrypting the ClientHello. `security=none` share links skip uTLS/REALITY and
+run the same handshake on raw TCP (`VLESSNoTLS`).
+
+### 9.4 Trojan share links
+
+`parseTrojanURL` (`proxy/extract_share.go`) — raw TCP only (`type=tcp` or
+absent; `ws`/`grpc`/`xhttp` and any `reality` transport are rejected at
+extraction). The password is kept in URL form so `#`/`@` survive the
+round trip, and blanked in bare-IP socket copies so the same host:port from a
+plain list is not double-emitted. `security=tls` (default) dials TLS with
+SNI-or-host and `InsecureSkipVerify` (self-signed is the norm); `none` is
+plaintext. The handshake carries SHA224(password). Credentials ride
+Candidate → Proxy → dial → pool/queue, so the same host:port with different
+passwords are distinct entries everywhere (bucket dedup is by full URL).
 
 ## 10. GeoIP integration
 
@@ -321,6 +338,8 @@ decrypting the ClientHello.
 | `serve_total_timeout` | 25s | Total budget per request |
 | `serve_connect_probe` | 3s | CONNECT first-byte deadline |
 | `serve_response_probe` | 3s | HTTP first-byte deadline |
+| `serve_sniff_timeout` | 3s | Budget for block-page body sniffing on small 200s |
+| `serve_require_proven` | false | Fail-closed serving: pick only proven tiers, `ErrNoProven` otherwise |
 | `admin_listen` | `127.0.0.1:9090` | Admin UI (empty = disabled) |
 
 ### `[checker]`
@@ -360,6 +379,8 @@ decrypting the ClientHello.
 | `revalidate_interval` | 15m | Full revalidation interval |
 | `revalidate_fresh_servers` | 15m | Skip recently-served in revalidation |
 | `revalidate_max_per_pass` | 30000 | Budget per revalidation pass |
+| `revalidate_seed_rate` | 200/s | Startup re-seed drain rate into the checker (`RevalidateSeeded`) |
+| `revalidate_seed_max` | 5000 | Cap on seeded proxies re-checked at startup |
 
 ## 12. Files on disk (do not delete)
 

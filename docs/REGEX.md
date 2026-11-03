@@ -13,6 +13,7 @@ always run first:
 | `[ipv6]:port` | bracketed literal only; a bare IPv6 is ambiguous by design |
 | spys.one JS ports | `document.write(":"+(a^b)+...)` decoded without a browser |
 | whole-body base64 | padded or unpadded; see below |
+| `trojan://` / `vless://` share links | `proxy/extract_share.go`; raw TCP only, credentials carried end to end |
 
 The per-site patterns in `regexp.txt` exist for the shapes where the address and
 the port are **not adjacent** — tables, JSON records, path-style links. Groups
@@ -52,20 +53,23 @@ These look like limitations and are not:
 
 ## Missing on purpose
 
-- **Authenticated proxies** (`user:pass@host:port`, `host:port:user:pass`):
-  the checker and dialer have no credential path, so such a list would only
-  produce proxies that fail validation. If this is ever added, it is a schema
-  change first (`http://user:pass@` through `ParseProxyLine`), then a regex.
-- **Trojan/Shadowsocks endpoints**: no dial path exists, so their patterns were
-  removed from `regexp.txt` outright — every match burned a full multi-protocol
-  check for a candidate that could never validate. See the NOTE in that file.
-- **VLESS URLs** (`vless://uuid@host:port?...`): the dial path exists
-  (`dialVLESS`), but the chain is broken in four places — the extractor drops
-  the UUID, `Candidate`'s VLESS fields are never filled from extraction, the
-  checker never copies them onto the `Proxy`, and the pool does not persist
-  them. The pattern was removed for the same reason as above. Bringing it back
-  means wiring all four, including the `?flow=&sni=&pbk=&sid=` query params,
-  not just a regex.
+- **Authenticated HTTP/SOCKS proxies** (`user:pass@host:port`,
+  `host:port:user:pass`): the only credential pipeline is the trojan/vless
+  share-link forms; plain proxy schemes parse no credentials, so such a list
+  would only produce candidates that cannot survive validation. Adding it is a
+  schema → checker → dialer project first, a regex second.
+- **`ss://`** — no dial path exists. **`vmess://`** — needs a VMess AEAD
+  transport, a crypto feature, not regexps. Neither carries a pattern in
+  `regexp.txt`: every match would burn a full multi-protocol check on a
+  candidate that can never validate.
+
+Both trojan and VLESS share links have already crossed the line the other way:
+each used to be "missing on purpose" for exactly these reasons, then got wired
+end to end (`parseTrojanURL`/`parseVLESSURL` in `proxy/extract_share.go`,
+credentials through Candidate → Proxy → dial → pool, invalid transports such
+as `type=ws`/`grpc` rejected at extraction). `ss://` in fairness has no
+transport between "RE2 pattern" and "a dialable protocol" — that is why it
+stays out, and what any future protocol must bring with it.
 
 ## Where each pattern shape comes from
 
@@ -77,4 +81,4 @@ These look like limitations and are not:
 | `1.2.3.4,8080,US,anonymous` | CSV exports (proxifly, proxy-gatherer) |
 | `server: ip` + `port: N` | Clash/QuanX/Surge subscription blocks |
 | `data-proxy-ip` / `data-proxy-port` | newer panel themes |
-| `ss://…@ip:port`, `vless://…@ip:port` | protocol subscription lists |
+| `ss://…@ip:port`, `vless://…@ip:port`, `trojan://…` | protocol subscription lists |

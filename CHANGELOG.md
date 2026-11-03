@@ -7,6 +7,51 @@ has no release process yet and an unmarked change is a change nobody can find.
 
 ## [Unreleased]
 
+### Documentation
+
+- Docs re-synced against HEAD after the audit/optimization passes
+  (`problems.md` §12–§15). Everything below was verified against the code,
+  not proofread:
+  - **AGENTS.md**: working-directory gotcha told the truth (`-config` defaults
+    to `config/config.toml`; the old "fails to load config from root" claim was
+    backwards); `main/config/` exposed as a gitignored stale duplicate that
+    makes `go run` from `main/` *accidentally* pass on this box;
+    `main/logging.go`, `proxy/transport.go` and `proxy/sticky.go` added to the
+    layout; the duplicated `logfiles.go` bullet removed; a documentation map
+    (which doc to update when behavior changes) added; new conventions:
+    construction sites must fill `Proxy.keyCache`, retries multiply across
+    dial/request layers, half-close (`CloseWrite`) is opt-in per
+    `net.Conn` wrapper, `requests_total` is a Snapshot-time sum of the three
+    front counters (a fourth front must join the sum), `serve_require_proven`
+    fail-closed mode, and bench-number discipline (1–2s benchtime, ±20% box
+    noise).
+  - **README**: admin page is five tabs (missing **Logs** tab, drop, Shutdown),
+    trojan and fail-closed serving added to the feature list, validation step
+    mentions the trojan handshake.
+  - **ARCHITECTURE**: route table gained `/api/proxies/drop` and
+    `/api/shutdown`; page description five tabs; config reference gained
+    `serve_require_proven` / `serve_sniff_timeout` / `revalidate_seed_rate` /
+    `revalidate_seed_max` (verified: consumed at `main/proxy.go`); component
+    table gained `ProxyTransport` and `PinPool` rows and the trojan dial;
+    §9.4 documents trojan share links; `probe_order` diagram wording reflects
+    that trojan/vless always carry an explicit schema.
+  - **DEVELOPER**: `main/config.toml` → `config/config.toml`; the pitfall row
+    told to `cd main` was exactly backwards (and now explains the
+    `main/config/` trap); the `SetVLESS` test snippet now compiles (7 args)
+    and trojan got the symmetric mention; admin UI section describes real
+    files in `adminweb/` (the "string constants" wording predates the
+    `go:embed` change) and its numbered list lost a duplicated step; a
+    **Race detector via WSL** section added — the full `go test -race ./...`
+    now runs on OracleLinux_7_9 (WSL1) with go1.27.3 and passes with zero
+    data-race reports, so the old "does not work here, don't try" invariant
+    is retired (AGENTS.md points there).
+  - **OPS.md** (RU): the "fails from repo root" warning corrected (root is the
+    one reliable place; `main/config/` stale-copy trap spelled out) and the
+    accidental "300 воркеров" prose matched the actual 600.
+  - **REGEX**: trojan/vless share links moved to supported (table row +
+    "Missing on purpose" rewritten with the honest history of both protocols);
+    authenticated-HTTP and `ss`/`vmess` bullets stay, stating precisely why.
+
 ### Fixed — critical
 
 - **The checker pipeline never started.** The `stopWorkers` close was
