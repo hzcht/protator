@@ -53,11 +53,13 @@ These look like limitations and are not:
 
 ## Missing on purpose
 
-- **Authenticated HTTP/SOCKS proxies** (`user:pass@host:port`,
-  `host:port:user:pass`): the only credential pipeline is the trojan/vless
-  share-link forms; plain proxy schemes parse no credentials, so such a list
-  would only produce candidates that cannot survive validation. Adding it is a
-  schema → checker → dialer project first, a regex second.
+- **Column-order credential shapes** (`host:port:user:pass` and spys-style
+  permutations): the `user:pass@host:port` userinfo form is supported end to
+  end for `http`/`https`/`socks5` (raw percent-encoded `ProxyMeta.proxyAuth`,
+  Basic in the CONNECT handshake, RFC 1929 on socks5 — `proxy/auth_test.go`),
+  so the hard pipeline exists; these orderings are a parsing decision
+  (`ParseProxyLine`/the spys decoder), not a project. Socks4 auth is missing
+  *on protocol grounds* — the protocol has none.
 - **`ss://`** — no dial path exists. **`vmess://`** — needs a VMess AEAD
   transport, a crypto feature, not regexps. Neither carries a pattern in
   `regexp.txt`: every match would burn a full multi-protocol check on a

@@ -303,13 +303,27 @@ func ReadQueueLast(path string, maxLines int) []*Proxy {
 	return readQueueCapped(path, maxLines)
 }
 
-// queueLoadFailed latches a *read error* (not "file absent") on the queue
-// file: the first dirty save after such a load would overwrite the real file
-// with whatever the (empty) in-memory queue holds — an AV lock or a transient
-// I/O error turning into permanent data loss. The latch is cleared by the
-// next successful load (i.e. the next start) and by an explicit successful
-// read of the same path.
-var queueLoadFailed atomic.Bool
+// queueLoadFailed latches a *read error* (not "file absent") per queue path:
+// the first dirty save after such a load would overwrite the real file with
+// whatever the (empty) in-memory queue holds — an AV lock or a transient I/O
+// error turning into permanent data loss. Keyed by path because one global
+// flag used to be cleared by a successful read of a DIFFERENT file (proxy.lst
+// failed → good_proxies.last read fine → the save loop happily clobbered the
+// unreadable queue). The latch is cleared only by a successful read of the
+// same path (i.e. the next start).
+var queueLoadFailed sync.Map // path -> *atomic.Bool
+
+func setQueueLoadFailed(path string, failed bool) {
+	v, _ := queueLoadFailed.LoadOrStore(path, new(atomic.Bool))
+	v.(*atomic.Bool).Store(failed)
+}
+
+func queueLoadIsFailed(path string) bool {
+	if v, ok := queueLoadFailed.Load(path); ok {
+		return v.(*atomic.Bool).Load()
+	}
+	return false
+}
 
 func readQueueCapped(path string, maxLines int) []*Proxy {
 	lines, err := readLines(path)
@@ -320,11 +334,11 @@ func readQueueCapped(path string, maxLines int) []*Proxy {
 		if !os.IsNotExist(err) {
 			log.Printf("queue: cannot read %s: %v (the queue file will NOT be overwritten until a successful load)", path, err)
 			Stats.QueueLoadFailures.Add(1)
-			queueLoadFailed.Store(true)
+			setQueueLoadFailed(path, true)
 		}
 		return nil
 	}
-	queueLoadFailed.Store(false)
+	setQueueLoadFailed(path, false)
 	if maxLines > 0 && len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:] // audit files: tail is freshest
 	}
@@ -367,8 +381,8 @@ func LoadRegexLines(path string) ([]string, error) {
 func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 	// P67 latch: refuse to overwrite a queue file that failed to load this
 	// session. Losing the in-memory state is recoverable; clobbering the on-
-	// disk queue with an empty one is not.
-	if queueLoadFailed.Load() {
+	// disk queue with an empty one is not. Keyed by path — see queueLoadFailed.
+	if queueLoadIsFailed(path) {
 		return fmt.Errorf("queue file %s failed to load this session; refusing to overwrite it", path)
 	}
 	dir := filepath.Dir(path)
@@ -424,9 +438,15 @@ func SaveBucketAtomic(path string, proxies []*Proxy, maxBytes int64) error {
 		// into the writer, so a multi-million-entry save allocates nothing
 		// per entry.
 		line := make([]byte, 0, 128)
-		for _, p := range proxies {
+		for i, p := range proxies {
 			line = p.AppendURL(line[:0])
-			if size+int64(len(line))+1 > maxBytes {
+			// The measurement pass above selected exactly this suffix to fit
+			// the budget, so the per-line check never fires in normal saves
+			// (URLLen == len(AppendURL) byte for byte). The guard stays as a
+			// damage cap — but it must exempt the first line, or it undoes
+			// the forced-keep decision above and writes the empty file that
+			// decision exists to prevent.
+			if i > 0 && size+int64(len(line))+1 > maxBytes {
 				break
 			}
 			if _, err := bw.Write(line); err != nil {

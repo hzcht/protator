@@ -102,9 +102,13 @@ func (b *beats) view(revalidateInterval, cycleSleep, saveInterval time.Duration)
 // "::1", "localhost" — with or without a port). Used for the admin token
 // warning.
 func loopbackAddr(addr string) bool {
+	// Split the port off only when the address actually carries one: a bare
+	// IPv6 literal has no port, and hand-stripping at the last colon used to
+	// turn "::1" into ":" — ParseIP failed, and a loopback-only admin listener
+	// got the exposure warning as a false positive.
 	host := addr
-	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.HasSuffix(host, "]") {
-		host = host[:i]
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
 	host = strings.Trim(host, "[]")
 	if strings.EqualFold(host, "localhost") {

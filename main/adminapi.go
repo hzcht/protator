@@ -146,6 +146,10 @@ func (a *admin) startStatsRecorder(ctx context.Context) {
 	var arm func()
 	arm = func() {
 		time.AfterFunc(time.Minute, func() {
+			// Timer callbacks run on bare runtime goroutines: a panic here
+			// (it renders the whole stats ring) would kill the process the
+			// way any other un-recovered goroutine does.
+			defer proxy.RecoverPanic("admin: stats recorder")
 			select {
 			case <-ctx.Done():
 				return

@@ -188,6 +188,10 @@ type Candidate struct {
 	TrojanPassword string
 	TrojanSNI      string
 	TrojanNoTLS    bool
+
+	// Plain-proxy credentials (http/https/socks5), raw as they appeared in
+	// the URL ("user:pass", still percent-encoded). Empty = none.
+	ProxyAuth string
 }
 
 func (c Candidate) key() string {
@@ -205,6 +209,10 @@ func (c Candidate) key() string {
 		if c.TrojanPassword != "" {
 			return "trojan:" + c.TrojanPassword + "@" + base
 		}
+	default:
+		if c.ProxyAuth != "" {
+			return c.Schema + ":" + c.ProxyAuth + "@" + base
+		}
 	}
 	return base
 }
@@ -215,6 +223,8 @@ func (p *Proxy) Addr() string {
 }
 
 // URL returns e.g. "socks5://host:port" or "vless://uuid@host:port?flow=...&sni=...&pbk=...&sid=...&spider=...".
+// Plain proxies with credentials render "scheme://user:pass@host:port" (raw,
+// still percent-encoded — same lossless round trip as the trojan password).
 func (p *Proxy) URL() string {
 	s := p.Schema
 	if s == "" {
@@ -225,6 +235,9 @@ func (p *Proxy) URL() string {
 	}
 	if s == "trojan" && p.GetTrojanPassword() != "" {
 		return fmt.Sprintf("trojan://%s@%s", p.GetTrojanPassword(), p.Addr()) + buildTrojanQuery(p)
+	}
+	if a := p.GetProxyAuth(); a != "" {
+		return fmt.Sprintf("%s://%s@%s", s, a, p.Addr())
 	}
 	return fmt.Sprintf("%s://%s", s, p.Addr())
 }
@@ -249,6 +262,9 @@ func (p *Proxy) URLLen() int {
 	}
 	if s == "trojan" && p.GetTrojanPassword() != "" {
 		return len("trojan://") + len(p.GetTrojanPassword()) + 1 + addr + len(buildTrojanQuery(p))
+	}
+	if a := p.GetProxyAuth(); a != "" {
+		return len(s) + 3 + len(a) + 1 + addr // "://" + "user:pass@"
 	}
 	return len(s) + 3 + addr // "://"
 }
@@ -422,8 +438,17 @@ func ParseProxyLine(line string) (*Proxy, error) {
 		}
 	}
 
-	// strip credentials if present (user:pass@host:port)
+	// Plain-proxy credentials (user:pass@host:port). trojan/vless consumed
+	// their userinfo above; here it means proxy authentication. Stored raw
+	// (still percent-encoded) for a lossless URL()/ParseProxyLine round trip —
+	// socks4 is excluded: the protocol has no password auth, so a userinfo
+	// there is junk that would turn a working anonymous dial into a failing
+	// authenticated one.
+	var proxyAuth string
 	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		if schema == "http" || schema == "https" || schema == "socks5" {
+			proxyAuth = rest[:at]
+		}
 		rest = rest[at+1:]
 	}
 
@@ -450,8 +475,37 @@ func ParseProxyLine(line string) (*Proxy, error) {
 	if schema == "trojan" {
 		p.SetTrojan(trojanPassword, trojanSNI, trojanNoTLS)
 	}
+	if proxyAuth != "" {
+		p.SetProxyAuth(proxyAuth)
+	}
 	p.keyCache = p.URL()
 	return p, nil
+}
+
+// candidateFromProxy converts a parsed proxy back into a candidate, carrying
+// every credential the pipeline can act on. RevalidateSeeded and the pool
+// reader go through this: a Proxy re-emitted as a bare {host, port, schema}
+// candidate loses its trojan password / vless UUID / http userinfo, and the
+// checker can then never validate it — the entry was dropped as dead on every
+// restart despite being alive.
+func candidateFromProxy(p *Proxy, source string) Candidate {
+	return Candidate{
+		Host:           p.Host,
+		Port:           p.Port,
+		Schema:         p.Schema,
+		Source:         source,
+		VLESSUUID:      p.GetVLESSUUID(),
+		VLESSFlow:      p.GetVLESSFlow(),
+		VLESSSNI:       p.GetVLESSSNI(),
+		VLESSPbk:       p.GetVLESSPbk(),
+		VLESSSid:       p.GetVLESSSid(),
+		VLESSSpider:    p.GetVLESSSpider(),
+		VLESSNoTLS:     p.GetVLESSNoTLS(),
+		TrojanPassword: p.GetTrojanPassword(),
+		TrojanSNI:      p.GetTrojanSNI(),
+		TrojanNoTLS:    p.GetTrojanNoTLS(),
+		ProxyAuth:      p.GetProxyAuth(),
+	}
 }
 
 // splitHostPort splits host:port, handling [ipv6]:port and bare IPv6 without

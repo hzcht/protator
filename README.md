@@ -40,6 +40,7 @@ tier `/ready` actually tests) rather than `live`.
 
 - **VLESS + REALITY support** — full VLESS protocol with REALITY handshake (x25519 + HKDF-SHA256), uTLS Chrome fingerprinting, Vision flow support. Config via `vless://uuid@host:port?flow=...&sni=...&pbk=...&sid=...`; `security=none` (plaintext, no uTLS) supported too.
 - **Trojan support** — `trojan://password@host:port` share lists parsed, validated, served and persisted end to end (raw TCP only; TLS with SNI or plaintext; same host:port with different passwords are distinct entries). Same pipeline as VLESS: credentials ride extraction → check → dial → pool/queue.
+- **Credentialed proxies** — `user:pass@host:port` validates and connects for `http`/`https` (Basic `Proxy-Authorization` in the CONNECT handshake) and `socks5` (RFC 1929). The userinfo is kept raw percent-encoded and is part of the proxy's identity: same host:port with different credentials are distinct entries. Socks4 stays out (the protocol has no auth).
 - **GeoIP integration** — optional MaxMind GeoIP2-City.mmdb (`geoip_db_path` in config). Validated proxies get country/ASN attached; admin filters by `?country=US&asn=AS12345`.
 - **WebSocket live updates** — `/ws` pushes health/proxy/source updates instantly; UI switches from 15s polling to real-time.
 - **Admin enhancements** — CSV/JSONL export, bulk source delete, force revalidate selected proxies, per-proxy **drop** from the queue, logs viewer tab, Shutdown button, copy curl/wget button, 24h stats history (`/api/stats/history` + graphs).

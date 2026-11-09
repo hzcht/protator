@@ -252,14 +252,13 @@ func startAdminServer(ctx context.Context, cfg *proxy.Config, bucket *proxy.Buck
 
 	srv := newAdminServer(a, logNoise)
 	// Wire bucket changes to WebSocket broadcasts. The subscriber callback
-	// only flags a pending change: it runs inline on the mutation path (every
-	// checker add, every revalidation drop, every serving-path eviction),
-	// where a full delta computation — whole-queue scan + diff + JSON marshal
-	// — must not run per mutation. startWSNotifier coalesces the flags into
-	// at most one broadcast per tick.
-	bucket.Subscribe(func(p *proxy.Proxy, added bool) {
-		a.ws.requestNotify()
-	})
+	// only records add-side URLs and flags a pending change: it runs inline
+	// on the mutation path (every checker add, every revalidation drop,
+	// every serving-path eviction), where a delta computation — scan, diff,
+	// JSON marshal — must not run per mutation. startWSNotifier coalesces
+	// the flags into at most one broadcast per tick, choosing between an
+	// incremental apply and a full heal (P3).
+	a.subscribeBucket(bucket)
 	go a.startWSNotifier(ctx)
 	a.startStatsRecorder(ctx) // start 24h stats history recorder
 	go func() {

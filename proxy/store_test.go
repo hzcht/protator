@@ -293,6 +293,56 @@ func TestSaveBucketAtomicKeepsNewestTail(t *testing.T) {
 	}
 }
 
+// A budget smaller than a single entry keeps the newest entry anyway. The
+// forced-keep clamp in the tail walk used to be undone by the per-line budget
+// check in the render loop, which broke on the first oversized line and
+// renamed an empty file into place — seeding an empty queue on the next start,
+// exactly what the clamp's comment promised never to do.
+func TestSaveBucketAtomicForcesNewestEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "q.lst")
+	all := []*Proxy{{Schema: "http", Host: "10.1.2.3", Port: 80}}
+	// Budget 8 bytes < the 19-byte URL + newline: nothing fits, keep one.
+	if err := SaveBucketAtomic(path, all, 8); err != nil {
+		t.Fatal(err)
+	}
+	loaded := ReadQueue(path)
+	if len(loaded) != 1 || loaded[0].Port != 80 {
+		t.Fatalf("forced-keep must write the newest entry, got %d entries", len(loaded))
+	}
+}
+
+// The load-failure latch is per path: a failed read of one queue file must
+// block only THAT file's overwrite. One global flag used to be cleared by a
+// successful read of a different file (proxy.lst failed → good_proxies.last
+// read fine → the save loop clobbered the unreadable queue with an empty one).
+func TestQueueLoadLatchIsPerPath(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.lst") // a directory: unreadable, not missing
+	good := filepath.Join(dir, "good.lst")
+	if err := os.Mkdir(bad, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(good, []byte("http://10.1.2.3:8080\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ReadQueue(bad) // latches: unreadable, not absent
+	if !queueLoadIsFailed(bad) {
+		t.Fatal("an unreadable queue file must latch its path")
+	}
+	ReadQueue(good) // a successful read of a DIFFERENT path must not clear it
+	if !queueLoadIsFailed(bad) {
+		t.Fatal("a successful read of another file cleared the failed file's latch")
+	}
+	p := &Proxy{Schema: "http", Host: "10.9.9.9", Port: 80}
+	if err := SaveBucketAtomic(bad, []*Proxy{p}, 1<<20); err == nil {
+		t.Fatal("the failed file must refuse to be overwritten")
+	}
+	if err := SaveBucketAtomic(good, []*Proxy{p}, 1<<20); err != nil {
+		t.Fatalf("the readable file must save normally: %v", err)
+	}
+}
+
 // A crash between CreateTemp and rename leaves temp files behind (their
 // cleanup defer never ran). SweepOrphanTMP removes exactly those patterns at
 // startup and nothing else.

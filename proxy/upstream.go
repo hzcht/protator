@@ -44,40 +44,70 @@ type ForwardDialer struct {
 // in the queue, so the dialer can bypass them instead of looping back into one
 // of its own upstreams.
 //
-// Addresses are reference counted because the bucket's identity is the full URL:
-// the same host:port is a distinct entry under http and socks5, and removing
-// one must not unblock the other. Unblocking early here is the unsafe
-// direction — it hands the dialer a proxy that may dial itself.
+// Membership is keyed by the proxy's Key (the bucket's identity is the full
+// URL: the same host:port is a distinct entry under http and socks5) with the
+// addr counted alongside, so removing one entry must not unblock the other.
+// This used to be a bare addr refcount fed from two sources — the change
+// subscription and the startup seed snapshot — and a proxy added in the window
+// between the two was counted twice while the bucket held it once; no later
+// Remove could unwind the phantom count, so the dialer bypassed that addr
+// forever. Keyed membership makes the seed+event double-add idempotent.
+// Unblocking early here is the unsafe direction — it hands the dialer a proxy
+// that may dial itself.
 type networkSet struct {
-	mu sync.RWMutex
-	m  map[string]int
+	mu     sync.RWMutex
+	byKey  map[string]string // proxy Key -> addr
+	byAddr map[string]int    // addr -> live entries behind it
 }
 
 func newNetworkSet() networkSet {
-	return networkSet{m: make(map[string]int, 1024)}
+	return networkSet{
+		byKey:  make(map[string]string, 1024),
+		byAddr: make(map[string]int, 1024),
+	}
+}
+
+// add registers a proxy under its Key. Re-adding the same Key (a change event
+// racing the startup seed pass) is a no-op, not a second count.
+func (s *networkSet) add(key, addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old, ok := s.byKey[key]; ok {
+		if old == addr {
+			return
+		}
+		// A Key keeps one addr for its whole life in practice; handle a
+		// change anyway instead of leaking the old addr's count.
+		if n := s.byAddr[old]; n <= 1 {
+			delete(s.byAddr, old)
+		} else {
+			s.byAddr[old] = n - 1
+		}
+	}
+	s.byKey[key] = addr
+	s.byAddr[addr]++
+}
+
+func (s *networkSet) remove(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	addr, ok := s.byKey[key]
+	if !ok {
+		return
+	}
+	delete(s.byKey, key)
+	if n := s.byAddr[addr]; n <= 1 {
+		delete(s.byAddr, addr)
+	} else {
+		s.byAddr[addr] = n - 1
+	}
 }
 
 func (s *networkSet) contains(addr string) bool {
 	s.mu.RLock()
-	n := s.m[addr]
+	n := s.byAddr[addr]
 	s.mu.RUnlock()
 	return n > 0
-}
-
-func (s *networkSet) put(addr string) {
-	s.mu.Lock()
-	s.m[addr]++
-	s.mu.Unlock()
-}
-
-func (s *networkSet) drop(addr string) {
-	s.mu.Lock()
-	if n := s.m[addr]; n <= 1 {
-		delete(s.m, addr)
-	} else {
-		s.m[addr] = n - 1
-	}
-	s.mu.Unlock()
 }
 
 // NewForwardDialer wires a dialer to the bucket and registers it for loop-set
@@ -105,16 +135,19 @@ func NewForwardDialer(bucket *Bucket, cfg *Config) *ForwardDialer {
 	// being notified in production).
 	bucket.Subscribe(d.onChange)
 	for _, p := range bucket.Snapshot() {
-		d.loop.put(p.Addr())
+		// Keyed add: a proxy that also arrived via a change event in the
+		// window between Subscribe and this snapshot is a no-op here, not a
+		// second count.
+		d.loop.add(p.Key(), p.Addr())
 	}
 	return d
 }
 
 func (d *ForwardDialer) onChange(p *Proxy, added bool) {
 	if added {
-		d.loop.put(p.Addr())
+		d.loop.add(p.Key(), p.Addr())
 	} else {
-		d.loop.drop(p.Addr())
+		d.loop.remove(p.Key())
 		d.pins.DropProxy(p.Key())
 	}
 }
@@ -251,6 +284,18 @@ func (c *firstByteConn) Read(p []byte) (int, error) {
 		c.cleared.Do(func() { _ = c.Conn.SetReadDeadline(time.Time{}) })
 	}
 	return n, err
+}
+
+// CloseWrite forwards a write-side half-close through the wrapper chain (same
+// contract as proxyConn.CloseWrite): embedding net.Conn does not promote
+// CloseWrite into this type's method set, so a type assertion on the wrapped
+// chain would silently skip this wrapper and a peer's FIN would never reach
+// the real socket.
+func (c *firstByteConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // proxyConn wraps a live tunnel so closing it releases the proxy's in-flight
@@ -444,12 +489,22 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	volume := new(int64)
 	lastAct := new(int64)
 	atomic.StoreInt64(lastAct, time.Now().UnixNano())
+	// early = client bytes the forwarder has taken (read from the client,
+	// whether or not they reached the tunnel yet). The forwarder owns the
+	// replay buffer — bytes.Buffer is not synchronized, so the main body must
+	// consult this counter instead of reading replay.Len() while the
+	// forwarder is appending (that was a data race under big CONNECT volume).
+	early := new(int64)
 	var upstreamEnded bool
 
 	// client -> tunnel. Early client bytes are buffered up to the replay cap,
 	// so a proven-dead tunnel can be retried — but only while the whole hand
 	// shape still fits in the buffer; an overflowing client is never replayed
 	// (TLS would be silently corrupted).
+	// Main-body snapshot of the replay length, taken before the forwarder
+	// goroutine starts: from spawn on, only the forwarder touches replay.
+	preLen := replay.Len()
+
 	var clientEOF atomic.Bool
 	go func() {
 		defer close(fwdDone)
@@ -473,6 +528,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 			n, rerr := client.Read(buf)
 			if n > 0 {
 				atomic.StoreInt64(lastAct, time.Now().UnixNano())
+				atomic.AddInt64(early, int64(n))
 				if replay.Len()+n > connectReplayMax {
 					select {
 					case overflowed <- struct{}{}:
@@ -537,7 +593,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	// starts, so a silent tunnel that received them is a genuine blackhole —
 	// not an ambiguous quiet client. Only a tunnel that got nothing at all
 	// streams on best-effort.
-	forwarded := replay.Len() > 0
+	forwarded := preLen > 0 || atomic.LoadInt64(early) > 0
 
 	switch {
 	case n > 0:

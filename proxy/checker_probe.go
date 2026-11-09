@@ -296,7 +296,7 @@ func (c *Checker) transportFor(p *Proxy) *http.Transport {
 	}
 
 	tr := &http.Transport{
-		Proxy: http.ProxyURL(&url.URL{Scheme: p.Schema, Host: p.Addr()}),
+		Proxy: http.ProxyURL(proxyURLOf(p)),
 		DialContext: (&net.Dialer{
 			Timeout:   c.cfg.Checker.ConnectT.Duration,
 			KeepAlive: 30 * time.Second,

@@ -66,7 +66,14 @@ func connectHTTPProxy(p *Proxy, timeout time.Duration, ctx context.Context, netw
 	}
 
 	conn.SetDeadline(time.Now().Add(timeout))
-	req := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\nProxy-Connection: keep-alive\r\n\r\n"
+	req := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\nProxy-Connection: keep-alive\r\n"
+	if user, pass, ok := p.authUserinfo(); ok {
+		// RFC 7617 Basic auth for the proxy itself (not the target). The
+		// values are the percent-decoded userinfo; without the header a
+		// credentialed proxy answers 407 and the tunnel never comes up.
+		req += "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)) + "\r\n"
+	}
+	req += "\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		conn.Close()
 		return nil, err
@@ -275,12 +282,22 @@ func dialVLESS(p *Proxy, timeout time.Duration, ctx context.Context, network, ad
 		return nil, err
 	}
 
-	// Vision/Spider header if present
+	// Vision/Spider header if present. Armed with a write deadline: the
+	// handshake above clears all deadlines (right, for the long-lived
+	// tunnel), but this frame is written *after* that point — a proxy that
+	// accepted the handshake and then stops reading would block the Write on
+	// a full TCP send buffer forever, leaking one dialing goroutine per
+	// occurrence (and hanging the client's request on the serving path).
 	if spider := p.GetVLESSSpider(); spider != "" {
+		if err := tconn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			tconn.Close()
+			return nil, err
+		}
 		if _, err := tconn.Write([]byte(spider)); err != nil {
 			tconn.Close()
 			return nil, err
 		}
+		_ = tconn.SetWriteDeadline(time.Time{})
 	}
 
 	return tconn, nil

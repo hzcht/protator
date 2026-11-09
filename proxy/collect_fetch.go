@@ -219,19 +219,29 @@ func (c *Collector) extractHTTP(ctx context.Context, site string) fetchResult {
 	return fetchResult{cands: cands, note: note}
 }
 
+// viaProxyUsable reports whether the HTTP fetch path can route through p:
+// net/http's Transport.ProxyURL understands http/https/socks5/socks5h only.
+// A socks4/vless/trojan proxy is a valid pipeline citizen (the checker and
+// the serving dialer swap dialers for them) but cannot be used here.
+func viaProxyUsable(p *Proxy) bool {
+	switch p.Schema {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	default:
+		return false
+	}
+}
+
 // extractViaProxy GETs the site through a specific upstream proxy. Failures
 // are classified: transport-level errors and device-junk statuses mark the
 // proxy as at fault (proxyFault), while target-side blocks *(a tiny 200
 // lander, a 403/404/429, a 5xx) leave the proxy's health untouched.
 func (c *Collector) extractViaProxy(ctx context.Context, site string, p *Proxy) fetchResult {
-	// net/http's Transport.ProxyURL only understands http/https/socks5/socks5h.
-	// A socks4/vless proxy (both valid pipeline schemas; the checker swaps
-	// dialers for them) fails instantly with "unsupported protocol scheme" —
-	// and that used to be charged as a proxy fault, so the collector silently
-	// evicted healthy non-http proxies on every via-proxy attempt.
-	switch p.Schema {
-	case "http", "https", "socks5", "socks5h":
-	default:
+	// A socks4/vless/trojan proxy fails instantly with "unsupported protocol
+	// scheme" — and that used to be charged as a proxy fault, so the
+	// collector silently evicted healthy non-http proxies on every
+	// via-proxy attempt.
+	if !viaProxyUsable(p) {
 		return fetchResult{note: "via-proxy unsupported for schema " + p.Schema}
 	}
 	proxyURL, err := url.Parse(p.URL())

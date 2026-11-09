@@ -7,6 +7,54 @@ has no release process yet and an unmarked change is a change nobody can find.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Batch` and `RevalidateSeeded` silently dropped proxy credentials.**
+  Both minted `Candidate`s without the userinfo, so a credentialed proxy
+  entered validation as anonymous and failed (trojan/vless share links carry
+  inline credentials, so they were affected through the same path). Both now
+  go through the shared `candidateFromProxy` converter, which is the one
+  Proxy→Candidate translation.
+- **Data race in the CONNECT tunnel (`serveConnectStream`)**, caught by the
+  race detector under heavy CONNECT volume: the forwarder goroutine appended
+  early client bytes into the replay buffer while the main body read
+  `replay.Len()`. The main body now consults a pre-spawn length snapshot plus
+  an atomic counter instead of touching the buffer.
+- **Self-deadlock in the log sink**: a failing `logging.dir` made `file()`
+  call `log.Printf` while holding its own mutex — every logger in the process
+  blocked behind it, and the "disabled" flag was never read. The failure is
+  now reported straight to stderr once and file logging stops cleanly.
+- **Queue-save data loss on a failed load**: the P67 latch that refuses to
+  overwrite an unreadable queue file was one global flag, cleared by a
+  successful read of a *different* file — a failed `proxy.lst` read followed
+  by a fine `good_proxies.last` read let the save loop clobber the real
+  queue. The latch is keyed by path now.
+- **Admin WS notifier and stats recorder ran on un-recovered goroutines**:
+  one panic in the delta rendering would kill the whole process. Recovered
+  per broadcast, so the notifier survives and keeps serving.
+- **Collector via-proxy retries are no longer burned on unusable schemas**
+  (trojan/vless/socks4 picks are skipped without spending a retry slot or
+  charging a fault, with one aggregated log note; §16 backlog item).
+- **VLESS spider frame written with no deadline** after the handshake cleared
+  them — a stopped-reading proxy leaked a goroutine forever.
+- **The admin live-page cap was check-then-act** (`wsMaxClients`): the
+  decision now runs under the hub lock.
+- **`loopbackAddr("::1")` returned false**, producing a false admin-exposure
+  warning for a loopback-only listener.
+- **`revalidate_seed_max = 0` meant "no cap"**, contradicting its documented
+  "(0 = 5000)" contract and un-throttling the 65k seed dump; the default is
+  now enforced at the use site.
+- **The candidate pool compaction goroutine and the first-byte conn wrapper
+  hardening**: `compactLoop` gained `RecoverPanic`; `firstByteConn` passes
+  `CloseWrite` through like `proxyConn` (latent, keeps the wrapper-chain
+  contract).
+- **The dialer loop-set no longer double-counts proxies added during
+  startup** (membership keyed by proxy key instead of an addr refcount, so a
+  phantom count could make the dialer bypass an address forever).
+- **An oversized single-entry queue save no longer writes an empty file**
+  (the forced-keep clamp is honored by the render loop).
+- Config comment: `/` and `/static/*` are open without a token by design.
+
 ### Documentation
 
 - Docs re-synced against HEAD after the audit/optimization passes
@@ -141,6 +189,15 @@ has no release process yet and an unmarked change is a change nobody can find.
 
 ### Added
 
+- **Credentialed proxies end to end** (P16): `user:pass@host:port` now
+  validates and connects for `http`/`https` (Basic `Proxy-Authorization` in
+  the CONNECT handshake), `socks5` (RFC 1929 via userinfo on the h12 dial),
+  `trojan` and `vless`. The userinfo is stored raw percent-encoded
+  (`ProxyMeta.proxyAuth`, never re-encoded — upstreams distinguish `%2F`
+  bytes from their decoded forms) and is part of the proxy's identity: the
+  same host:port with different credentials is two different entries, and
+  the bucket/candidate dedup follows the URL automatically. Socks4 stays
+  unsupported (the protocol has no auth). Tests: `proxy/auth_test.go`.
 - **`proxy/stats.go` — the process-wide counter registry.** Serving path
   (requests, dial attempts/failures, evictions, served OK, response-level
   failures, block pages, bytes in/out), checker throughput, collector cycles
@@ -180,8 +237,8 @@ has no release process yet and an unmarked change is a change nobody can find.
   proxy-list.download, openproxylist, geonode, openproxy.space, proxylist.icu,
   pubproxy, multiproxy) and Telegram channel mirrors (`t.me/s/...`), alongside
   more raw GitHub lists.
-- **Benchmarks** (`proxy/pick_bench_test.go`) for the five hot paths: pick, live
-  page, queue save, pool add at cap, pin set at cap.
+- **Benchmarks** (`proxy/pick_bench_test.go`) for the six hot paths: pick,
+  proven-pool rebuild, live page, queue save, pool add at cap, pin set at cap.
 - **Tests**: idle-worker no-spin (CPU-sampling), supervisor restart / no-restart
   after channel close, LRU eviction and reverse-index re-pinning, expiry sweep,
   pool compaction under rotation, `URLLen` correctness and tail preservation,
@@ -209,6 +266,14 @@ has no release process yet and an unmarked change is a change nobody can find.
   broadcast per client, for data that changes once a minute) and are skipped
   entirely when no client is connected. The initial state message is the only
   one that carries history.
+- **WebSocket deltas are incremental** (P3): the hub tracks at most
+  `jsonRowCap` (1000) rows and re-renders just those per tick — field
+  changes and removals keep one-tick latency without touching the whole
+  checked scope. The bucket subscriber runs alloc-free on the mutation
+  path (cached key + a cap-1 flag); adds marked between heals join the set
+  incrementally, an add burst bigger than one render or a 60s interval
+  falls back to a full-heal resync, and an add arriving on a cap-truncated
+  universe is deferred so it cannot vanish again on the next heal.
 - **Serving-path policy moved to `proxy/pick.go`** (proof tiers, `rankPick`,
   `betterPick`); `bucket.go` is now the queue itself.
 - **The admin assets are real files** in `main/adminweb/`, `//go:embed`-ed by
@@ -283,18 +348,22 @@ The production-scale reading and what is still on the table are in
   `TestExtractGatesNeverDropMatches` runs every shipped pattern over eight
   body shapes and asserts that whatever the gate skipped really was empty.
   New `BenchmarkExtractPage` covers both a real page and an IP-less one.
+- **The `freshPool` rebuild no longer holds the queue's read lock for an
+  O(queue) scan.** The pointer copy runs under the lock (memcpy only) and
+  the freshness rank runs outside it, so checker adds and serving evictions
+  no longer queue behind the scan (~18ms per rebuild extrapolated at a
+  2M-entry queue). A reused scratch buffer (exclusively held under
+  `freshMu`, never handed to a picker) keeps the rebuild allocation-flat.
+  Same-session A/B at 70k, `-benchtime 1s`: scan-under-lock 649µs/103 KB →
+  775µs/103 KB — the ~20% rebuild CPU is the deliberate price; a scratchless
+  first cut (fresh allocation per rebuild: 1062µs/669 KB) was rejected on
+  its own numbers. `problems.md` §18 carries the decision trail, §12 the
+  corrected cliff entry. New `BenchmarkFreshPoolRebuild` (the cached pick
+  path is unchanged: 2084ns/0 allocs at 70k).
 
 ### Known gaps (next)
 
-- No metrics for the *serving* path over time beyond the 24h ring: alerts are
-  still a human reading `/api/metrics`.
 - `/api/logs` is a tail, not a search; an incident older than 300 lines still
   needs the rotated file.
-- The admin page has no way to drop a proxy from the queue (only the checks
-  that may drop it as a side effect).
-- Authenticated proxies (`user:pass@host:port`) are still not supported: the
-  checker and dialer have no credential path, so those sources are ignored
-  rather than half-read.
-- `README.md` still describes the collector's source ordering optimistically;
-  the telemetry drive is `max_sites_per_cycle` and that is the number that
-  decides whether the tail of `sites.txt` is ever reached.
+- Alerting beyond the dying-pool watchdog (`statsLoop`: >50% dial failures
+  for two consecutive minutes) is still a human reading `/api/metrics`.

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/url"
 	"strings"
 	"sync/atomic"
 )
@@ -38,6 +39,13 @@ type ProxyMeta struct {
 	// password contains URL-significant bytes like # or @.
 	trojanSNI   atomic.Pointer[string]
 	trojanNoTLS atomic.Pointer[bool] // security=none: plaintext, no TLS
+
+	// proxyAuth carries the raw userinfo ("user:pass", still percent-encoded)
+	// of a plain proxy (http/https/socks5): same lossless-round-trip contract
+	// as trojanPassword. Empty = no credentials. socks4 keeps none (the
+	// protocol has no password auth), trojan/vless carry theirs in their own
+	// fields.
+	proxyAuth atomic.Pointer[string]
 }
 
 func (p *ProxyMeta) Country() string {
@@ -148,6 +156,10 @@ func (p *ProxyMeta) setTrojan(password, sni string, noTLS bool) {
 	p.trojanPassword.Store(ptrTo(password))
 	p.trojanSNI.Store(ptrTo(sni))
 	p.trojanNoTLS.Store(ptrToBool(noTLS))
+}
+
+func (p *ProxyMeta) setProxyAuth(raw string) {
+	p.proxyAuth.Store(ptrTo(raw))
 }
 
 func ptrTo(s string) *string { return &s }
@@ -266,6 +278,71 @@ func (p *Proxy) GetTrojanNoTLS() bool {
 func (p *Proxy) SetTrojan(password, sni string, noTLS bool) {
 	p.ensureMeta()
 	p.meta.setTrojan(password, sni, noTLS)
+}
+
+// GetProxyAuth returns the raw userinfo ("user:pass", still percent-encoded)
+// of a plain http/https/socks5 proxy, or "".
+func (p *Proxy) GetProxyAuth() string {
+	if p.meta == nil {
+		return ""
+	}
+	if s := p.meta.proxyAuth.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
+
+// SetProxyAuth stores the raw userinfo of a plain proxy. Must run before the
+// identity is frozen (keyCache): the credentials are part of the URL, so a
+// keyCache built without them would serve one password's transport to
+// another's.
+func (p *Proxy) SetProxyAuth(raw string) {
+	p.ensureMeta()
+	p.meta.setProxyAuth(raw)
+}
+
+// authUserinfo decodes the raw userinfo for Basic-auth use: the part before
+// the first ':' is the user, the rest (a ':' is legal inside a password) the
+// password; both percent-decoded. ok is false when there is no userinfo.
+func (p *Proxy) authUserinfo() (user, pass string, ok bool) {
+	raw := p.GetProxyAuth()
+	if raw == "" {
+		return "", "", false
+	}
+	u, pw := raw, ""
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		u, pw = raw[:i], raw[i+1:]
+	}
+	return unescapeUserinfo(u), unescapeUserinfo(pw), true
+}
+
+// unescapeUserinfo percent-decodes one userinfo part; a malformed escape
+// sequence falls back to the raw spelling (the source line is the authority).
+func unescapeUserinfo(s string) string {
+	if d, err := url.QueryUnescape(s); err == nil {
+		return d
+	}
+	return s
+}
+
+// proxyURLOf renders the proxy as a *url.URL for http.Transport's Proxy field:
+// userinfo (when present) becomes u.User, so net/http sends the
+// Proxy-Authorization header for http/https proxies and speaks RFC 1929
+// username/password auth for socks5.
+func proxyURLOf(p *Proxy) *url.URL {
+	s := p.Schema
+	if s == "" {
+		s = "http"
+	}
+	u := &url.URL{Scheme: s, Host: p.Addr()}
+	if user, pass, ok := p.authUserinfo(); ok {
+		if pass != "" {
+			u.User = url.UserPassword(user, pass)
+		} else {
+			u.User = url.User(user)
+		}
+	}
+	return u
 }
 
 // ensureMeta is a fallback for Proxy values built outside the known

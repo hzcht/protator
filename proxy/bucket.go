@@ -51,6 +51,12 @@ type Bucket struct {
 	freshMu sync.Mutex
 	fresh   []*Proxy
 	freshAt time.Time
+	// freshScratch recycles the pointer-copy buffer between rebuilds. It is
+	// only touched while freshMu is held, so it is exclusive to whichever
+	// rebuild is running and never handed to a picker — the rebuild's
+	// *result* stays a fresh allocation, exactly because of the recycled
+	// storage bug this replaced.
+	freshScratch []*Proxy
 
 	// Proof-of-life windows used by freshnessRank. Set once at startup from
 	// the config; see SetFreshnessWindows.
@@ -111,6 +117,16 @@ func (b *Bucket) Subscribe(fn func(p *Proxy, added bool)) func() {
 // entry that was removed underneath it costs one failed dial and a retry, and
 // invalidating on every add would turn each pick into an O(queue) scan.
 //
+// The rebuild used to hold the read lock across the whole scan — an O(queue)
+// pass that stalled every checker Add and serving eviction for its duration
+// whenever the interval had expired. It now copies the pointers under the
+// read lock and ranks outside it (the LiveListUnranked shape): the window
+// fields are set once at startup and read lock-free on the serving path, and
+// every per-entry field the rank touches is atomic. Membership can shift
+// mid-scan the same way a LiveList page can — an entry added between copy and
+// rank may be missed, one removed may be included — and the snapshot is
+// recomputed once per interval by design, so the lag is already the contract.
+//
 // Lock order is freshMu -> mu, and no caller may hold mu when calling this:
 // PickHealthy used to take b.mu.RLock and then land here, where the rebuild
 // takes b.mu.RLock again — a recursive read lock, which deadlocks the moment
@@ -126,16 +142,27 @@ func (b *Bucket) freshPool(now time.Time) []*Proxy {
 	if !b.freshAt.IsZero() && now.Sub(b.freshAt) < freshRebuildInterval {
 		return b.fresh
 	}
-	b.mu.RLock()
 	nowNanos := now.UnixNano()
+	// Pointer copy under the read lock; the rank filter runs outside it.
+	// The scratch is internal-only — guarded by freshMu, which serializes
+	// rebuilds — so it can persist across rebuilds: the queue is bounded at
+	// max entries, and paying a full queue-sized allocation every interval
+	// is what killed the first cut of this shape.
+	b.mu.RLock()
+	n := len(b.proxies)
+	if n > cap(b.freshScratch) {
+		b.freshScratch = make([]*Proxy, n)
+	}
+	cp := b.freshScratch[:n]
+	copy(cp, b.proxies)
+	b.mu.RUnlock()
 	out := make([]*Proxy, 0, 256)
-	for _, p := range b.proxies {
+	for _, p := range cp {
 		if b.freshnessRank(nowNanos, p) != freshStale {
 			out = append(out, p)
 		}
 	}
 	b.fresh, b.freshAt = out, now
-	b.mu.RUnlock()
 	return out
 }
 

@@ -38,6 +38,14 @@ const (
 	// wsMaxClients bounds simultaneous admin pages. Each costs two
 	// goroutines, a 256-slot buffer and a socket.
 	wsMaxClients = 32
+	// wsFullHealInterval bounds how long the delta may run without a
+	// whole-queue rescan (P3). Between heals the delta is incremental: it
+	// re-renders only the rows it already tracks (jsonRowCap lookups, not a
+	// queue walk) plus the URLs the bucket reported as added. The heal is
+	// what still catches what no bucket event ever reports — a row ageing
+	// out of the live window, queue-order churn inside the capped render —
+	// so it runs on this interval whenever a delta is due at all.
+	wsFullHealInterval = time.Minute
 )
 
 // wsHub owns every connected admin page. It is a type of its own because the
@@ -51,10 +59,25 @@ type wsHub struct {
 	// delta bookkeeping: the previous render of the live set, so each
 	// broadcast sends only what changed.
 	prevProxies map[string]liveRow
-	prevHealth  map[string]int
 	// Coalesced change flags from bucket.Subscribe (cap 1: a pending flag is
 	// all the notifier needs).
 	notify chan struct{}
+
+	// Incremental-delta bookkeeping (P3). dirtyMu guards the add-side set
+	// plus the heal bookkeeping: markDirty runs inline on the bucket's
+	// mutation path (it has to stay a map insert of a cached key), while the
+	// notifier goroutine is the only writer of lastFull/truncated. Separate
+	// from mu so a checker add never contends with broadcast and connection
+	// set traffic.
+	dirtyMu  sync.Mutex
+	dirty    map[string]struct{}
+	lastFull time.Time
+	// truncated mirrors the previous full render: when the checked scope was
+	// cut at jsonRowCap, the tracked set is a queue-order sample, not the
+	// whole alive set, and a newly added row outside that sample must not be
+	// inserted incrementally — the next heal would not have it in its render
+	// and would report the row removed again (visible-then-vanished churn).
+	truncated bool
 }
 
 func newWSHub() *wsHub {
@@ -62,6 +85,7 @@ func newWSHub() *wsHub {
 		conns:       make(map[*wsConn]struct{}),
 		prevProxies: make(map[string]liveRow),
 		notify:      make(chan struct{}, 1),
+		dirty:       make(map[string]struct{}),
 	}
 }
 
@@ -75,10 +99,63 @@ func (h *wsHub) requestNotify() {
 	}
 }
 
-func (h *wsHub) add(c *wsConn) {
+// markDirty records the URL of a proxy the bucket just added, so the next
+// incremental tick can consider it for insertion. Key() is the cached URL
+// string — no formatting, no allocation, nothing else the mutation path would
+// feel. Runs only for adds: removals need no marker, a re-render of the
+// tracked set finds them through the failed lookup. evictions (an add at
+// capacity) surface the same way.
+func (h *wsHub) markDirty(key string) {
+	h.dirtyMu.Lock()
+	h.dirty[key] = struct{}{}
+	h.dirtyMu.Unlock()
+}
+
+// takeDirty swaps in a fresh set and returns the pending one. The snapshot is
+// taken before the render it feeds: an add that lands mid-render goes into the
+// fresh set and is reconsidered next tick, where a clear-after-render would
+// swallow it (rendered — harmless; not rendered — lost until the next heal).
+func (h *wsHub) takeDirty() map[string]struct{} {
+	h.dirtyMu.Lock()
+	defer h.dirtyMu.Unlock()
+	d := h.dirty
+	h.dirty = make(map[string]struct{})
+	return d
+}
+
+func (h *wsHub) dirtyLen() int {
+	h.dirtyMu.Lock()
+	defer h.dirtyMu.Unlock()
+	return len(h.dirty)
+}
+
+// healState reports when the last full render ran and whether it hit the
+// jsonRowCap.
+func (h *wsHub) healState() (time.Time, bool) {
+	h.dirtyMu.Lock()
+	defer h.dirtyMu.Unlock()
+	return h.lastFull, h.truncated
+}
+
+// markHealed records a completed full render and its truncation flag.
+func (h *wsHub) markHealed(truncated bool) {
+	h.dirtyMu.Lock()
+	h.lastFull = time.Now()
+	h.truncated = truncated
+	h.dirtyMu.Unlock()
+}
+
+func (h *wsHub) add(c *wsConn) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	// The cap decision runs under the same lock as the registration: a
+	// separate count() check let N parallel upgrades all observe the pre-add
+	// count and all register (check-then-act).
+	if len(h.conns) >= wsMaxClients {
+		return false
+	}
 	h.conns[c] = struct{}{}
-	h.mu.Unlock()
+	return true
 }
 
 func (h *wsHub) remove(c *wsConn) {
@@ -128,8 +205,12 @@ func (a *admin) handleWebSocket(ws *websocket.Conn) {
 
 	// Bound the number of live pages: each holds a writer goroutine, a
 	// reader goroutine, a 256-slot send buffer and a socket. A runaway
-	// reconnect loop (or a scanner) must not grow those without limit.
-	if a.ws.count() >= wsMaxClients {
+	// reconnect loop (or a scanner) must not grow those without limit. The
+	// decision runs inside add() under the same lock as the count: checking
+	// count() here and adding below were two separate acquisitions, and N
+	// parallel upgrades all observed the pre-add count.
+	c := &wsConn{conn: ws, send: make(chan []byte, 256)}
+	if !a.ws.add(c) {
 		_ = ws.Close()
 		return
 	}
@@ -137,9 +218,6 @@ func (a *admin) handleWebSocket(ws *websocket.Conn) {
 	// Whatever deadline the server set before the hijack, drop it: this
 	// connection now runs on the deadlines below.
 	_ = ws.SetDeadline(time.Time{})
-
-	c := &wsConn{conn: ws, send: make(chan []byte, 256)}
-	a.ws.add(c)
 
 	// Send initial state.
 	a.sendWSState(c)
@@ -179,6 +257,21 @@ func (a *admin) handleWebSocket(ws *websocket.Conn) {
 	}
 }
 
+// subscribeBucket wires bucket change events to the WebSocket delta: adds
+// join the incremental insert set (markDirty), everything else just flags the
+// notifier. The subscriber runs inline on the mutation path — every checker
+// add, every revalidation drop, every serving-path eviction — so both actions
+// stay allocation-free and lock-free w.r.t. the bucket: Key() is a cached
+// string, requestNotify is a non-blocking channel send.
+func (a *admin) subscribeBucket(bucket *proxy.Bucket) {
+	bucket.Subscribe(func(p *proxy.Proxy, added bool) {
+		if added {
+			a.ws.markDirty(p.Key())
+		}
+		a.ws.requestNotify()
+	})
+}
+
 // sendWSState sends the current state to a newly connected client.
 //
 // This is the only message that carries history: a periodic delta repeating a
@@ -206,15 +299,18 @@ func (a *admin) sendWSState(c *wsConn) {
 
 // startWSNotifier turns the per-mutation flags into at most one delta
 // broadcast per tick. The checker adds and revalidation drops arrive in
-// bursts of hundreds per second; recomputing a whole-queue diff for each one
-// inline would put admin bookkeeping in the hot path of every worker.
+// bursts of hundreds per second; applying each one inline would put admin
+// bookkeeping in the hot path of every worker.
 //
-// The interval follows the queue size, re-evaluated every tick so a queue
-// that grows past the threshold slows down on its own: a delta over a few
-// thousand entries is milliseconds, over two million it is seconds of scan
-// plus megabytes of JSON per client. A dashboard that refreshes every few
-// seconds instead of every second is still live; a proxy that spends its time
-// rendering the admin page is not serving.
+// The tick either heals or applies incrementally (notifyWSChanged) — the
+// subscription only flags a pending change and records add-side URLs, so the
+// mutation side never sees a scan, a diff or a marshal. The interval follows
+// the queue size, re-evaluated every tick so a queue that grows past the
+// threshold slows down on its own: a delta over a few thousand entries is
+// milliseconds, over two million the heal is seconds of scan plus megabytes
+// of JSON per client. A dashboard that refreshes every few seconds instead of
+// every second is still live; a proxy that spends its time rendering the
+// admin page is not serving.
 func (a *admin) startWSNotifier(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -239,24 +335,73 @@ func (a *admin) startWSNotifier(ctx context.Context) {
 			}
 			pending = false
 			lastBroadcast = time.Now()
-			a.notifyWSChanged()
+			a.notifyWSChangedSafe()
 		}
 	}
 }
 
-// notifyWSChanged computes and broadcasts the delta: only changed proxies
-// (added/removed/updated) plus health.
+// notifyWSChangedSafe runs one delta broadcast. The rendering walks the whole
+// live queue, builds rows and marshals JSON — all of it parsing live state —
+// and the notifier is a bare goroutine: without the recover, one panic kills
+// the process through the runtime (skipping main's defers), and without the
+// per-broadcast placement a panic would also retire the notifier forever,
+// leaving the page silently stale.
+func (a *admin) notifyWSChangedSafe() {
+	defer proxy.RecoverPanic("admin: ws notifier")
+	a.notifyWSChanged()
+}
+
+// notifyWSChanged computes and broadcasts one delta.
+//
+// Two shapes, chosen by cost (P3). A full heal rebuilds the tracked set from
+// a whole-queue scan (liveDelta) — authoritative, but O(queue), so it runs at
+// most once per wsFullHealInterval and whenever a burst of adds cannot be
+// applied as one incremental message. Everything else is incremental: applyDirty
+// re-renders the rows the tracker already holds with per-row bucket lookups
+// (jsonRowCap of them, about a millisecond against a two-million-entry queue —
+// the scan it replaces cost a pointer copy of the whole queue plus a window
+// filter) and lets only the add-side dirty set join the set between heals.
+//
+// The incremental shape keeps the field columns (latency, counters,
+// served/checked flags) at their old one-tick latency: revalidation re-stamps
+// an existing resident without any bucket event, so a dirty-adds-only render
+// would freeze those columns until the next heal.
 func (a *admin) notifyWSChanged() {
 	if a.ws.count() == 0 {
-		return // nobody is listening: the diff is pure cost
+		// No audience: the diff is pure cost. Drop the add-side set too —
+		// it would otherwise pool up the adds of every closed-quiet hour and
+		// hand the next connection a burst-sized set by surprise. A client
+		// that connects later gets a full state render; whatever is due
+		// next ticks either heals (fresh render) or diffs a set that is at
+		// most this tick old.
+		a.ws.takeDirty()
+		return
 	}
+	lastFull, truncated := a.ws.healState()
+	// A dirty set bigger than one render cannot go out as adds without a
+	// message the size of the cap — resync instead, and the heal clears the
+	// set. The nil-bucket case heals too: applyDirty needs Get.
+	if a.bucket == nil || lastFull.IsZero() || time.Since(lastFull) >= wsFullHealInterval ||
+		a.ws.dirtyLen() > jsonRowCap {
+		a.fullHealWS()
+		return
+	}
+	a.applyDirtyWS(truncated)
+}
+
+// fullHealWS rebuilds the tracked set from a whole-queue scan and broadcasts
+// the diff against the previous one.
+func (a *admin) fullHealWS() {
+	// Snapshot the add-side set before rendering (takeDirty semantics).
+	a.ws.takeDirty()
 	live, truncated := a.liveDelta()
-	currentProxies := make(map[string]liveRow, len(live))
+	current := make(map[string]liveRow, len(live))
 	for _, p := range live {
-		currentProxies[p.URL] = p
+		current[p.URL] = p
 	}
 
-	added, removed, updated := a.ws.diff(currentProxies)
+	added, removed, updated := a.ws.diff(current)
+	a.ws.markHealed(truncated)
 
 	msg := map[string]interface{}{
 		"type":      "delta",
@@ -268,6 +413,93 @@ func (a *admin) notifyWSChanged() {
 	}
 	data, _ := json.Marshal(msg)
 	a.ws.broadcast(data)
+}
+
+// applyDirtyWS renders one incremental delta: every row the tracker already
+// holds (re-checked through a per-row bucket lookup), plus the URLs the bucket
+// reported as added, diffed against the tracker in place — then broadcasts.
+//
+// Insertions are gated on the universe not being a cap-truncated sample
+// (wsHub.truncated): inside a truncated universe a queue-tail row would be
+// added here and then reported removed again by the next full render, whose
+// scan stops at the cap. Outside one, the universe is the whole checked scope,
+// so an inserted row is exactly what the next heal will still hold.
+func (a *admin) applyDirtyWS(truncated bool) {
+	dirty := a.ws.takeDirty()
+	now := time.Now()
+
+	a.ws.mu.Lock()
+	var added []liveRow
+	var removed []string
+	var updated []liveRow
+	// The tracked set is the render universe: every row is looked up and
+	// re-rendered, so removals and field changes need no bucket event. Rows
+	// dropped mid-iteration (delete during range) are simply not visited
+	// again; rows mutated in place are safe map updates.
+	for url, prev := range a.ws.prevProxies {
+		p := a.bucket.Get(url)
+		if p == nil {
+			removed = append(removed, url)
+			delete(a.ws.prevProxies, url)
+			continue
+		}
+		row := newLiveRow(p, now)
+		if !row.Served && !row.Checked {
+			// Proof of life slipped past the window without a bucket
+			// event: same verdict a full render would reach.
+			removed = append(removed, url)
+			delete(a.ws.prevProxies, url)
+			continue
+		}
+		if rowChanged(prev, row) {
+			a.ws.prevProxies[url] = row
+			updated = append(updated, row)
+		}
+	}
+	if !truncated {
+		// The hard len cap also covers the stale-flag window: the universe
+		// can grow past jsonRowCap between heals while truncated is still
+		// false, and the next heal is what re-evaluates the flag.
+		for url := range dirty {
+			if _, ok := a.ws.prevProxies[url]; ok {
+				continue
+			}
+			if len(a.ws.prevProxies) >= jsonRowCap {
+				break
+			}
+			p := a.bucket.Get(url)
+			if p == nil {
+				continue
+			}
+			row := newLiveRow(p, now)
+			if !row.Served && !row.Checked {
+				continue
+			}
+			a.ws.prevProxies[url] = row
+			added = append(added, row)
+		}
+	}
+	a.ws.mu.Unlock()
+
+	msg := map[string]interface{}{
+		"type":      "delta",
+		"health":    a.healthView(a.tlsConfigured),
+		"added":     added,
+		"removed":   removed,
+		"updated":   updated,
+		"truncated": truncated,
+	}
+	data, _ := json.Marshal(msg)
+	a.ws.broadcast(data)
+}
+
+// rowChanged reports whether the fields the page renders from a delta moved.
+// One definition for both delta paths (the full heal's diff and the
+// incremental tick) so the comparison cannot drift between them.
+func rowChanged(prev, cur liveRow) bool {
+	return prev.Latency != cur.Latency || prev.Consec != cur.Consec || prev.InFlight != cur.InFlight ||
+		prev.Served != cur.Served || prev.Checked != cur.Checked ||
+		prev.Fails != cur.Fails || prev.OK != cur.OK
 }
 
 // diff compares the given render against the previous one, updates the stored
@@ -284,8 +516,7 @@ func (h *wsHub) diff(current map[string]liveRow) (added []liveRow, removed []str
 			added = append(added, p)
 			continue
 		}
-		if prev.Latency != p.Latency || prev.Consec != p.Consec || prev.InFlight != p.InFlight ||
-			prev.Served != p.Served || prev.Checked != p.Checked || prev.Fails != p.Fails || prev.OK != p.OK {
+		if rowChanged(prev, p) {
 			updated = append(updated, p)
 		}
 	}

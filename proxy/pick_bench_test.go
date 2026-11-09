@@ -57,6 +57,31 @@ func BenchmarkPickHealthy(b *testing.B) {
 	}
 }
 
+// BenchmarkFreshPoolRebuild measures the rebuild half of the proven-pool
+// cache: an O(queue) pointer copy plus rank that runs once per
+// freshRebuildInterval on the serving path. BenchmarkPickHealthy mostly
+// walks the cached fast path, so the price of an expired interval — the one
+// moment writers wait for the scan — is invisible without this.
+func BenchmarkFreshPoolRebuild(b *testing.B) {
+	for _, n := range []int{1000, 70000} {
+		bucket := benchBucket(n)
+		b.Run(fmt.Sprintf("queue=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			now := time.Now()
+			for i := 0; i < b.N; i++ {
+				// Reset the stamp so every iteration takes the rebuild
+				// path: the freshMu round trip is part of what serving pays.
+				bucket.freshMu.Lock()
+				bucket.freshAt = time.Time{}
+				bucket.freshMu.Unlock()
+				if pool := bucket.freshPool(now); len(pool) == 0 {
+					b.Fatal("empty proven pool")
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkLiveListPage is the admin path: ranking a page of the queue is the
 // most expensive read the list renders. (Country/ASN filtering happens one
 // layer up, in admin live(), not in LiveListPage — there is no filter to pass

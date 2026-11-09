@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -250,11 +251,26 @@ func (c *Collector) fetch(ctx context.Context, site string, out chan<- Candidate
 		if probes < 1 {
 			probes = 1
 		}
-		for attempt := 0; attempt < retries; attempt++ {
+		skipped := 0 // unusable-schema picks passed over without burning a retry
+		picks := 0
+		for attempt := 0; attempt < retries; {
 			p, err := c.bucket.PickHealthy(ctx, probes, nil)
 			if err != nil {
 				break
 			}
+			// PickHealthy samples the whole queue and may hand back a proxy
+			// the HTTP fetch path cannot route through (socks4/vless/trojan).
+			// Skip it without burning a retry — but bound the re-picking, so
+			// a queue of unusable schemas falls through to the browser
+			// fallback instead of spinning here.
+			if !viaProxyUsable(p) {
+				skipped++
+				if picks++; picks >= retries*4 {
+					break
+				}
+				continue
+			}
+			attempt++
 			r = c.extractViaProxy(ctx, site, p)
 			if len(r.cands) > 0 {
 				p.MarkServeOK(0)
@@ -280,6 +296,9 @@ func (c *Collector) fetch(ctx context.Context, site string, out chan<- Candidate
 				// proxy itself is healthy, leave its counters alone.
 			}
 			viaNotes = append(viaNotes, r.note)
+		}
+		if skipped > 0 {
+			viaNotes = append(viaNotes, fmt.Sprintf("skipped %d unusable-schema picks", skipped))
 		}
 		if len(viaNotes) > 0 {
 			log.Printf("collector: %s -> direct [%s]; via-proxy [%s]", site, directNote, strings.Join(viaNotes, " | "))

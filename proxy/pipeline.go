@@ -166,12 +166,20 @@ func RevalidateSeeded(ctx context.Context, candidates chan<- Candidate, snap []*
 	if maxSeeds > 0 && len(snap) > maxSeeds {
 		snap = snap[:maxSeeds]
 	}
+	if maxSeeds <= 0 {
+		// The documented contract ("0 = 5000") mirrors revalidate_seed_rate:
+		// an absent key or an explicit 0 must not mean "no cap", or the full
+		// 65k seed dump floods the checker — exactly the starvation this cap
+		// exists to prevent.
+		maxSeeds = 5000
+	}
 	interval := time.Second / time.Duration(rate)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for _, p := range snap {
+		c := candidateFromProxy(p, p.Source())
 		select {
-		case candidates <- Candidate{Host: p.Host, Port: p.Port, Schema: p.Schema, Source: p.Source()}:
+		case candidates <- c:
 		case <-ctx.Done():
 			return
 		}

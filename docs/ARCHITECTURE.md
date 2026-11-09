@@ -171,12 +171,12 @@ For `schema="vless"` the checker:
 | ForwardDialer | `proxy/upstream.go` | `DialContext` with failover + passive feedback; `loop` set dials known-proxy addresses directly (anti self-loop); `NewTransport` (no keep-alives). |
 | ProxyTransport | `proxy/transport.go` | Request-level failover for plain HTTP (retries with a fresh transport, body rewound for retries), interstitial + block-page detection with a bounded `serve_sniff_timeout` sniff, device-junk/network-error classification. |
 | Sticky sessions | `proxy/sticky.go` | `PinPool`: pins a proxy to a connection/session key (`serve_pin_ttl`, optional `X-Sticky-Session` header), LRU eviction + reverse index; a pinned proxy's death rotates to a fresh one. |
-| Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT, optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections), `dialVLESS` (uTLS + REALITY + VLESS handshake; `security=none` runs it on raw TCP), `dialTrojan` (TLS-or-plaintext + SHA224 password handshake). |
+| Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT with Basic `Proxy-Authorization` when the URL carries userinfo; optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections; userinfo on the socks5 URL becomes RFC 1929 auth), `dialVLESS` (uTLS + REALITY + VLESS handshake; `security=none` runs it on raw TCP), `dialTrojan` (TLS-or-plaintext + SHA224 password handshake, password from the share-link userinfo). |
 | Checker | `proxy/checker.go` + `proxy/checker_probe.go` | Section 3: decisions (`Check`, `Revalidate`, `fullCheck`, bogon/self-IP rules). The evidence probes against the outside world — exit IP, content/leak verdicts, the end-to-end serving probe, the per-proxy transport, GeoIP (MaxMind MMDB) — are `checker_probe.go`. |
 | Collector | `proxy/collector.go` + `proxy/collect_fetch.go` | Section 1 left side. Cycle/scheduling: cookie jar, browser-grade headers, per-site cooldown, priority-ordered site walk with `max_sites_per_cycle` / `max_candidates_per_site` caps, blocking `emit`. One fetch: 429/503 + `Retry-After`, binary content-type guard, captcha/block-page classification, per-proxy transport cache, JS-protection hints in logs. |
 | Site telemetry | `proxy/sitestats.go` | `SiteRegistry`: per-source emitted/found/alive/fails, cooldown, deterministic rotation of untried sources, bounded to 200k tracked URLs. |
 | Extractor | `proxy/extract.go` (+ `extract_gate.go`, `extract_share.go`, `extract_spys.go`, `extract_base64.go`) | Universal `scheme://ip:port`, bare `ip:port`, `[ipv6]:port`, spys XOR decoder, `document.write` JS reconstruction (`proxy/jswrite.go`), then `regexp.txt` patterns (2 groups either order, or 1 group + `portBefore`). The gate that may skip a pass is documented in `extract_gate.go`; share links, spys and the base64 pass each have their own file. |
-| Proxy model | `proxy/model.go` + `proxy/model_proto.go` | `Proxy` + lock-free (`sync/atomic`) health stats: `consecFails`, `okTotal`/`failTotal`, latency EMA, `lastCheck`/`lastOK`, `source`. `Candidate`, `ParseProxyLine`. `model_proto.go` holds the cold `ProxyMeta` and its GeoIP/VLESS/trojan accessors plus the share-link query builders. |
+| Proxy model | `proxy/model.go` + `proxy/model_proto.go` | `Proxy` + lock-free (`sync/atomic`) health stats: `consecFails`, `okTotal`/`failTotal`, latency EMA, `lastCheck`/`lastOK`, `source`. `Candidate`, `ParseProxyLine` (userinfo on `http`/`https`/`socks5` kept raw percent-encoded as `ProxyMeta.proxyAuth`). `model_proto.go` holds the cold `ProxyMeta` and its GeoIP/VLESS/trojan/auth accessors plus the share-link query builders. |
 | Storage | `proxy/store.go` | `LoadSites` (BOM strip, normalize, dedup), `SiteList` (`LoadSiteList`/`Add`/`Remove`/`Render`/`SaveSiteList` with `.bak` for the admin editor), `ReadQueue`, `LoadRegexLines`, `AppendGood`, and the one atomic writer `writeFileAtomicTo` (temp + fsync + rename, pattern swept by `SweepOrphanTMP`) that `SaveBucketAtomic`, the sites/pool saves and the debug-proxies file all go through. |
 | Candidate Pool | `proxy/pool.go` | Persisted failed candidates with source attribution (`addr\t<source-url>`). Rotating re-probe (`Batch`), `Good()` marks validated entries. Caps at `max_candidates`: the oldest line is evicted to make room (never a newly discovered one), the file is trimmed to the tail on load and periodically compacted so it cannot outgrow the cap. |
 | SOCKS5 front | `proxy/socks5_server.go` | Minimal RFC 1928 server, tunnels each session via `ForwardDialer`, idle-deadline relay. Volume-aware verdict (`relayCount`). |
@@ -315,6 +315,18 @@ SNI-or-host and `InsecureSkipVerify` (self-signed is the norm); `none` is
 plaintext. The handshake carries SHA224(password). Credentials ride
 Candidate → Proxy → dial → pool/queue, so the same host:port with different
 passwords are distinct entries everywhere (bucket dedup is by full URL).
+
+### 9.5 Plain-scheme credentials
+
+`user:pass@host:port` on `http`/`https`/`socks5` lines is parsed end to end:
+`ParseProxyLine` stores the userinfo **raw** (percent-encoding preserved,
+never decoded/re-encoded — upstreams distinguish `%2F` from its decoded
+form) in `ProxyMeta.proxyAuth`; `Key()+URL()+URLLen()` include it, so
+credentials are part of the proxy's identity and the dedup rule above
+applies unchanged. The dialer turns it into a Basic `Proxy-Authorization`
+header for CONNECT and RFC 1929 for socks5. Socks4 is excluded (no auth in
+the protocol); `host:port:user:pass` column orderings remain unparsed (see
+`docs/REGEX.md`).
 
 ## 10. GeoIP integration
 

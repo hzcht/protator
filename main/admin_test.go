@@ -22,7 +22,15 @@ import (
 
 func newTestAdmin(t *testing.T) (*admin, *proxy.Bucket, string) {
 	t.Helper()
-	bucket := proxy.NewBucket(100)
+	return newTestAdminBucket(t, 100)
+}
+
+// newTestAdminBucket is newTestAdmin with a queue cap the test controls: the
+// default is sized for a few entries, and a test that must hit a render cap
+// brings a bigger bucket.
+func newTestAdminBucket(t *testing.T, max int) (*admin, *proxy.Bucket, string) {
+	t.Helper()
+	bucket := proxy.NewBucket(max)
 	cfg := &proxy.Config{}
 	cfg.Collector.SitesFile = filepath.Join(t.TempDir(), "sites.txt")
 	if err := os.WriteFile(cfg.Collector.SitesFile, []byte(

@@ -200,6 +200,9 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 		if cand.Schema == "vless" {
 			p.SetVLESS(cand.VLESSUUID, cand.VLESSFlow, cand.VLESSSNI, cand.VLESSPbk, cand.VLESSSid, cand.VLESSSpider, cand.VLESSNoTLS)
 		}
+		if cand.ProxyAuth != "" {
+			p.SetProxyAuth(cand.ProxyAuth)
+		}
 		// Precompute the identity before the proxy is published: every Key()
 		// on the productive population would otherwise rebuild the URL with
 		// fmt.Sprintf (rankPick calls it once per probe, up to 256 per pick,

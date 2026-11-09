@@ -128,7 +128,8 @@ shutdown_timeout = "10s"
 #   GET  /api/proxies  ?scope=hot|served|checked|all, format=text|csv|jsonl to download
 #   POST /api/proxies/revalidate  re-check the given proxies through the full checker
 #   WebSocket /ws      live health/proxy/source deltas
-# Everything except /health and /ready needs admin_token when it is set (a
+# Everything except /health, /ready, and the static shell (/ and /static/* —
+# no live data, just the login page) needs admin_token when it is set (a
 # Bearer header, or ?token= on the URL). The page remembers a token given on the
 # URL, so https://host:9090/?token=... works as a login link. Leave empty on a
 # loopback bind; the process warns loudly when a non-loopback listener has no

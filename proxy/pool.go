@@ -284,6 +284,11 @@ func (cp *CandidatePool) requestCompact() {
 // multi-megabyte write and its fsync out of the Add path that hundreds of
 // checker workers share.
 func (cp *CandidatePool) compactLoop(stop <-chan struct{}) {
+	// Bare goroutine: a panic here (rendering, disk I/O, log paths) would
+	// otherwise kill the whole process through the runtime, skipping main's
+	// defers — queue save, pool flush. Recover and keep looping: a wedged
+	// compaction is an incident; a dead process is a catastrophe.
+	defer RecoverPanic("pool: compact loop")
 	for {
 		select {
 		case <-stop:
@@ -513,12 +518,7 @@ func (cp *CandidatePool) Batch(n int) []Candidate {
 			if _, isGood := cp.good[pl.key]; isGood {
 				continue
 			}
-			out = append(out, Candidate{
-				Host:   pl.host,
-				Port:   pl.port,
-				Schema: pl.schema,
-				Source: pl.source,
-			})
+			out = append(out, pl.cand)
 		}
 	}
 	cp.cursor = (cp.cursor + examined) % len(cp.lines)
@@ -539,7 +539,7 @@ func (cp *CandidatePool) Len() int {
 // re-probed candidate can never validate — the exact hole the credentialed
 // extractor note warns about.
 func candidateLine(c Candidate) string {
-	if c.Schema == "" || c.Schema == "http" {
+	if (c.Schema == "" || c.Schema == "http") && c.ProxyAuth == "" {
 		return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	}
 	p := &Proxy{Schema: c.Schema, Host: c.Host, Port: c.Port, meta: &ProxyMeta{}}
@@ -548,6 +548,9 @@ func candidateLine(c Candidate) string {
 	}
 	if c.Schema == "trojan" {
 		p.SetTrojan(c.TrojanPassword, c.TrojanSNI, c.TrojanNoTLS)
+	}
+	if c.ProxyAuth != "" {
+		p.SetProxyAuth(c.ProxyAuth)
 	}
 	return p.URL()
 }
@@ -580,6 +583,12 @@ type poolLine struct {
 	schema string
 	source string
 	line   string
+	// cand carries the FULL parsed candidate — credentials included. Batch
+	// used to re-emit only host/port/schema/source, which silently stripped
+	// the password from every credentialed line (trojan/vless uuid/password,
+	// http/socks user:pass): the re-probed candidate could never validate and
+	// was dropped as dead.
+	cand Candidate
 }
 
 func parsePoolLine(line string) (poolLine, bool) {
@@ -591,7 +600,15 @@ func parsePoolLine(line string) (poolLine, bool) {
 	if err != nil {
 		return poolLine{}, false
 	}
-	return poolLine{key: p.Key(), host: p.Host, port: p.Port, schema: p.Schema, source: source, line: line}, true
+	return poolLine{
+		key:    p.Key(),
+		host:   p.Host,
+		port:   p.Port,
+		schema: p.Schema,
+		source: source,
+		line:   line,
+		cand:   candidateFromProxy(p, source),
+	}, true
 }
 
 // readPoolLines loads the persisted pool. A read failure is logged and treated

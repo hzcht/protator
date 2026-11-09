@@ -176,3 +176,40 @@ func TestPlainHTTPProbeCanBeDisabled(t *testing.T) {
 		t.Error("probe disabled but the deadline was still armed")
 	}
 }
+
+// The loop set is keyed by proxy Key. The startup wiring subscribes to change
+// events and then seeds from a snapshot; a proxy added in that window used to
+// be counted twice by the old addr refcount while the bucket held it once, and
+// no later Remove could unwind the phantom count — the dialer bypassed that
+// addr forever (refusing to dial an upstream it thinks is itself).
+func TestNetworkSetKeyedMembership(t *testing.T) {
+	ns := newNetworkSet()
+	p := &Proxy{Schema: "http", Host: "10.1.2.3", Port: 8080}
+	// The exact startup interleaving: change event, then the seed pass sees
+	// the same proxy in the snapshot.
+	ns.add(p.Key(), p.Addr())
+	ns.add(p.Key(), p.Addr()) // double-add must be idempotent
+	if !ns.contains(p.Addr()) {
+		t.Fatal("a registered proxy's addr must be contained")
+	}
+	ns.remove(p.Key()) // the single Remove the bucket sends
+	if ns.contains(p.Addr()) {
+		t.Fatal("phantom count survived the single Remove: the addr is bypassed forever")
+	}
+
+	// Two entries sharing one host:port (http + socks5 are distinct bucket
+	// entries): removing one must not unblock the other.
+	q := &Proxy{Schema: "socks5", Host: "10.1.2.3", Port: 8080}
+	ns.add(p.Key(), p.Addr())
+	ns.add(q.Key(), q.Addr())
+	ns.remove(p.Key())
+	if !ns.contains(p.Addr()) {
+		t.Fatal("removing the http entry unblocked the socks5 entry on the same addr")
+	}
+	ns.remove(q.Key())
+	if ns.contains(p.Addr()) {
+		t.Fatal("addr stayed contained after both entries were removed")
+	}
+	// Removing an unknown Key is a no-op, not a panic or a negative count.
+	ns.remove(q.Key())
+}

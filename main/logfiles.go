@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,6 +188,13 @@ func hasPrefix(line, prefix string) bool {
 func (s *fileLogSink) file(cat string) *rotatingFile {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Read the flag before anything else: after a failure below the sink must
+	// not touch the dir again (MkdirAll per line) — and it must not log
+	// through itself while holding s.mu (sync.Mutex is not reentrant; that
+	// log.Printf deadlocked every future logger on the first line).
+	if s.disabled {
+		return nil
+	}
 	if f, ok := s.files[cat]; ok {
 		return f
 	}
@@ -197,11 +203,10 @@ func (s *fileLogSink) file(cat string) *rotatingFile {
 		return nil
 	}
 	if err := os.MkdirAll(s.cfg.Dir, 0o755); err != nil {
-		// Log once (to stderr — the sink is what failed) and disable file
-		// logging: without the disable flag every subsequent line retried
-		// the MkdirAll, and without the log the operator never learned why
-		// the files were missing. Stderr-only is the safe fallback.
-		log.Printf("filelog: cannot create log dir %s: %v; continuing with stderr only", s.cfg.Dir, err)
+		// Report once, straight to stderr: log.Printf re-enters this sink
+		// (Write → file() → s.mu) while s.mu is held — a non-reentrant
+		// self-deadlock that took down every logger in the process with it.
+		fmt.Fprintf(os.Stderr, "filelog: cannot create log dir %s: %v; continuing with stderr only\n", s.cfg.Dir, err)
 		s.disabled = true
 		return nil
 	}

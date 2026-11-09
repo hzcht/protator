@@ -2,8 +2,11 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -487,6 +490,49 @@ func TestCollectorViaProxyChargesFaults(t *testing.T) {
 		}
 		if b.Len() != 0 {
 			t.Fatalf("junk proxy must be evicted from the pool")
+		}
+	})
+
+	t.Run("unusable-schema picks do not burn retries", func(t *testing.T) {
+		// A queue of only trojan proxies: every PickHealthy result is unusable
+		// for the HTTP fetch path. The retry loop must re-pick (bounded)
+		// instead of burning retry slots on guaranteed rejections, never
+		// charge a fault, and summarize the skips in one aggregated note.
+		b := NewBucket(16)
+		var trojans []*Proxy
+		for i := 0; i < 3; i++ {
+			p := mustProxy(t, fmt.Sprintf("trojan://secret@10.9.%d.1:443", i+1))
+			b.Add(p)
+			trojans = append(trojans, p)
+		}
+		cfg := mkCfg()
+		col, err := NewCollector(cfg, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var logs bytes.Buffer
+		log.SetOutput(&logs)
+		defer log.SetOutput(os.Stderr)
+		out := make(chan Candidate, 8)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if n := col.fetch(ctx, directDead, out); n != -1 {
+			t.Fatalf("fetch must fail, got %d", n)
+		}
+		for _, p := range trojans {
+			if p.ConsecFails() != 0 {
+				t.Fatalf("unusable-schema proxy must not be charged, fails=%d", p.ConsecFails())
+			}
+		}
+		if b.Len() != 3 {
+			t.Fatalf("unusable-schema proxies must not be evicted, len=%d", b.Len())
+		}
+		got := logs.String()
+		if !strings.Contains(got, "skipped 8 unusable-schema picks") {
+			t.Fatalf("log must aggregate the skipped picks: %q", got)
+		}
+		if strings.Contains(got, "via-proxy unsupported") {
+			t.Fatalf("no retry may be spent on an unusable pick: %q", got)
 		}
 	})
 }
