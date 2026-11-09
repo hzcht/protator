@@ -17,11 +17,10 @@ import (
 	"protator/proxy"
 )
 
-// Version answers "which build is in production". There were no tags before
-// versioning started, so this begins at 0.1.0-dev and the first tag defines
-// 0.1.0; until then every build reports the same -dev version, which is
-// honest: without a tag there is nothing else to name them by.
-const protatorVersion = "0.1.0-dev"
+// Version answers "which build is in production". The first tag (v0.1.0,
+// 2026-11-09) defines 0.1.0; builds from tagged commits report exactly that,
+// working-tree builds report it too until the next bump.
+const protatorVersion = "0.1.0"
 
 func main() {
 	cfgPath := flag.String("config", "config/config.toml", "path to TOML config")

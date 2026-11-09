@@ -2,10 +2,13 @@
 
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Everything not in a tag yet lives in `## [Unreleased]`, because this project
-has no release process yet and an unmarked change is a change nobody can find.
+Tagged releases get their own heading with the tag's date; everything not in
+a tag lives in `## [Unreleased]`, because an unmarked change is a change
+nobody can find.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-11-09
 
 ### Fixed
 
