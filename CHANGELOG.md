@@ -8,6 +8,23 @@ nobody can find.
 
 ## [Unreleased]
 
+### Added
+
+- **Credentialed proxies are extracted, not only parsed.** The collector now
+  reads `scheme://user:pass@ip:port` and bare `user:pass@ip:port` tokens and
+  blanks them out of the text the anonymous passes see: the bare socket inside
+  a credentialed token is the same entry, so validating the anonymous view
+  spent a check to come back 407/dead. Socks4 userinfo is dropped (the protocol
+  has no auth). `host:port:user:pass` column exports yield both candidates —
+  the anonymous one survives stale credentials, the credentialed one has its
+  own identity key.
+- **`ParseProxyLine` accepts `host:port:user:pass`** (queue/API/pool input):
+  no scheme, no `@`, dotted host, numeric port; `SplitN(4)` keeps any further
+  colons inside the password. The extractor's column suffix is deliberately
+  stricter (both fields bounded, at least one ASCII letter, no URL-significant
+  bytes), so a clock (`:10:00:30`) or a second port (`:3128`) is not read as
+  auth.
+
 ## [0.1.0] - 2026-11-09
 
 ### Fixed

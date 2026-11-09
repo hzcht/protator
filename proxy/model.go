@@ -39,7 +39,7 @@ type Proxy struct {
 	// must serve lock-free on every dial.
 	keyCache string
 
-	// Cold fields (admin/debug only) вЂ” allocated separately to keep Proxy small.
+	// Cold fields (admin/debug only) — allocated separately to keep Proxy small.
 	meta *ProxyMeta
 }
 
@@ -61,7 +61,7 @@ func (p *Proxy) MarkInFlightDone() { atomic.AddInt64(&p.inFlight, -1) }
 func (p *Proxy) InFlight() int64 { return atomic.LoadInt64(&p.inFlight) }
 
 // MarkDialOK records a successful upstream dial: a latency sample only. Health
-// is settled later by MarkServeOK / MarkServeFail once the outcome is known вЂ”
+// is settled later by MarkServeOK / MarkServeFail once the outcome is known —
 // a dial that merely connected must never clear a failure streak, or every
 // response-level charge (blackhole, device answer) would be wiped by the next
 // request's dial to the same proxy.
@@ -198,7 +198,7 @@ func (c Candidate) key() string {
 	base := fmt.Sprintf("%s:%d", c.Host, c.Port)
 	// Credentialed protocols: the same host:port with a different password
 	// is a different proxy (trojan lists reuse hosts across passwords), so
-	// the credential joins the identity вЂ” otherwise extraction dedup keeps
+	// the credential joins the identity — otherwise extraction dedup keeps
 	// only the first password per host:port and the rest are never tried.
 	switch c.Schema {
 	case "vless":
@@ -294,7 +294,7 @@ func (p *Proxy) AppendURL(buf []byte) []byte {
 	if s == "vless" && p.GetVLESSUUID() != "" {
 		// Must include the addr, same as URL(): without host:port the queue
 		// save rendered "vless://uuid@?flow=вЂ¦", ParseProxyLine failed at
-		// splitHostPort("") on reload and silently dropped the entry вЂ” the
+		// splitHostPort("") on reload and silently dropped the entry — the
 		// save/reload cycle deleted every VLESS proxy while URLLen (which
 		// counts the addr) and AppendGood(p.URL()) stayed correct.
 		buf = append(buf, "vless://"...)
@@ -345,8 +345,10 @@ func (p *Proxy) Key() string {
 }
 
 // ParseProxyLine parses queue lines into a Proxy.
-// Accepted forms: "host:port", "scheme://host:port", "scheme://user:pass@host:port",
-// "vless://uuid@host:port?...", "trojan://password@host:port?...".
+// Accepted forms: "host:port", "host:port:user:pass",
+// "scheme://host:port", "scheme://user:pass@host:port",
+// "user:pass@host:port", "vless://uuid@host:port?...",
+// "trojan://password@host:port?...".
 func ParseProxyLine(line string) (*Proxy, error) {
 	s := strings.TrimSpace(line)
 	if s == "" || strings.HasPrefix(s, "#") {
@@ -354,8 +356,10 @@ func ParseProxyLine(line string) (*Proxy, error) {
 	}
 
 	schema := "http"
+	explicitScheme := false
 	rest := s
 	if i := strings.Index(s, "://"); i >= 0 {
+		explicitScheme = true
 		schema = strings.ToLower(s[:i])
 		// Umbrella spellings (socks5h://, socks4a://) normalize to dialer
 		// names: the extractor already does this, but queue/pool files may
@@ -452,6 +456,20 @@ func ParseProxyLine(line string) (*Proxy, error) {
 		rest = rest[at+1:]
 	}
 
+	// host:port:user:pass exports (spys-style columns) carry neither a
+	// scheme nor an "@". Tried only when the line had no explicit scheme and
+	// no userinfo: the shape is then unambiguous enough — one dotted host,
+	// one numeric port, the rest is the raw userinfo (SplitN keeps any
+	// further colons inside the password).
+	if !explicitScheme && proxyAuth == "" {
+		if host, port, auth, ok := splitCredentialColumns(rest); ok {
+			p := &Proxy{Schema: schema, Host: host, Port: port, meta: &ProxyMeta{}}
+			p.SetProxyAuth(auth)
+			p.keyCache = p.URL()
+			return p, nil
+		}
+	}
+
 	host, portStr, err := splitHostPort(rest)
 	if err != nil {
 		return nil, err
@@ -509,7 +527,7 @@ func candidateFromProxy(p *Proxy, source string) Candidate {
 }
 
 // splitHostPort splits host:port, handling [ipv6]:port and bare IPv6 without
-// brackets followed by ":port" (which is ambiguous вЂ” treat as bracketed form
+// brackets followed by ":port" (which is ambiguous — treat as bracketed form
 // requirement, i.e. require net.SplitHostPort for correctness).
 func splitHostPort(s string) (string, string, error) {
 	// Bracketed form or domain form: handled by net.SplitHostPort.
@@ -529,4 +547,25 @@ func splitHostPort(s string) (string, string, error) {
 		return host, port, nil
 	}
 	return "", "", fmt.Errorf("not a host:port string %q", s)
+}
+
+// splitCredentialColumns parses "host:port:user:pass" — the credential shape
+// spys-style exports publish. Deliberately narrow: no brackets, no "@", no
+// URL-significant bytes anywhere; a dotted host (IPv4 or domain), a numeric
+// port, and both credential fields non-empty. Anything else falls through to
+// the normal host:port path, so a bare IPv6 line with several colons is not
+// misread as auth (its port field would not parse).
+func splitCredentialColumns(s string) (host string, port int, auth string, ok bool) {
+	if strings.ContainsAny(s, "[]@/?# \t\r\n\"'<>") {
+		return "", 0, "", false
+	}
+	parts := strings.SplitN(s, ":", 4)
+	if len(parts) != 4 || !strings.Contains(parts[0], ".") || parts[2] == "" || parts[3] == "" {
+		return "", 0, "", false
+	}
+	p, err := strconv.Atoi(parts[1])
+	if err != nil || p < 1 || p > 65535 {
+		return "", 0, "", false
+	}
+	return parts[0], p, parts[2] + ":" + parts[3], true
 }

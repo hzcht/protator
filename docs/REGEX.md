@@ -9,6 +9,9 @@ always run first:
 | shape | notes |
 |-------|-------|
 | `scheme://ip:port` | http, https, socks4/5, protocol kept |
+| `scheme://user:pass@ip:port` | raw userinfo kept for http/https/socks5; socks4 drops it (no protocol auth) |
+| `user:pass@ip:port` | bare export form; `name@ip:port` without a colon is ignored (email/mention) |
+| `ip:port:user:pass` | column exports: anonymous **and** credentialed candidates; the suffix needs a letter and bounded fields |
 | bare `ip:port` | protocol unknown → probed later via `checker.probe_order` |
 | `[ipv6]:port` | bracketed literal only; a bare IPv6 is ambiguous by design |
 | spys.one JS ports | `document.write(":"+(a^b)+...)` decoded without a browser |
@@ -50,16 +53,25 @@ These look like limitations and are not:
 - **`schemaNear` only looks 80 bytes around a match.** It is a poor man's
   context sniffing, not a parser; a protocol token further away is ignored
   rather than guessed.
+- **A credentialed token is emitted once, then blanked from the text the
+  anonymous passes see.** The bare `ip:port` inside `scheme://user:pass@ip:port`
+  is the same socket; validating it anonymously spends a check to earn a 407.
+- **The `host:port:user:pass` suffix is conservative.** Both fields must be
+  non-empty and bounded, at least one must contain an ASCII letter, and no
+  `/?#@[]` byte may appear. A clock (`…:8080:10:00:30`) or a second port
+  (`…:8080:3128`) is therefore not read as auth. The anonymous candidate is
+  still emitted before the credentialed one — stale column credentials must
+  not hide a working socket.
 
 ## Missing on purpose
 
-- **Column-order credential shapes** (`host:port:user:pass` and spys-style
-  permutations): the `user:pass@host:port` userinfo form is supported end to
-  end for `http`/`https`/`socks5` (raw percent-encoded `ProxyMeta.proxyAuth`,
-  Basic in the CONNECT handshake, RFC 1929 on socks5 — `proxy/auth_test.go`),
-  so the hard pipeline exists; these orderings are a parsing decision
-  (`ParseProxyLine`/the spys decoder), not a project. Socks4 auth is missing
-  *on protocol grounds* — the protocol has none.
+- **Other credential permutations** (`user:pass:host:port`, CSV columns in
+  another order): the `user:pass@host:port` and `host:port:user:pass` forms are
+  supported end to end for `http`/`https`/`socks5` (raw percent-encoded
+  `ProxyMeta.proxyAuth`, Basic in the CONNECT handshake, RFC 1929 on socks5 —
+  `proxy/auth_test.go`). Further orderings have no measured source yet, and
+  guessing them from arbitrary page text invites false positives. Socks4 auth
+  is missing *on protocol grounds* — the protocol has none.
 - **`ss://`** — no dial path exists. **`vmess://`** — needs a VMess AEAD
   transport, a crypto feature, not regexps. Neither carries a pattern in
   `regexp.txt`: every match would burn a full multi-protocol check on a
@@ -81,6 +93,7 @@ stays out, and what any future protocol must bring with it.
 | `"ip":"...","port":...` in one JSON record | geonode API, openproxy.space, proxylist.icu |
 | `?ip=...&port=...` | proxysearcher-style APIs |
 | `1.2.3.4,8080,US,anonymous` | CSV exports (proxifly, proxy-gatherer) |
+| `1.2.3.4:8080:user:pass` | column exports / spys-style dumps with credentials |
 | `server: ip` + `port: N` | Clash/QuanX/Surge subscription blocks |
 | `data-proxy-ip` / `data-proxy-port` | newer panel themes |
 | `ss://…@ip:port`, `vless://…@ip:port`, `trojan://…` | protocol subscription lists |

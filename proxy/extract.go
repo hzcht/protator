@@ -18,6 +18,14 @@ var (
 	reBareV4   = regexp.MustCompile(`\b(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
 	reBareV6   = regexp.MustCompile(`\[([0-9a-fA-F:]{2,45})\]:([0-9]{1,5})\b`)
 
+	// Credentialed universal shapes, same socket-detection rules as the two
+	// above. The userinfo charset stops at "@", whitespace, markup and the
+	// URL-significant bytes that must be percent-encoded in a token ("/?#[]"):
+	// without that, an unsupported scheme's "ftp://" prefix would be swallowed
+	// into the userinfo and the "after ://" guard could never fire.
+	reSchemeCredV4 = regexp.MustCompile(`(?i)\b(https?|socks5h?|socks4a?)://([^@\s"'<>/?#\[\]]{1,255})@(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
+	reBareCredV4   = regexp.MustCompile(`([^@\s"'<>/?#\[\]]{1,255})@(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
+
 	// spys.one-style JS-obfuscated ports:
 	//   1.2.3.4<script>document.write("..."+(varA^varB)+(varC^varD)...)</script>
 	// with the variables defined in another script block on the same page
@@ -172,6 +180,62 @@ func (e *Extractor) extract(text string) []Candidate {
 		text = string(buf)
 	}
 
+	// 0b) Credentialed forms: scheme://user:pass@ip:port (URL form) and
+	// user:pass@ip:port (bare export form). The credential is part of the
+	// proxy's identity and the bare host:port inside the token is the same
+	// socket — emit the credentialed candidate, then blank the token so the
+	// anonymous passes below do not spend a validation on an unauthenticated
+	// view of it. socks4 has no auth in the protocol: its userinfo is
+	// dropped (matching ParseProxyLine) and the token still blanked.
+	if strings.Contains(text, "@") {
+		if strings.Contains(text, "://") {
+			for _, m := range reSchemeCredV4.FindAllStringSubmatchIndex(text, -1) {
+				if len(m) != 10 {
+					continue
+				}
+				port, ok := parsePort(text[m[8]:m[9]])
+				if !ok {
+					continue
+				}
+				schema := normScheme(text[m[2]:m[3]])
+				var auth string
+				if schema == "http" || schema == "https" || schema == "socks5" {
+					auth = text[m[4]:m[5]]
+				}
+				emit(Candidate{Host: text[m[6]:m[7]], Port: port, Schema: schema, ProxyAuth: auth})
+				blank(m[0], m[1])
+			}
+			if buf != nil {
+				text = string(buf)
+			}
+		}
+		for _, m := range reBareCredV4.FindAllStringSubmatchIndex(text, -1) {
+			if len(m) != 8 {
+				continue
+			}
+			userinfo := text[m[2]:m[3]]
+			// Require the user:pass shape: "name@ip:port" in page text is far
+			// more often an email or a mention than a proxy credential.
+			if !strings.Contains(userinfo, ":") {
+				continue
+			}
+			// The tail of an unsupported scheme (ftp://…) is guesswork, not a
+			// proxied list entry.
+			if m[0] >= 3 && text[m[0]-3:m[0]] == "://" {
+				continue
+			}
+			port, ok := parsePort(text[m[6]:m[7]])
+			if !ok {
+				continue
+			}
+			emit(Candidate{Host: text[m[4]:m[5]], Port: port, ProxyAuth: userinfo})
+			blank(m[0], m[1])
+		}
+		if buf != nil {
+			text = string(buf)
+		}
+	}
+
 	// One pre-scan decides for everything below that needs a dotted quad
 	// (reBareV4, the spys pass and every site pattern whose source starts with
 	// the IPv4 group). Computed after blanking: blanking only ever removes
@@ -216,6 +280,12 @@ func (e *Extractor) extract(text string) []Candidate {
 				continue
 			}
 			emit(Candidate{Host: host, Port: port})
+			// "…:8080:user:pass": keep the anonymous candidate (its creds may
+			// be stale/junk) and add the credentialed one; two keys, two
+			// checks, one of them can win.
+			if auth, ok := credentialColumnAfter(text, m[5]); ok {
+				emit(Candidate{Host: host, Port: port, ProxyAuth: auth})
+			}
 		}
 	}
 	// 3) [ipv6]:port — every match starts with "["
@@ -287,6 +357,57 @@ func (e *Extractor) extract(text string) []Candidate {
 		}
 	}
 	return out
+}
+
+// credentialColumnAfter returns the "user:pass" token directly following a
+// host:port match ("…:8080:user:pass", the shape spys-style exports publish).
+//
+// Conservative on purpose: the token must be one run of non-delimiter bytes,
+// both fields non-empty, no URL-significant bytes, and at least one field
+// must contain a letter. A clock ("…:8080:10:00:30") or a port list
+// ("…:8080:3128") is therefore not read as auth — attaching that junk would
+// double the validations for the same socket with a credential the source
+// never provided.
+func credentialColumnAfter(text string, pos int) (string, bool) {
+	if pos >= len(text) || text[pos] != ':' {
+		return "", false
+	}
+	end := pos + 1
+	for end < len(text) && !credentialTokenDelim(text[end]) {
+		end++
+	}
+	userinfo := text[pos+1 : end]
+	user, pass, ok := strings.Cut(userinfo, ":")
+	if !ok || user == "" || pass == "" || len(user) > 64 || len(pass) > 128 {
+		return "", false
+	}
+	if strings.ContainsAny(userinfo, "/?#@[]") {
+		return "", false
+	}
+	if !hasASCIICredentialLetter(user) && !hasASCIICredentialLetter(pass) {
+		return "", false
+	}
+	return userinfo, true
+}
+
+// credentialTokenDelim are the bytes that end a list token: whitespace,
+// markup and list separators. ':' is deliberately not one — it separates the
+// userinfo fields.
+func credentialTokenDelim(c byte) bool {
+	switch c {
+	case ' ', '\t', '\r', '\n', '"', '\'', '<', '>', '`', '|', ',', ';', ')', ']', '}':
+		return true
+	}
+	return false
+}
+
+func hasASCIICredentialLetter(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return true
+		}
+	}
+	return false
 }
 
 func portBefore(s string) (int, bool) {

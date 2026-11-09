@@ -404,3 +404,145 @@ func TestCredentialLinePortParsing(t *testing.T) {
 		}
 	}
 }
+
+// host:port:user:pass is the column shape spys-style exports publish. It is
+// parsed only in that exact, unambiguous form; everything else must still
+// fail loudly rather than half-parse.
+func TestProxyLineCredentialColumns(t *testing.T) {
+	p, err := ParseProxyLine("1.2.3.4:8080:user:p%40ss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Schema != "http" || p.Host != "1.2.3.4" || p.Port != 8080 {
+		t.Fatalf("socket parsed wrong: %+v", p)
+	}
+	if got, want := p.GetProxyAuth(), "user:p%40ss"; got != want {
+		t.Fatalf("raw auth = %q, want %q", got, want)
+	}
+	// The column form normalizes to the URL form, so queue persistence and
+	// the dialer share one representation.
+	if got, want := p.URL(), "http://user:p%40ss@1.2.3.4:8080"; got != want {
+		t.Fatalf("URL = %q, want %q", got, want)
+	}
+
+	// SplitN keeps every colon after the user in the password.
+	q, err := ParseProxyLine("1.2.3.4:8080:user:pa:ss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := q.GetProxyAuth(), "user:pa:ss"; got != want {
+		t.Fatalf("multi-colon password = %q, want %q", got, want)
+	}
+
+	// Domains are acceptable hosts for queue/API input (extraction itself
+	// stays IPv4-only); the first two fields decide the socket.
+	d, err := ParseProxyLine("proxy.example.com:8080:user:pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Host != "proxy.example.com" || d.Port != 8080 || d.GetProxyAuth() != "user:pass" {
+		t.Fatalf("domain column parse = %+v", d)
+	}
+
+	// Too few fields: an error, not a silent host:port read.
+	if _, err := ParseProxyLine("1.2.3.4:8080:user"); err == nil {
+		t.Fatal("three-field line parsed as a proxy")
+	}
+	// A bare IPv6 line must not be mistaken for columns (its "port" fails to
+	// parse, and splitHostPort requires brackets for more than one colon).
+	if _, err := ParseProxyLine("2001:db8::1:8080"); err == nil {
+		t.Fatal("bare IPv6 line parsed as a proxy")
+	}
+	if _, err := ParseProxyLine("[2001:db8::1]:8080"); err != nil {
+		t.Fatalf("bracketed IPv6: %v", err)
+	}
+}
+
+// Extraction must see credentials in both universal forms; otherwise the
+// only candidate for a credentialed list is the anonymous host:port, which
+// validates as 407/dead and loses the source. The column and clock cases pin
+// the conservative suffix rules.
+func TestExtractCredentialedForms(t *testing.T) {
+	e := &Extractor{}
+	cases := []struct {
+		name string
+		body string
+		want []Candidate
+	}{
+		{
+			name: "scheme url",
+			body: `<a href="http://user:pass@1.2.3.4:8080">x</a>`,
+			want: []Candidate{{Host: "1.2.3.4", Port: 8080, Schema: "http", ProxyAuth: "user:pass"}},
+		},
+		{
+			name: "socks5 raw percent",
+			body: "socks5://u:p%40ss@5.6.7.8:1080",
+			want: []Candidate{{Host: "5.6.7.8", Port: 1080, Schema: "socks5", ProxyAuth: "u:p%40ss"}},
+		},
+		{
+			name: "socks4 drops auth",
+			body: "socks4://user:pass@9.9.9.9:4145",
+			want: []Candidate{{Host: "9.9.9.9", Port: 4145, Schema: "socks4"}},
+		},
+		{
+			name: "bare userinfo",
+			body: "user:pass@2.2.2.2:3128",
+			want: []Candidate{{Host: "2.2.2.2", Port: 3128, ProxyAuth: "user:pass"}},
+		},
+		{
+			name: "columns keep both",
+			body: "3.3.3.3:8080:user:pass",
+			want: []Candidate{
+				{Host: "3.3.3.3", Port: 8080},
+				{Host: "3.3.3.3", Port: 8080, ProxyAuth: "user:pass"},
+			},
+		},
+		{
+			name: "clock is not auth",
+			body: "4.4.4.4:8080:10:00:30",
+			want: []Candidate{{Host: "4.4.4.4", Port: 8080}},
+		},
+		{
+			name: "port list is not auth",
+			body: "4.4.4.5:8080:3128",
+			want: []Candidate{{Host: "4.4.4.5", Port: 8080}},
+		},
+		{
+			name: "email is not userinfo",
+			body: "admin@6.6.6.6:8080",
+			want: []Candidate{{Host: "6.6.6.6", Port: 8080}},
+		},
+		{
+			// ftp:// is not a proxy scheme: its userinfo is guesswork, so only
+			// the anonymous socket is kept. Pins the "after ://" guard, which
+			// only fires because '/' and '?' are excluded from the userinfo
+			// class (otherwise the match would start at "ftp").
+			name: "unsupported scheme is not userinfo",
+			body: "ftp://user:pass@7.7.7.7:8080",
+			want: []Candidate{{Host: "7.7.7.7", Port: 8080}},
+		},
+	}
+	for _, tc := range cases {
+		got := e.Extract([]byte(tc.body))
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: got %d candidates %v, want %d %v", tc.name, len(got), got, len(tc.want), tc.want)
+		}
+		want := make(map[string]Candidate, len(tc.want))
+		for _, c := range tc.want {
+			want[c.key()] = c
+		}
+		for _, c := range got {
+			w, ok := want[c.key()]
+			if !ok {
+				t.Fatalf("%s: unexpected candidate %+v (key %q)", tc.name, c, c.key())
+			}
+			if c.Host != w.Host || c.Port != w.Port || c.Schema != w.Schema || c.ProxyAuth != w.ProxyAuth {
+				t.Fatalf("%s: candidate %+v, want %+v", tc.name, c, w)
+			}
+			delete(want, c.key())
+		}
+		if len(want) != 0 {
+			t.Fatalf("%s: missing candidates %v", tc.name, want)
+		}
+	}
+}
