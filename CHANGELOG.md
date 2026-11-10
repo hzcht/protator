@@ -25,6 +25,36 @@ nobody can find.
   bytes), so a clock (`:10:00:30`) or a second port (`:3128`) is not read as
   auth.
 
+### Changed
+
+- **The extractor skips every pass a body cannot match.** Each pattern's
+  parse is analyzed at startup (`needsIPv4`), so a quad-less body runs none
+  of the 59 site patterns that require an IPv4 quad (all but the IPv6 table
+  one). The cred/scheme passes gained the same cheap filters (`'@'` followed
+  by a digit; ASCII-case "http"/"socks"). Scheme regexes use the same explicit
+  ASCII-case grammar instead of Go's broader Unicode `(?i)`, keeping the
+  filters and downstream URI dispatch consistent. All filters are one linear
+  scan and provably never drop a possible match.
+- **`config/regexp.txt` deduplicated and its CSV separator rewritten.** The
+  universal bare pass already covers `\b(ip:port)\b` (removed), the
+  ditatompel line was byte-identical to proxy-list.org's (removed), and the
+  CSV separator became the single-byte class `(?:\A|[,;\r\n])` — additive
+  only (a lone `\r` separator is newly tolerated).
+
+### Performance
+
+- **Extraction on the 130 KB fixture: 241 ms → ~130 ms (1.0 MB/s); a
+  quad-less junk page 165 ms → 2.65 ms.** After the gates, patterns that open
+  with the IPv4 quad (`reBareV4` and the IP-leading site patterns) are probed
+  at the quad offsets inside a parse-derived window instead of full-body
+  scans — ~9 ms each → ~0.5–0.9 ms. The equivalence with `FindAll`
+  (identical matches, spans, order) is pinned body-by-body by
+  `TestSiteAnchoredPathMatchesFindAll`; the machinery and its deliberately
+  refused generalizations (mid-pattern quads) live in `extract_anchor.go`
+  and problems.md §21. Case-folded literals reserve four UTF-8 bytes per rune,
+  a probe plan is capped by its **total** window (not per step), and
+  `FuzzAnchoredMatchesFindAll` adds arbitrary-body equivalence coverage.
+
 ## [0.1.0] - 2026-11-09
 
 ### Fixed

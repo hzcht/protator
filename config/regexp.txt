@@ -138,8 +138,8 @@ port-([0-9]{1,5})[^0-9]{0,200}([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 # cyber-gateway.net style
 <td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>\s*\w{2}\s*</td>
 
-# ditatompel.com style
-<tr[^>]*>\s*<td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>
+# ditatompel.com style — dropped: byte-for-byte identical to the
+# proxy-list.org line below (both end on an open third cell).
 
 # aliveproxy.com style
 <td[^>]*>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*</td>\s*<td[^>]*>\s*([0-9]{1,5})\s*</td>\s*<td[^>]*>\s*[A-Z]{2}\s*</td>
@@ -202,8 +202,9 @@ port-([0-9]{1,5})[^0-9]{0,200}([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 # Brightdata/GeoSurf style with country code
 "ip"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"[^}]{0,100}"port"\s*:\s*([0-9]{1,5})[^}]{0,50}"country"\s*:\s*"[A-Z]{2}"
 
-# scrapers like proxy-gatherer output: "1.2.3.4:8080"
-\b([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})\b
+# Scrapers like proxy-gatherer output: "1.2.3.4:8080". Not listed anymore —
+# the universal bare pass (proxy/extract.go reBareV4) is exactly this shape
+# and always runs; a second copy here re-costs a linear pass per body.
 
 # KDL / RoketPro style: {"host":"1.2.3.4","port":8080}
 "host"\s*:\s*"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*,\s*"port"\s*:\s*([0-9]{1,5})
@@ -223,7 +224,13 @@ port-([0-9]{1,5})[^0-9]{0,200}([0-9]{1,3}(?:\.[0-9]{1,3}){3})
 # CSV exports with unquoted columns: 1.2.3.4,8080,US,anonymous
 # (the quoted variant already exists above; this is the default
 # encoding/csv writer, which does not quote numbers)
-(?:^|,|\r?\n|;)\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*[,;]\s*([0-9]{1,5})\s*[,;\r\n]
+# The separator is a one-byte class, not "^|,|\r?\n|;": RE2 pays for the
+# alternation at every byte of every body, and the single-byte form (plus the
+# \s* that follows it) matches everything the per-branch form did — except it
+# also tolerates a lone CR, which no current exporter emits and which can
+# only add a candidate, never drop one. Measured: ~27 ms of a 130 KB page was
+# this pattern's alternation walk.
+(?:\A|[,;\r\n])\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*[,;]\s*([0-9]{1,5})\s*[,;\r\n]
 
 # Clash / quanx / surge subscription blocks (yaml or inline maps):
 #   proxies:

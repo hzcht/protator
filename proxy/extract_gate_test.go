@@ -34,6 +34,10 @@ func TestExtractGatesNeverDropMatches(t *testing.T) {
 		"share links": "trojan://secret@example.com:443?type=tcp#x\nvless://01234567-89ab-cdef-0123-456789abcdef@1.2.3.4:8443?security=tls\n",
 		"ipv6 list":   "[2001:db8::1]:8080\n[::1]:9050\n",
 		"scheme list": "socks5://1.2.3.4:1080\nhttp://5.6.7.8:8080\n",
+		// New-gate audiences: '@' without a digit after it, and a scheme-less
+		// URL form whose "://" cannot match the universal scheme pass.
+		"emails only": "contact bob@example.com or alice@example.org for the list password\n",
+		"ftp only":    "grab it from ftp://10.0.0.2:21/pub/list.txt\n",
 	}
 
 	for name, body := range bodies {
@@ -63,9 +67,22 @@ func TestExtractGatesNeverDropMatches(t *testing.T) {
 				t.Errorf("%s: IPv4 gate skipped the spys pass but it yields %v", name, spys)
 			}
 		}
-		if !strings.Contains(text, "://") {
+		if !hasAtDigit(text) {
+			if got := reSchemeCredV4.FindAllStringSubmatchIndex(text, -1); len(got) > 0 {
+				t.Errorf("%s: '@'+digit gate skipped reSchemeCredV4 but it matches %q", name, text[got[0][0]:got[0][1]])
+			}
+			if got := reBareCredV4.FindAllStringSubmatchIndex(text, -1); len(got) > 0 {
+				t.Errorf("%s: '@'+digit gate skipped reBareCredV4 but it matches %q", name, text[got[0][0]:got[0][1]])
+			}
+		}
+		if !hasAnySchemeToken(text) {
 			if got := reSchemeV4.FindAllStringSubmatch(text, -1); len(got) > 0 {
-				t.Errorf("%s: \"://\" gate skipped reSchemeV4 but it matches %q", name, got[0][0])
+				t.Errorf("%s: scheme-token gate skipped reSchemeV4 but it matches %q", name, got[0][0])
+			}
+		}
+		if !strings.Contains(text, "://") && hasAnySchemeToken(text) {
+			if got := reSchemeCredV4.FindAllStringSubmatchIndex(text, -1); len(got) > 0 {
+				t.Errorf("%s: \"://\" gate skipped reSchemeCredV4 but it matches %q", name, text[got[0][0]:got[0][1]])
 			}
 		}
 		if !strings.Contains(text, "[") {
@@ -75,14 +92,48 @@ func TestExtractGatesNeverDropMatches(t *testing.T) {
 		}
 
 		// Every site pattern the gate skipped must really be empty.
-		for i, re := range e.patterns {
+		for i := range e.passes {
 			if !e.skips(i, ipv4) {
 				continue
 			}
-			if got := re.FindAllStringSubmatchIndex(text, -1); len(got) > 0 {
+			p := &e.passes[i]
+			if got := p.re.FindAllStringSubmatchIndex(text, -1); len(got) > 0 {
 				t.Errorf("%s: gate skipped pattern %d (%s) but it matches at %d",
-					name, i, re.String(), got[0][0])
+					name, i, p.re, got[0][0])
 			}
 		}
+	}
+}
+
+// Scheme regexes and their pre-gates must implement the same grammar. URI
+// schemes are ASCII-case-insensitive; Go's broader Unicode (?i) semantics
+// (LONG S for 's', KELVIN SIGN for 'k') are deliberately not accepted.
+func TestSchemeGatesMatchASCIIGrammar(t *testing.T) {
+	for _, s := range []string{
+		"SOCKS5://1.2.3.4:1080",
+		"SocKs4A://1.2.3.4:1080",
+		"HTTPS://1.2.3.4:443",
+	} {
+		if reSchemeV4.FindStringIndex(s) == nil || !hasAnySchemeToken(s) {
+			t.Errorf("ASCII spelling rejected by regex or gate: %q", s)
+		}
+	}
+	for _, s := range []string{
+		"sock\u017F5://1.2.3.4:1080",
+		"soc\u212As5://1.2.3.4:1080",
+	} {
+		if reSchemeV4.FindStringIndex(s) != nil || hasAnySchemeToken(s) {
+			t.Errorf("non-ASCII scheme accepted by regex or gate: %q", s)
+		}
+	}
+	upperVLESS := "VLESS://uuid@1.2.3.4:443"
+	if reVLESSURL.FindStringIndex(upperVLESS) == nil ||
+		!containsFoldASCII(upperVLESS, "vless://") {
+		t.Error("uppercase VLESS rejected")
+	}
+	longSVLESS := "vle\u017Fs://uuid@1.2.3.4:443"
+	if reVLESSURL.FindStringIndex(longSVLESS) != nil ||
+		containsFoldASCII(longSVLESS, "vless://") {
+		t.Error("non-ASCII VLESS scheme accepted")
 	}
 }

@@ -68,6 +68,7 @@ protator/
 │   ├── dial.go             # CONNECT, SOCKS, VLESS (uTLS + REALITY)
 │   ├── extract.go          # Extractor + the passes of Extract()
 │   ├── extract_gate.go     # Which passes may be skipped (and the scans that decide)
+│   ├── extract_anchor.go   # Quad-offset probes + parse-derived bounded windows
 │   ├── extract_share.go    # trojan:// + vless:// share links
 │   ├── extract_spys.go     # spys.one JS-obfuscated port reconstruction
 │   ├── extract_base64.go   # Whole-body base64 pass + its false-positive guard

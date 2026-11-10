@@ -128,6 +128,7 @@ func TestExtractVLESS(t *testing.T) {
 vless://d342d11e-d424-4583-b36e-524ab1f0afa4@node.example:443?encryption=none&security=tls&sni=node.example&type=tcp#one
 vless://other-uuid@node.example:443?security=tls#two
 vless://ws-uuid@node.example:443?type=ws#ws-skipped
+VLESS://upper-uuid@8.8.8.8:443?security=tls#uppercase
 plain 9.9.9.9:8080 still works
 `
 	cands := e.Extract([]byte(body))
@@ -141,12 +142,18 @@ plain 9.9.9.9:8080 still works
 	if _, ok := byKey["vless:other-uuid@node.example:443"]; !ok {
 		t.Fatalf("second vless entry (other uuid) missing: %v", byKey)
 	}
+	if _, ok := byKey["vless:upper-uuid@8.8.8.8:443"]; !ok {
+		t.Fatalf("uppercase ASCII scheme entry missing: %v", byKey)
+	}
 	for k := range byKey {
 		if strings.Contains(k, "ws-uuid") {
 			t.Fatalf("ws vless entry leaked: %q", k)
 		}
 		if k == "node.example:443" {
 			t.Fatalf("vless socket double-emitted as bare: %q", k)
+		}
+		if k == "8.8.8.8:443" {
+			t.Fatalf("uppercase vless socket double-emitted as bare: %q", k)
 		}
 	}
 	if _, ok := byKey["9.9.9.9:8080"]; !ok {

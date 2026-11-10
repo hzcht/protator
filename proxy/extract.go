@@ -12,9 +12,19 @@ import (
 // context that already bounds the match.
 const ipv4RE = `(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])`
 
+// URI schemes are ASCII by grammar. Spell case-insensitivity out with byte
+// classes instead of (?i): Go's Unicode folding also accepts LONG S for "s"
+// and KELVIN SIGN for "k", but the rest of the pipeline (scheme dispatch,
+// URL serialization and fixed-prefix parsing) is intentionally ASCII.
+const (
+	proxySchemeRE  = `(?:[hH][tT][tT][pP][sS]?|[sS][oO][cC][kK][sS]5[hH]?|[sS][oO][cC][kK][sS]4[aA]?)`
+	trojanSchemeRE = `[tT][rR][oO][jJ][aA][nN]`
+	vlessSchemeRE  = `[vV][lL][eE][sS][sS]`
+)
+
 // Universal patterns always applied by the extractor (in this order).
 var (
-	reSchemeV4 = regexp.MustCompile(`(?i)\b(https?|socks5h?|socks4a?)://(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
+	reSchemeV4 = regexp.MustCompile(`\b(` + proxySchemeRE + `)://(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
 	reBareV4   = regexp.MustCompile(`\b(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
 	reBareV6   = regexp.MustCompile(`\[([0-9a-fA-F:]{2,45})\]:([0-9]{1,5})\b`)
 
@@ -23,7 +33,7 @@ var (
 	// URL-significant bytes that must be percent-encoded in a token ("/?#[]"):
 	// without that, an unsupported scheme's "ftp://" prefix would be swallowed
 	// into the userinfo and the "after ://" guard could never fire.
-	reSchemeCredV4 = regexp.MustCompile(`(?i)\b(https?|socks5h?|socks4a?)://([^@\s"'<>/?#\[\]]{1,255})@(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
+	reSchemeCredV4 = regexp.MustCompile(`\b(` + proxySchemeRE + `)://([^@\s"'<>/?#\[\]]{1,255})@(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
 	reBareCredV4   = regexp.MustCompile(`([^@\s"'<>/?#\[\]]{1,255})@(` + ipv4RE + `(?:\.` + ipv4RE + `){3}):([0-9]{1,5})\b`)
 
 	// spys.one-style JS-obfuscated ports:
@@ -47,29 +57,44 @@ var (
 	// No capture groups — parseTrojanURL splits the token itself, because
 	// passwords may contain @ and hosts may be domains, neither of which a
 	// 1–2 group ip+port shape can express.
-	reTrojanURL = regexp.MustCompile(`(?i)\btrojan://[^\s"'<>]{1,1000}`)
+	reTrojanURL = regexp.MustCompile(`\b` + trojanSchemeRE + `://[^\s"'<>]{1,1000}`)
 
 	// vless://uuid@host:port?params#remarks share links. Same shape and
 	// same bound as trojan; parseVLESSURL splits the token itself.
-	reVLESSURL = regexp.MustCompile(`(?i)\bvless://[^\s"'<>]{1,1000}`)
+	reVLESSURL = regexp.MustCompile(`\b` + vlessSchemeRE + `://[^\s"'<>]{1,1000}`)
 )
+
+// sitePass is one compiled line of regexp.txt together with the facts
+// NewExtractor derives from that same source at startup. One record per pass
+// keeps the lockstep structural: the old parallel slices had to be appended
+// in four places and indexed consistently by every reader.
+type sitePass struct {
+	re *regexp.Regexp
+	// startsIPv4 is true when the source literally opens with the canonical
+	// IPv4 group (startsWithIPv4Group), so it cannot match a body without a
+	// dotted quad.
+	startsIPv4 bool
+	// needsIPv4 is true when the parse proves *every* match must consume the
+	// canonical group (patternRequiresIPv4): a quad-less body can skip the
+	// pass. True whenever startsIPv4 is true.
+	needsIPv4 bool
+	// hint is the per-token probe plan when the pass opens with the quad and
+	// its tail is bounded (buildQuadHint, extract_anchor.go); nil keeps the
+	// legacy full-body pass.
+	hint *probeHint
+}
 
 // Extractor pulls host:port candidates out of scraped page bodies using the
 // universal patterns above plus the per-site patterns from regexp.txt.
 type Extractor struct {
-	patterns []*regexp.Regexp
-	// startsIPv4[i] is true when patterns[i] literally begins with the
-	// canonical IPv4 group, so it cannot match a body without a dotted quad.
-	// Derived at compile time; see startsWithIPv4Group.
-	//
-	// A gate exists because every site pattern is a full pass over the body
-	// (61 of them measured 215 of the 260 ms a real 128 KB page costs). It may
-	// only ever be wrong in the safe direction: a gate that lets an impossible
-	// pattern through costs time, one that drops a possible match silently
-	// loses candidates — so it is a necessary condition derived from the
-	// pattern's own source, never a guess, and TestExtractGatesNeverDropMatches
-	// asserts the empty side of it.
-	startsIPv4 []bool
+	// passes are the compiled regexp.txt patterns with their derived gates
+	// and anchor plans. Every site pattern is a full pass over the body —
+	// they were the dominant cost on the 130 KB fixture — so a pass whose own
+	// source proves it cannot match is skipped. A gate may only ever be wrong
+	// in the safe direction: a needless pass costs time, a missed one loses a
+	// candidate with no log line (extract_gate.go,
+	// TestExtractGatesNeverDropMatches).
+	passes []sitePass
 }
 
 // NewExtractor compiles the extra regexes from regexp.txt.
@@ -80,8 +105,13 @@ func NewExtractor(regexLines []string) (*Extractor, error) {
 		if err != nil {
 			return nil, fmt.Errorf("bad regex %q: %w", line, err)
 		}
-		e.patterns = append(e.patterns, re)
-		e.startsIPv4 = append(e.startsIPv4, startsWithIPv4Group(line))
+		starts := startsWithIPv4Group(line)
+		e.passes = append(e.passes, sitePass{
+			re:         re,
+			startsIPv4: starts,
+			needsIPv4:  starts || patternRequiresIPv4(line),
+			hint:       buildQuadHint(line),
+		})
 	}
 	return e, nil
 }
@@ -156,10 +186,10 @@ func (e *Extractor) extract(text string) []Candidate {
 			buf[i] = ' '
 		}
 	}
-	// Gate 0: both share-link patterns are "scheme://…" under (?i), so a
-	// case-folded literal search decides whether they can match at all. This
-	// runs before blanking — blanking is what removes them from the text the
-	// later passes see.
+	// Gate 0: both share-link patterns are ASCII-case-insensitive
+	// "scheme://…" forms, so the matching ASCII-folded literal decides
+	// whether they can match at all. This runs before blanking — blanking is
+	// what removes them from the text the later passes see.
 	if containsFoldASCII(text, "trojan://") {
 		for _, loc := range reTrojanURL.FindAllStringIndex(text, -1) {
 			if c, ok := parseTrojanURL(text[loc[0]:loc[1]]); ok {
@@ -180,6 +210,13 @@ func (e *Extractor) extract(text string) []Candidate {
 		text = string(buf)
 	}
 
+	// Pre-scan before the credentialed pass: userinfo precedes the quad in
+	// both cred patterns, so a dotted quad is a necessary condition there.
+	// Blanking below may consume the page's last quad, so the passes that
+	// follow re-run the scan on their own text (the cheap half of the gate is
+	// one linear pass; see extract_gate.go).
+	ipv4 := hasIPv4Token(text)
+
 	// 0b) Credentialed forms: scheme://user:pass@ip:port (URL form) and
 	// user:pass@ip:port (bare export form). The credential is part of the
 	// proxy's identity and the bare host:port inside the token is the same
@@ -187,8 +224,15 @@ func (e *Extractor) extract(text string) []Candidate {
 	// anonymous passes below do not spend a validation on an unauthenticated
 	// view of it. socks4 has no auth in the protocol: its userinfo is
 	// dropped (matching ParseProxyLine) and the token still blanked.
-	if strings.Contains(text, "@") {
-		if strings.Contains(text, "://") {
+	//
+	// Gated on ipv4 like every pass whose canonical group is required: the
+	// userinfo runs before the quad in both patterns, so "@", a scheme
+	// token, and a dotted quad are all necessary conditions. The "@"
+	// condition is tightened to '@'-followed-by-a-digit (hasAtDigit): the
+	// quad starts right after the '@' and its first octet is a digit, so a
+	// page of email addresses never starts the engine (extract_gate.go).
+	if ipv4 && hasAtDigit(text) {
+		if hasAnySchemeToken(text) {
 			for _, m := range reSchemeCredV4.FindAllStringSubmatchIndex(text, -1) {
 				if len(m) != 10 {
 					continue
@@ -237,13 +281,28 @@ func (e *Extractor) extract(text string) []Candidate {
 	}
 
 	// One pre-scan decides for everything below that needs a dotted quad
-	// (reBareV4, the spys pass and every site pattern whose source starts with
-	// the IPv4 group). Computed after blanking: blanking only ever removes
-	// text, so a quad seen before it might already be gone.
-	ipv4 := hasIPv4Token(text)
+	// (reBareV4, reSchemeV4, the spys pass and every pattern whose parse
+	// requires the canonical IPv4 group). Computed after blanking: blanking
+	// only ever removes text, so a quad seen before it might already be gone.
+	ipv4 = hasIPv4Token(text)
 
-	// 1) scheme://ip:port (explicit protocol) — every match contains "://"
-	if strings.Contains(text, "://") {
+	// Token offsets for the anchored fast path. They serve every pass whose
+	// pattern can start on a quad: reBareV4 and the site hints. A sparse
+	// enough page keeps them cheap; a degenerate digit page (a token at
+	// nearly every offset) throws them away, and each pass falls back to the
+	// legacy full-body match.
+	var tokens []int
+	if ipv4 {
+		tokens = appendIPv4Tokens(nil, text)
+		if len(tokens) == 0 || int64(len(tokens)) > int64(len(text))/ipTokenSparsity {
+			tokens = nil // degenerate digit page: the legacy pass is cheaper
+		}
+	}
+
+	// 1) scheme://ip:port (explicit protocol) — every match contains a
+	// scheme token and a quad, so both gates must hold. An empty "://"
+	// without a scheme token cannot match (extract_gate.go).
+	if ipv4 && hasAnySchemeToken(text) {
 		for _, m := range reSchemeV4.FindAllStringSubmatch(text, -1) {
 			if len(m) != 4 {
 				continue
@@ -258,8 +317,12 @@ func (e *Extractor) extract(text string) []Candidate {
 	// 2) bare ip:port — use indices to reject partial IP matches (e.g. 29.30.31.3 from 29.30.31.32)
 	// Without a dotted quad in the body neither this pass nor the spys pass
 	// can produce anything, so both are skipped by the one pre-scan above.
+	// When the token list is available, the pass is anchored at the quad
+	// offsets instead of a full-body scan; the hint's wordGuard re-checks the
+	// leading \b the window slice cannot see by itself.
 	if ipv4 {
-		for _, m := range reBareV4.FindAllStringSubmatchIndex(text, -1) {
+		idxs := findAtQuadTokens(reBareV4, text, tokens, reBareV4Hint)
+		for _, m := range idxs {
 			if len(m) != 6 {
 				continue
 			}
@@ -312,16 +375,27 @@ func (e *Extractor) extract(text string) []Candidate {
 	}
 
 	// 4) site-specific patterns from regexp.txt. Each one is a full pass over
-	// the body — 61 of them measured 215 of the 260 ms a real 128 KB page
-	// costs — so the ones whose own source proves them impossible to match are
-	// skipped. Patterns that merely start with a literal ("<td…") are NOT
-	// gated: Go's regexp already jumps from literal-prefix to literal-prefix
-	// internally, and measuring that gate at 1 ms of 184 ms said so.
-	for i, re := range e.patterns {
+	// the body, so the ones whose own source proves them impossible to match
+	// are skipped. The gate is structural: a pattern whose parse *requires*
+	// the canonical IPv4 group (not only one that starts with it) is dead on
+	// a quad-less body (extract_gate.go). Patterns that merely start with a
+	// literal ("<td…") are NOT gated: Go's regexp already jumps from
+	// literal-prefix to literal-prefix internally, and measuring that gate
+	// said so.
+	//
+	// Patterns that open with the quad take the anchored fast path: match
+	// starts are probed at the token offsets (the one scan per body above)
+	// inside a window their bounded tail cannot escape. Tails that cannot be
+	// bounded (or quads that sit mid-pattern — see extract_anchor.go) keep
+	// the legacy full-body pass. The leftmost-scan policy and the
+	// "no match lost/none invented" contract are pinned match-by-match by
+	// TestSiteAnchoredPathMatchesFindAll.
+	for i := range e.passes {
+		p := &e.passes[i]
 		if e.skips(i, ipv4) {
 			continue
 		}
-		idxs := re.FindAllStringSubmatchIndex(text, -1)
+		idxs := findAtQuadTokens(p.re, text, tokens, p.hint)
 		for _, m := range idxs {
 			switch {
 			case len(m) >= 6: // two groups: ip + port in either order
