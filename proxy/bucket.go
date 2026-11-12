@@ -493,8 +493,46 @@ func (b *Bucket) ProvenCount() int {
 	return n
 }
 
+// emptyQueuePoll is the safety-poll interval for a caller waiting on an empty
+// queue. The signal channel normally wakes it immediately; this bounds how
+// long a missed edge can hold a request.
+const emptyQueuePoll = 500 * time.Millisecond
+
+// waitQueue blocks until the queue changes, the context ends, or the safety
+// poll expires. timer is caller-owned and reused across iterations: time.After
+// allocates a timer and a channel per loop pass, and every caller parked on an
+// empty queue used to pay that on the serving path.
+//
+// The timer is drained on both non-timer branches so the next Reset cannot
+// return a stale tick.
+func (b *Bucket) waitQueue(ctx context.Context, timer *time.Timer) error {
+	timer.Reset(emptyQueuePoll)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return ctx.Err()
+	case <-b.signal:
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return nil
+	case <-timer.C:
+		return nil
+	}
+}
+
 // Random returns a uniformly random live proxy, waiting if the queue is empty.
 func (b *Bucket) Random(ctx context.Context) (*Proxy, error) {
+	timer := time.NewTimer(emptyQueuePoll)
+	defer timer.Stop()
 	for {
 		b.mu.RLock()
 		n := len(b.proxies)
@@ -505,11 +543,8 @@ func (b *Bucket) Random(ctx context.Context) (*Proxy, error) {
 		}
 		b.mu.RUnlock()
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-b.signal:
-		case <-time.After(500 * time.Millisecond): // safety poll
+		if err := b.waitQueue(ctx, timer); err != nil {
+			return nil, err
 		}
 	}
 }
@@ -532,6 +567,8 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 	if probes < 1 {
 		probes = 1
 	}
+	timer := time.NewTimer(emptyQueuePoll)
+	defer timer.Stop()
 	for {
 		// Read the proven pool BEFORE taking mu: freshPool takes mu.RLock
 		// itself while rebuilding, and a nested RLock is how a serving pick
@@ -545,14 +582,10 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 		// gone (both are read before/outside the rebuild interval).
 		if len(b.proxies) == 0 {
 			b.mu.RUnlock()
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-b.signal:
-				continue
-			case <-time.After(500 * time.Millisecond): // safety poll
-				continue
+			if err := b.waitQueue(ctx, timer); err != nil {
+				return nil, err
 			}
+			continue
 		}
 		// Pick the preferred tier under the lock. proven is immutable once
 		// handed out (freshPool builds a new slice per rebuild) and only

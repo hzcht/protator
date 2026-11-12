@@ -54,7 +54,10 @@ func (p *Proxy) Source() string { return p.source }
 // MarkInFlight increments the count of live tunnels through this proxy.
 // Decremented when the wrapped connection closes. Used by the load-aware
 // picker to spread concurrent requests over healthy proxies.
-func (p *Proxy) MarkInFlight()     { atomic.AddInt64(&p.inFlight, 1) }
+func (p *Proxy) MarkInFlight() { atomic.AddInt64(&p.inFlight, 1) }
+
+// MarkInFlightDone decrements the live-tunnel count; call it exactly once per
+// MarkInFlight, when the wrapped connection closes.
 func (p *Proxy) MarkInFlightDone() { atomic.AddInt64(&p.inFlight, -1) }
 
 // InFlight returns the number of currently open connections through this proxy.
@@ -118,10 +121,12 @@ func (p *Proxy) sampleLatency(d time.Duration) {
 // ConsecFails returns the current consecutive-failure streak.
 func (p *Proxy) ConsecFails() int64 { return atomic.LoadInt64(&p.consecFails) }
 
-// OKTotal is the lifetime count of successful dials/checks, FailTotal the
-// count of failures. The admin page shows both so an operator can tell a
-// proxy that has never been exercised from one that keeps failing.
-func (p *Proxy) OKTotal() int64   { return atomic.LoadInt64(&p.okTotal) }
+// OKTotal returns the lifetime count of successful dials/checks. The admin page
+// shows it next to FailTotal so an operator can tell a proxy that has never
+// been exercised from one that keeps failing.
+func (p *Proxy) OKTotal() int64 { return atomic.LoadInt64(&p.okTotal) }
+
+// FailTotal returns the lifetime count of failed dials/checks (see OKTotal).
 func (p *Proxy) FailTotal() int64 { return atomic.LoadInt64(&p.failTotal) }
 
 // Latency returns the EMA dial latency (0 = not measured yet).

@@ -670,6 +670,67 @@ func TestAdminConfigRedactsAndTokenGates(t *testing.T) {
 	}
 }
 
+// The WebSocket endpoint is gated on the HTTP upgrade request, before the
+// hijack. The gate itself is plain handler logic (testable without a
+// handshake); the routes() wiring must also reject before the real WS handler
+// ever sees the request.
+func TestAdminWSTokenGates(t *testing.T) {
+	a, _, _ := newTestAdmin(t)
+	a.cfg.Server.AdminToken = "s3cret"
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := a.requireAdminTokenWS(next)
+
+	if status, _ := doJSON(t, a, http.MethodGet, "/ws", ""); status != http.StatusUnauthorized {
+		t.Fatalf("routes(): /ws without token: status %d, want 401 (gate must run before the hijack)", status)
+	}
+	for _, target := range []string{"/ws", "/ws?token=wrong"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("gate on %q: status %d, want 401", target, rec.Code)
+		}
+	}
+	for _, header := range []struct{ name, val string }{
+		{"Authorization", "Bearer s3cret"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+		req.Header.Set(header.name, header.val)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("gate with %s token: status %d, want 200", header.name, rec.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/ws?token=s3cret", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gate with query token: status %d, want 200", rec.Code)
+	}
+}
+
+// With no admin_token configured the WS gate must be a pass-through: loopback
+// admin instances run without a token and the page must still stream.
+func TestAdminWSTokenEmptyPassesThrough(t *testing.T) {
+	a, _, _ := newTestAdmin(t)
+	if a.cfg.Server.AdminToken != "" {
+		t.Fatalf("test admin unexpectedly has a token %q", a.cfg.Server.AdminToken)
+	}
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	a.requireAdminTokenWS(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	if !called || rec.Code != http.StatusOK {
+		t.Fatalf("no-token config must pass through: called=%v status=%d", called, rec.Code)
+	}
+}
+
 // --- actions -------------------------------------------------------------
 
 // The wake and cooldown-reset actions must reach the collector: a button that

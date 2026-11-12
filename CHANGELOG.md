@@ -24,8 +24,30 @@ nobody can find.
   stricter (both fields bounded, at least one ASCII letter, no URL-significant
   bytes), so a clock (`:10:00:30`) or a second port (`:3128`) is not read as
   auth.
+- **CI on GitHub Actions** (`.github/workflows/ci.yml` — there was none):
+  Linux runs `go test ./... -race -count=1` (the detector needs gcc, which
+  the Windows dev box lacks); Windows mirrors the local gate verbatim
+  (`go build ./...`, `go vet ./...`, `gofmt -l main proxy util` must stay
+  silent).
+- **Tests for the previously untested loops.** `RevalidateMany`/`RevalidateNow`
+  (counts, pass cap, stalest-first order, recently-served skip, cancellation,
+  empty-input noop), `PoolReprobeLoop` (cancel, empty pool, channel-room cap
+  with full-channel skip, non-blocking partial emit), `Collector.Run` (a
+  panicking cycle is recovered and the loop keeps cycling), and the
+  WebSocket admin-token gate (401 before the hijack; pass-through when no
+  token is configured). Coverage: proxy 69.8% → 72.9%, main 49.3% → 50.0%;
+  214 test/bench/fuzz functions.
 
 ### Changed
+
+- **The bucket's waiting paths stopped allocating a fresh timer per poll.**
+  The `time.After` safety polls in `Random`/`PickHealthy` now share one
+  caller-owned `time.Timer` (`waitQueue`, 500 ms `emptyQueuePoll` tick) —
+  no per-iteration churn on the serving path.
+- **Code documented.** One `doc.go` per package (`proxy`, `main`); doc
+  comments on the tricky internals (`Duration`'s TOML round-trip, the atomic
+  file writer, `noiseWriter`, the mixed admin listener, `ProxyMeta`
+  accessors, health counters); `util` marked Deprecated.
 
 - **The extractor skips every pass a body cannot match.** Each pattern's
   parse is analyzed at startup (`needsIPv4`), so a quad-less body runs none

@@ -54,6 +54,9 @@ func newNoiseWriter(out io.Writer, window time.Duration) *noiseWriter {
 	}
 }
 
+// Write filters stdlib TLS-handshake noise and coalesces the goproxy
+// dial-warning flood: the first warning for a target inside the window is
+// emitted with a count of the repeats it absorbed, the rest are dropped.
 func (w *noiseWriter) Write(p []byte) (int, error) {
 	line := strings.TrimRight(string(p), "\r\n")
 

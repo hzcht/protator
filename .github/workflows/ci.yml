@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The race detector is the point of this job: the Windows dev box has no
+  # gcc/cgo, so `go test -race` can only run here (or manually in WSL —
+  # docs/DEVELOPER.md has the workflow).
+  test-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go test ./... -race -count=1
+
+  # Mirror of the local gate commands (docs/DEVELOPER.md) on the platform the
+  # project actually develops on. bash keeps the three commands identical to
+  # the local PowerShell-quoted ones.
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l main proxy util)"

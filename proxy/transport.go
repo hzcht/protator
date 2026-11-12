@@ -394,6 +394,8 @@ func (bd *blockDetector) readAndMark(resp *http.Response) bool {
 // stickyErr replays a mid-sniff read error after the buffered prefix.
 type stickyErr struct{ err error }
 
+// Read reports the sticky error. The buffered prefix was already delivered by
+// ReadAndMark, so this only ever signals the failure that interrupted it.
 func (e stickyErr) Read([]byte) (int, error) { return 0, e.err }
 
 // readAndMarkBudget is readAndMark under a wall-clock bound. A chunked
@@ -471,4 +473,5 @@ type rewoundBody struct {
 	closer io.Closer
 }
 
+// Close closes the underlying body. The replayed prefix needs no cleanup.
 func (b *rewoundBody) Close() error { return b.closer.Close() }

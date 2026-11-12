@@ -13,8 +13,9 @@ import (
 // The query builders live here too because they render exactly these fields
 // back into a URL; AppendURL/URL/Key in model.go call them.
 
-// ProxyMeta holds cold fields (admin/debug only) вЂ” not accessed on the hot serving path.
-// Keeping these separate reduces Proxy size from ~200B to ~120B, reducing GC pressure.
+// ProxyMeta holds cold fields (admin/debug only) — not accessed on the hot
+// serving path. Keeping these separate reduces Proxy size from ~200B to ~120B,
+// reducing GC pressure.
 //
 // Every field is an atomic pointer because Proxy cannot carry a mutex: it is
 // written by a checker goroutine (SetGeoIP / SetVLESS) and read by the admin
@@ -48,6 +49,12 @@ type ProxyMeta struct {
 	proxyAuth atomic.Pointer[string]
 }
 
+// Every accessor below returns the zero value when the field was never set, so
+// callers can use them without a nil check on Proxy.meta. Setters are
+// deliberately unexported: the metadata is written once by the checker and only
+// read afterwards (see ProxyMeta's field comments for the exact contract).
+
+// Country returns the ISO 3166-1 alpha-2 country code, or "".
 func (p *ProxyMeta) Country() string {
 	if s := p.country.Load(); s != nil {
 		return *s
@@ -55,6 +62,7 @@ func (p *ProxyMeta) Country() string {
 	return ""
 }
 
+// ASN returns "AS12345 Provider Name", or "".
 func (p *ProxyMeta) ASN() string {
 	if s := p.asn.Load(); s != nil {
 		return *s
@@ -62,6 +70,7 @@ func (p *ProxyMeta) ASN() string {
 	return ""
 }
 
+// VLESSUUID returns the share-link UUID, or "".
 func (p *ProxyMeta) VLESSUUID() string {
 	if s := p.vlessUUID.Load(); s != nil {
 		return *s
@@ -69,6 +78,7 @@ func (p *ProxyMeta) VLESSUUID() string {
 	return ""
 }
 
+// VLESSFlow returns the flow control value (e.g. "xtls-rprx-vision"), or "".
 func (p *ProxyMeta) VLESSFlow() string {
 	if s := p.vlessFlow.Load(); s != nil {
 		return *s
@@ -76,6 +86,7 @@ func (p *ProxyMeta) VLESSFlow() string {
 	return ""
 }
 
+// VLESSSNI returns the server name sent in the TLS handshake, or "".
 func (p *ProxyMeta) VLESSSNI() string {
 	if s := p.vlessSNI.Load(); s != nil {
 		return *s
@@ -83,6 +94,7 @@ func (p *ProxyMeta) VLESSSNI() string {
 	return ""
 }
 
+// VLESSPbk returns the REALITY public key, or "".
 func (p *ProxyMeta) VLESSPbk() string {
 	if s := p.vlessPbk.Load(); s != nil {
 		return *s
@@ -90,6 +102,7 @@ func (p *ProxyMeta) VLESSPbk() string {
 	return ""
 }
 
+// VLESSSid returns the REALITY short ID, or "".
 func (p *ProxyMeta) VLESSSid() string {
 	if s := p.vlessSid.Load(); s != nil {
 		return *s
@@ -97,6 +110,7 @@ func (p *ProxyMeta) VLESSSid() string {
 	return ""
 }
 
+// VLESSSpider returns the spider header value (vision transport), or "".
 func (p *ProxyMeta) VLESSSpider() string {
 	if s := p.vlessSpider.Load(); s != nil {
 		return *s
@@ -104,6 +118,7 @@ func (p *ProxyMeta) VLESSSpider() string {
 	return ""
 }
 
+// VLESSNoTLS reports security=none: the link is plaintext with no TLS layer.
 func (p *ProxyMeta) VLESSNoTLS() bool {
 	if b := p.vlessNoTLS.Load(); b != nil {
 		return *b
@@ -111,6 +126,8 @@ func (p *ProxyMeta) VLESSNoTLS() bool {
 	return false
 }
 
+// TrojanPassword returns the trojan password as it appeared in the URL (still
+// percent-encoded), or "".
 func (p *ProxyMeta) TrojanPassword() string {
 	if s := p.trojanPassword.Load(); s != nil {
 		return *s
@@ -118,6 +135,7 @@ func (p *ProxyMeta) TrojanPassword() string {
 	return ""
 }
 
+// TrojanSNI returns the trojan TLS server name, or "".
 func (p *ProxyMeta) TrojanSNI() string {
 	if s := p.trojanSNI.Load(); s != nil {
 		return *s
@@ -125,6 +143,7 @@ func (p *ProxyMeta) TrojanSNI() string {
 	return ""
 }
 
+// TrojanNoTLS reports security=none: the trojan payload is sent in plaintext.
 func (p *ProxyMeta) TrojanNoTLS() bool {
 	if b := p.trojanNoTLS.Load(); b != nil {
 		return *b

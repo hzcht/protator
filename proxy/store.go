@@ -481,6 +481,10 @@ type goodWriter struct {
 	f    *os.File
 }
 
+// AppendGood appends one validated proxy URL to the audit file, flushing past
+// 4 KB so memory and crash loss stay bounded. Safe for concurrent use: the
+// per-path writer is cached and locked. A write or flush failure is logged and
+// counted, never returned — the audit file is a record, not a control path.
 func AppendGood(path, line string) {
 	if path == "" {
 		return

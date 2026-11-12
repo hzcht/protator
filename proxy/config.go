@@ -15,6 +15,9 @@ type Duration struct {
 	time.Duration
 }
 
+// UnmarshalTOML decodes the string form ("10s", "2m30s") into a Duration. A
+// non-string value is rejected: TOML integers there are almost always a unit
+// mistake (10 meaning "ten seconds" reads as ten nanoseconds).
 func (d *Duration) UnmarshalTOML(v interface{}) error {
 	s, ok := v.(string)
 	if !ok {
@@ -28,6 +31,8 @@ func (d *Duration) UnmarshalTOML(v interface{}) error {
 	return nil
 }
 
+// MarshalText renders a Duration back into its TOML string form, so a config
+// dump round-trips into a file the loader accepts.
 func (d Duration) MarshalText() ([]byte, error) {
 	return []byte(d.Duration.String()), nil
 }

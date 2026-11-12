@@ -230,6 +230,8 @@ func buildGoproxy(cfg *proxy.Config, fwd *proxy.ForwardDialer, noise *log.Logger
 // ProxyCtx.RoundTripper interface.
 type ctxRoundTripper struct{ rt http.RoundTripper }
 
+// RoundTrip implements goproxy's round-tripper hook by delegating to the
+// underlying transport; goproxy's ctx is not needed for the call.
 func (a *ctxRoundTripper) RoundTrip(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
 	return a.rt.RoundTrip(req)
 }

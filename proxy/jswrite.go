@@ -310,6 +310,8 @@ func (v jsVal) str() (string, bool) {
 	return v.s, true
 }
 
+// Array returns the value as a JS array: its parts when it is one, otherwise
+// the scalar as a single-element slice.
 func (v jsVal) Array() []string {
 	if v.isArr {
 		return v.parts

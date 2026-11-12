@@ -178,6 +178,26 @@ wsl -d OracleLinux_7_9 -u root -- bash -lc 'cd /mnt/i/proj/protator && go test -
   under Linux for memory/CPU measurements — work on a scratch copy of
   `config/` + `data/`, never the production files.
 
+### CI
+
+`.github/workflows/ci.yml` (added 2026-11; there was none before) runs on
+every push to master and every PR:
+
+- **ubuntu** — `go test ./... -race -count=1`: the race detector now runs
+  automatically on every change; the WSL workflow above is for local
+  iterations only.
+- **windows** — the local gate verbatim: `go build ./...`, `go vet ./...`,
+  `gofmt -l main proxy util` (must stay silent).
+
+Baseline as of this pass: 214 test/benchmark/fuzz functions; `go test
+-cover` reports `protator/proxy` 72.9%, `protator/main` 50.0%. The largest
+remaining gaps are `browser.go` (Playwright fallback, default-off) and the
+three listener front ends.
+
+staticcheck v0.4.7 crashes on go1.26.1 (IR nil-deref on every package), so
+`go vet` plus the CI race run are the static analysis until an update fixes
+the toolchain.
+
 ## 6. Logging Conventions
 
 Prefix every log line with component:

@@ -23,6 +23,7 @@ type peekConn struct {
 	off int
 }
 
+// Read replays the sniffed prefix first, then reads from the real connection.
 func (c *peekConn) Read(p []byte) (int, error) {
 	if c.off < len(c.buf) {
 		n := copy(p, c.buf[c.off:])
@@ -51,6 +52,8 @@ type mixedListener struct {
 // byte. Without it one silent client would stall the whole accept loop.
 const sniffTimeout = 5 * time.Second
 
+// Accept sniffs the first byte of each connection to decide which listener
+// handles it, and hands the already-read byte back through peekConn.
 func (l *mixedListener) Accept() (net.Conn, error) {
 	for {
 		c, err := l.Listener.Accept()

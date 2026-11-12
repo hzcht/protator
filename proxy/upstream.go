@@ -277,6 +277,8 @@ type firstByteConn struct {
 	cleared sync.Once
 }
 
+// Read arms the first-byte deadline once and clears it as soon as data
+// arrives, so only silence past the window is fatal.
 func (c *firstByteConn) Read(p []byte) (int, error) {
 	c.armed.Do(func() { _ = c.Conn.SetReadDeadline(time.Now().Add(c.window)) })
 	n, err := c.Conn.Read(p)
@@ -306,6 +308,8 @@ type proxyConn struct {
 	once sync.Once
 }
 
+// Close releases the proxy's in-flight counter exactly once, then closes the
+// underlying connection.
 func (c *proxyConn) Close() error {
 	c.once.Do(func() {
 		if c.p != nil {

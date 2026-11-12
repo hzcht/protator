@@ -232,6 +232,9 @@ func newRotatingFile(path string, maxBytes int64, keep int) *rotatingFile {
 	return &rotatingFile{path: path, maxBytes: maxBytes, keep: keep}
 }
 
+// Write appends one line and rotates by size. It always reports success to the
+// caller: the stderr mirror already carries the line, so a full disk must not
+// make the log package panic or short-write into the application.
 func (r *rotatingFile) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -300,6 +303,7 @@ func (r *rotatingFile) gen(n int) string {
 	return fmt.Sprintf("%s.%d", r.path, n)
 }
 
+// Close closes the backing file, if open. Safe to call twice.
 func (r *rotatingFile) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
