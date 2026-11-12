@@ -172,6 +172,39 @@ func (c *Checker) resolveSelfIP() (net.IP, error) {
 }
 
 // Check validates a candidate and returns the working Proxy.
+// proxyForCandidate materializes the Proxy for one validation attempt with
+// the schema already resolved (the candidate's explicit schema, or one
+// element of the probe order). Both branches of Check must go through it:
+// the credentials are part of the identity, so they are stamped before
+// keyCache freezes the key — a late stamp would put one password's transport
+// into another's cache slot and let dedup collapse entries that differ only
+// by credential. The probe branch used to build the Proxy without the
+// credential at all, silently validating bare `user:pass@host:port`
+// candidates anonymously. socks4 has no protocol auth, so a credential is
+// dropped here, at the single construction site, not per call site.
+func proxyForCandidate(cand Candidate, schema string) *Proxy {
+	// meta is allocated here, before publication: SetGeoIP/SetVLESS run
+	// after the proxy is queued (revalidation) while admin live rows read
+	// GetCountry/GetASN concurrently, and a lazily-initialized plain
+	// pointer field is a data race on the hot read path.
+	p := &Proxy{Schema: schema, Host: cand.Host, Port: cand.Port, meta: &ProxyMeta{}}
+	if schema == "trojan" {
+		p.SetTrojan(cand.TrojanPassword, cand.TrojanSNI, cand.TrojanNoTLS)
+	}
+	if schema == "vless" {
+		p.SetVLESS(cand.VLESSUUID, cand.VLESSFlow, cand.VLESSSNI, cand.VLESSPbk, cand.VLESSSid, cand.VLESSSpider, cand.VLESSNoTLS)
+	}
+	if cand.ProxyAuth != "" && schema != "socks4" {
+		p.SetProxyAuth(cand.ProxyAuth)
+	}
+	// Precompute the identity before the proxy is published: every Key()
+	// on the productive population would otherwise rebuild the URL with
+	// fmt.Sprintf (rankPick calls it once per probe, up to 256 per pick,
+	// under the bucket read lock). Single goroutine here, so no race.
+	p.keyCache = p.URL()
+	return p
+}
+
 func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 	Stats.Checks.Add(1)
 	if cand.Port < 1 || cand.Port > 65535 {
@@ -185,29 +218,7 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 		}
 	}
 	if cand.Schema != "" && validSchema(cand.Schema) {
-		// meta is allocated here, before publication: SetGeoIP/SetVLESS run
-		// after the proxy is queued (revalidation) while admin live rows read
-		// GetCountry/GetASN concurrently, and a lazily-initialized plain
-		// pointer field is a data race on the hot read path.
-		p := &Proxy{Schema: cand.Schema, Host: cand.Host, Port: cand.Port, meta: &ProxyMeta{}}
-		// Credentials ride along before the identity is frozen: a trojan or
-		// vless entry without its password/UUID can never validate, and the
-		// key (hence the transport cache and dedup) includes them — stamping
-		// after keyCache would serve one password's transport to another's.
-		if cand.Schema == "trojan" {
-			p.SetTrojan(cand.TrojanPassword, cand.TrojanSNI, cand.TrojanNoTLS)
-		}
-		if cand.Schema == "vless" {
-			p.SetVLESS(cand.VLESSUUID, cand.VLESSFlow, cand.VLESSSNI, cand.VLESSPbk, cand.VLESSSid, cand.VLESSSpider, cand.VLESSNoTLS)
-		}
-		if cand.ProxyAuth != "" {
-			p.SetProxyAuth(cand.ProxyAuth)
-		}
-		// Precompute the identity before the proxy is published: every Key()
-		// on the productive population would otherwise rebuild the URL with
-		// fmt.Sprintf (rankPick calls it once per probe, up to 256 per pick,
-		// under the bucket read lock). Single goroutine here, so no race.
-		p.keyCache = p.URL()
+		p := proxyForCandidate(cand, cand.Schema)
 		if err := c.preDial(p); err != nil {
 			Stats.ChecksFailed.Add(1)
 			return nil, err
@@ -228,8 +239,7 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 		order = preferFirst(order, cand.Prefer)
 	}
 	for _, s := range order {
-		p := &Proxy{Schema: s, Host: cand.Host, Port: cand.Port, meta: &ProxyMeta{}}
-		p.keyCache = p.URL() // same precompute as above, same reason
+		p := proxyForCandidate(cand, s)
 		if err := c.preDial(p); err != nil {
 			continue
 		}

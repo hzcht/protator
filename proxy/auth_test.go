@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -204,6 +206,147 @@ func TestDialProxyWrongCredentialFails(t *testing.T) {
 	}
 	if _, err := dialProxy(p, 5*time.Second, context.Background(), "tcp", "example.com:80"); err == nil {
 		t.Fatal("a wrong proxy credential must fail the dial")
+	}
+}
+
+// startForwardAuthConnectProxy is startAuthConnectProxy for checker tests: it
+// verifies the Basic credential, then forwards the tunnel to target (host:port)
+// instead of echoing — the checker's probes speak TLS (or socks) through the
+// tunnel, and an echoed tunnel feeds the client its own ClientHello.
+func startForwardAuthConnectProxy(t *testing.T, user, pass, target string) (addr string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if !strings.HasPrefix(line, "CONNECT ") {
+					return
+				}
+				auth := ""
+				for {
+					h, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if h == "\r\n" || h == "\n" {
+						break
+					}
+					if strings.HasPrefix(strings.ToLower(h), "proxy-authorization:") {
+						auth = strings.TrimSpace(h[len("proxy-authorization:"):])
+					}
+				}
+				if auth != want {
+					io.WriteString(c, "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+					return
+				}
+				up, err := net.DialTimeout("tcp", target, 5*time.Second)
+				if err != nil {
+					io.WriteString(c, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+					return
+				}
+				defer up.Close()
+				io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n")
+				go io.Copy(up, br)
+				io.Copy(c, up)
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// The probe branch (no explicit schema) must carry the candidate's credential
+// through every protocol attempt: a bare `user:pass@host:port` candidate goes
+// down this branch, and the branch used to build the Proxy without the
+// credential — validated anonymously, so an auth-requiring proxy failed the
+// check outright and a lax one entered the queue with the wrong identity.
+func TestCheckerProbeBranchCarriesCredentials(t *testing.T) {
+	// One TLS server plays both self-IP service and content test: its body
+	// contains a foreign IP and the expected template.
+	svc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("your ip is 5.6.7.8, Example Domain"))
+	}))
+	defer svc.Close()
+
+	// A CONNECT proxy demanding exactly this credential and forwarding the
+	// tunnel to svc: every probe protocol must speak through it, so the check
+	// only passes when the credential actually rode the tunnel.
+	proxy := startForwardAuthConnectProxy(t, "user", "pass", strings.TrimPrefix(svc.URL, "https://"))
+	host, portS, err := net.SplitHostPort(proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{}
+	cfg.Checker.SelfIPURLs = []string{svc.URL}
+	cfg.Checker.ProbeOrder = []string{"http", "socks5", "socks4", "https"}
+	cfg.Checker.TCPTimeout = Duration{3 * time.Second}
+	cfg.Checker.ConnectT = Duration{3 * time.Second}
+	cfg.Checker.TLSHandshake = Duration{3 * time.Second}
+	cfg.Checker.ResponseT = Duration{5 * time.Second}
+	cfg.Checker.TotalT = Duration{10 * time.Second}
+
+	checker := &Checker{cfg: cfg, selfIP: net.ParseIP("9.9.9.9"), ipRe: reAnyIP, allowBogon: true}
+	checker.tests = []ContentTest{{Name: "svc", URL: svc.URL, MustContain: []string{"Example"}}}
+
+	// Schema == "" sends the candidate down the probe branch. The password is
+	// kept URL-significant-byte-free so the raw userinfo and its encoded form
+	// coincide and the assertion is not about escaping.
+	cand := Candidate{Host: host, Port: port, ProxyAuth: "user:pass"}
+	p, err := checker.Check(cand)
+	if err != nil {
+		t.Fatalf("credentialed probe-branch check failed: %v", err)
+	}
+	if got := p.GetProxyAuth(); got != "user:pass" {
+		t.Fatalf("validated proxy lost the credential: %q", got)
+	}
+	if !strings.Contains(p.URL(), "user:pass@"+host) {
+		t.Fatalf("URL must include the credential: %q", p.URL())
+	}
+}
+
+// proxyForCandidate is the single construction site for checked proxies: the
+// credential must be part of the frozen identity for http/https/socks5, and
+// must be dropped for socks4 (the protocol has no auth field) even when a
+// hand-built Candidate carries one.
+func TestProxyForCandidateCredentialRules(t *testing.T) {
+	cand := Candidate{Host: "1.2.3.4", Port: 8080, ProxyAuth: "user:pass"}
+	for _, schema := range []string{"http", "https", "socks5"} {
+		p := proxyForCandidate(cand, schema)
+		if got := p.GetProxyAuth(); got != "user:pass" {
+			t.Fatalf("%s: GetProxyAuth = %q, want user:pass", schema, got)
+		}
+		if !strings.Contains(p.URL(), "user:pass@1.2.3.4:8080") {
+			t.Fatalf("%s: URL %q lost the credential", schema, p.URL())
+		}
+		if !strings.Contains(p.Key(), "user:pass@1.2.3.4:8080") {
+			t.Fatalf("%s: frozen key %q must include the credential", schema, p.Key())
+		}
+	}
+	p := proxyForCandidate(cand, "socks4")
+	if got := p.GetProxyAuth(); got != "" {
+		t.Fatalf("socks4 must drop the credential, got %q", got)
+	}
+	if strings.Contains(p.URL(), "user:pass@") {
+		t.Fatalf("socks4 URL %q still carries the credential", p.URL())
 	}
 }
 

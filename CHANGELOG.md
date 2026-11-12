@@ -63,6 +63,17 @@ nobody can find.
   CSV separator became the single-byte class `(?:\A|[,;\r\n])` — additive
   only (a lone `\r` separator is newly tolerated).
 
+### Fixed
+
+- **The checker's probe branch carried no credential.** Both Check branches
+  now share one constructor, `proxyForCandidate`: bare
+  `user:pass@ip:port` and `host:port:user:pass` candidates (the shapes
+  extraction emits) were built as anonymous proxies, so an auth-requiring
+  proxy failed validation outright and a lax one entered the queue with
+  the wrong identity. The credential is now part of the frozen identity
+  (URL/Key) for http/https/socks5 and dropped for socks4, matching the
+  extractor's socks4 rule.
+
 ### Performance
 
 - **Extraction on the 130 KB fixture: 241 ms → ~130 ms (1.0 MB/s); a
