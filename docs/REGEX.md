@@ -10,14 +10,22 @@ always run first:
 | shape | notes |
 |-------|-------|
 | `scheme://ip:port` | http, https, socks4/5, protocol kept |
-| `scheme://user:pass@ip:port` | raw userinfo kept for http/https/socks5; socks4 drops it (no protocol auth) |
-| `user:pass@ip:port` | bare export form; `name@ip:port` without a colon is ignored (email/mention) |
+| `scheme://user:pass@ip:port` | raw userinfo kept for http/https/socks5; socks4 drops it (no protocol auth); userinfo without `:` is a mention — the socket is kept with its scheme, anonymous |
+| `user:pass@ip:port` | bare export form; `name@ip:port` without a colon is ignored (email/mention); best-effort, see below |
 | `ip:port:user:pass` | column exports: anonymous **and** credentialed candidates; the suffix needs a letter and bounded fields |
 | bare `ip:port` | protocol unknown → probed later via `checker.probe_order` |
 | `[ipv6]:port` | bracketed literal only; a bare IPv6 is ambiguous by design |
 | spys.one JS ports | `document.write(":"+(a^b)+...)` decoded without a browser |
 | whole-body base64 | padded or unpadded; see below |
 | `trojan://` / `vless://` share links | `proxy/extract_share.go`; raw TCP only, credentials carried end to end |
+
+The bare credential form is deliberately best-effort. Its userinfo class has no
+leading boundary and permits hyphens, so a token glued to prose
+(`contact-user:pass@1.2.3.4:8080`) is read as a hyphenated username. Both rules
+cannot hold at once: a left boundary would truncate legitimate hyphenated
+usernames, and no boundary separates every word from every credential. Treat
+bare credentials as a hint, prefer the scheme form when certainty matters, and
+let validation reject credentials a proxy does not accept.
 
 URI schemes are ASCII-case-insensitive. Universal scheme regexes spell this
 with explicit byte classes (`[vV]`, `[sS]`, ...), and their pre-gates use the

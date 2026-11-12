@@ -628,6 +628,14 @@ func TestExtractCredentialedForms(t *testing.T) {
 			want: []Candidate{{Host: "9.9.9.9", Port: 4145, Schema: "socks4"}},
 		},
 		{
+			// Symmetric with the bare form below: "user@ip:port" is a mention
+			// far more often than a Basic credential with an empty password.
+			// The scheme stays as evidence; the credential is not invented.
+			name: "scheme userinfo without colon stays anonymous",
+			body: "https://user@8.8.8.8:8443",
+			want: []Candidate{{Host: "8.8.8.8", Port: 8443, Schema: "https"}},
+		},
+		{
 			name: "bare userinfo",
 			body: "user:pass@2.2.2.2:3128",
 			want: []Candidate{{Host: "2.2.2.2", Port: 3128, ProxyAuth: "user:pass"}},

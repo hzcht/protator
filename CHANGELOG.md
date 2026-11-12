@@ -65,6 +65,15 @@ nobody can find.
 
 ### Fixed
 
+- **Scheme userinfo without `:` no longer manufactures a credential.**
+  `https://user@1.2.3.4:8080` now stays the anonymous socket with its scheme
+  instead of becoming a Basic credential with an empty password — symmetric
+  with the bare form, which already ignored `name@ip:port`.
+- **The bare credential form's ambiguity is documented** (`docs/REGEX.md`):
+  the userinfo class can absorb a preceding hyphenated word
+  (`contact-user:pass@…`); a left boundary would truncate legitimate
+  usernames, so bare credentials stay best-effort and validation rejects
+  wrong ones.
 - **The checker's probe branch carried no credential.** Both Check branches
   now share one constructor, `proxyForCandidate`: bare
   `user:pass@ip:port` and `host:port:user:pass` candidates (the shapes

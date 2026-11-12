@@ -242,9 +242,14 @@ func (e *Extractor) extract(text string) []Candidate {
 					continue
 				}
 				schema := normScheme(text[m[2]:m[3]])
+				userinfo := text[m[4]:m[5]]
+				// Symmetric with the bare pass below: a userinfo without ':'
+				// ("https://user@1.2.3.4:8080") is far more often a mention
+				// than a Basic credential with an empty password. Keep the
+				// socket with the scheme as evidence and drop the guess.
 				var auth string
-				if schema == "http" || schema == "https" || schema == "socks5" {
-					auth = text[m[4]:m[5]]
+				if strings.Contains(userinfo, ":") && (schema == "http" || schema == "https" || schema == "socks5") {
+					auth = userinfo
 				}
 				emit(Candidate{Host: text[m[6]:m[7]], Port: port, Schema: schema, ProxyAuth: auth})
 				blank(m[0], m[1])
