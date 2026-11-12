@@ -159,7 +159,7 @@ go test ./main/ -run TestAdmin -v
 ### Test Conventions
 - Use `t.TempDir()` for all file I/O
 - No network access in unit tests (use in-test CONNECT proxy from `proxy/pipeline_test.go`)
-- Loop contracts are pinned by dedicated test files (`proxy/revalidate_test.go`, `proxy/poolloop_test.go`, `proxy/collector_test.go`, the admin WS token gate in `main/admin_test.go`) — extend the matching file instead of inventing a parallel one
+- Loop contracts are pinned by dedicated test files (`proxy/revalidate_test.go`, `proxy/poolloop_test.go`, `proxy/collector_test.go`, `proxy/bucket_wait_test.go`, the admin WS token gate in `main/admin_test.go`) — extend the matching file instead of inventing a parallel one
 - `go test -race` does not build on the Windows box itself (no gcc/cgo) — run it through WSL, see "Race detector via WSL" below
 
 ### Race detector via WSL
