@@ -20,6 +20,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\main\start.ps1
 
 ```
 protator/
+├── .github/
+│   └── workflows/
+│       └── ci.yml           # CI: Linux race suite + Windows local gate
 ├── config/                  # Configuration files
 │   ├── config.toml         # Main configuration
 │   ├── sites.txt           # Curated source list
@@ -34,6 +37,7 @@ protator/
 │   └── logs/               # Rotating log files
 ├── main/                    # Entrypoint & admin
 │   ├── proxy.go            # main() + wiring (buildPipeline, startCollector)
+│   ├── doc.go              # Package documentation
 │   ├── servers.go          # HTTP/HTTPS/SOCKS5 listeners
 │   ├── loops.go            # Wiring + housekeeping loops (save, stats)
 │   ├── workers.go          # checkerWorkers: validation pool + supervisor
@@ -49,9 +53,11 @@ protator/
 │   ├── adminweb/           # The real UI files (HTML/CSS/JS)
 │   ├── logfiles.go         # Per-category rotating log sinks + in-memory tail
 │   ├── logging.go          # noiseWriter (TLS noise filter + goproxy WARN coalesce)
+│   ├── OPS.md              # Operator manual (Russian)
 │   ├── start.ps1           # Ops: start/restart
 │   └── stop.ps1            # Ops: graceful stop
 ├── proxy/                   # Core logic
+│   ├── doc.go              # Package documentation
 │   ├── model.go            # Proxy, Candidate, atomic health stats, URL/Key/parse
 │   ├── model_proto.go      # ProxyMeta + GeoIP/VLESS/trojan accessors + query builders
 │   ├── bucket.go           # Live queue, hot tail, Subscribe, PickHealthy
@@ -72,6 +78,7 @@ protator/
 │   ├── extract_share.go    # trojan:// + vless:// share links
 │   ├── extract_spys.go     # spys.one JS-obfuscated port reconstruction
 │   ├── extract_base64.go   # Whole-body base64 pass + its false-positive guard
+│   ├── jswrite.go          # document.write reconstruction (Proxynova/GeoNode)
 │   ├── pool.go             # CandidatePool (rotating, async compaction)
 │   ├── debugproxies.go     # Rolling window of freshly validated proxies
 │   ├── sitestats.go        # SiteRegistry (telemetry + cooldown + priority)
@@ -83,8 +90,9 @@ protator/
 │   ├── tlsutil.go          # Cert loading / self-signed generation
 │   ├── browser.go          # Playwright headless fallback
 │   ├── sticky.go           # Connection/session pinning (LRU pool)
-│   └── transport.go        # ProxyTransport (request-level failover + block detection)
-├── util/                    # Legacy stub (keep as-is)
+│   ├── transport.go        # ProxyTransport (request-level failover + block detection)
+│   └── testdata/           # Extraction regression fixtures (captured pages)
+├── util/                    # Deprecated legacy stub (keep as-is)
 └── docs/                    # Architecture, Developer guide, extractor/regex notes
 ```
 
@@ -151,6 +159,7 @@ go test ./main/ -run TestAdmin -v
 ### Test Conventions
 - Use `t.TempDir()` for all file I/O
 - No network access in unit tests (use in-test CONNECT proxy from `proxy/pipeline_test.go`)
+- Loop contracts are pinned by dedicated test files (`proxy/revalidate_test.go`, `proxy/poolloop_test.go`, `proxy/collector_test.go`, the admin WS token gate in `main/admin_test.go`) — extend the matching file instead of inventing a parallel one
 - `go test -race` does not build on the Windows box itself (no gcc/cgo) — run it through WSL, see "Race detector via WSL" below
 
 ### Race detector via WSL
@@ -245,6 +254,9 @@ max_candidates_per_site = 1000
 | Move the pool rewrite back under `mu` | Checker stalls for every fsync | Use `compactAsync` (snapshot → write → flush) |
 | Call `log.Fatalf` outside a bind path | Skips every defer: no queue save | Log and keep serving |
 | Read `Len()` in `/ready` | Supervisor keeps a dead proxy in rotation | Use `Bucket.ProvenCount` |
+| Dedup or probe by host:port alone | Same socket over http and socks5, or with different `user:pass@`, is a different proxy | Bucket dedup is by full URL incl. credentials — key on `Key()`, never host:port |
+| Poll a waiting loop with `time.After` | A fresh timer is allocated per iteration on hot paths | Reuse one caller-owned `time.Timer` (`waitQueue`, `proxy/bucket.go`) |
+| Feed credentialed tokens to the anonymous passes | Wasted check: an anonymous probe of an auth socket is 407/dead | The extractor blanks credentialed tokens first; contract in `docs/REGEX.md` |
 | Hardcode ports in tests | Flaky on CI | Use `net.Listen("tcp", "127.0.0.1:0")` |
 
 ## 9. Debugging
