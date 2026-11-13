@@ -298,7 +298,7 @@ func (p *Proxy) AppendURL(buf []byte) []byte {
 	}
 	if s == "vless" && p.GetVLESSUUID() != "" {
 		// Must include the addr, same as URL(): without host:port the queue
-		// save rendered "vless://uuid@?flow=вЂ¦", ParseProxyLine failed at
+		// save rendered "vless://uuid@?flow=…", ParseProxyLine failed at
 		// splitHostPort("") on reload and silently dropped the entry — the
 		// save/reload cycle deleted every VLESS proxy while URLLen (which
 		// counts the addr) and AppendGood(p.URL()) stayed correct.

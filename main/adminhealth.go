@@ -39,7 +39,7 @@ func (a *admin) healthView(tls bool) map[string]interface{} {
 		m["worker_restarts"] = a.workers.Restarts()
 	}
 	if a.beats != nil {
-		m["beats"] = a.beats.view(a.cfg.Storage.RevalidateInterval.Duration, a.cfg.Collector.CycleSleep.Duration, a.cfg.Storage.SaveInterval.Duration)
+		m["beats"] = a.beats.view(a.cfg.Storage.RevalidateInterval.Duration, a.cfg.Collector.CycleSleep.Duration, a.cfg.Storage.SaveInterval.Duration, exportRefreshInterval(a.cfg))
 	}
 	counters := proxy.Stats.Snapshot()
 	for _, k := range []string{

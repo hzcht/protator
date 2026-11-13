@@ -288,3 +288,23 @@ dir = "data/logs"
 max_bytes = 33554432
 # Keep this many rotated generations per category (.log.1 newest, .log.K oldest).
 keep = 5
+
+[export]
+# The list distribution service: a plain HTTP listener that hands out live
+# (proven-tier) proxies to external consumers. GET /?count=N&format=txt|json
+#   txt  - one proxy URL per line, scheme://host:port (credentials included
+#          when the proxy has them, same lines as the admin .txt download)
+#   json - [{"url":...,"schema":...,"host":...,"port":...}, ...]
+# The served list is a RANDOM SAMPLE of the proven tier (served or validated
+# within the 15-minute liveness window), rebuilt every refresh_minutes —
+# consecutive rebuilds hand out different proxies, requests between rebuilds
+# share one list. list_size is both the sample size and the per-request count
+# cap. Loopback by default: a non-loopback listen is allowed but shouted about
+# at startup, because the endpoint gives away live proxies to anyone who can
+# reach the port.
+enabled = true
+listen = "127.0.0.1:8899"
+# Rebuild the served list every n minutes.
+refresh_minutes = 5
+# Sample size == max proxies per request.
+list_size = 1000

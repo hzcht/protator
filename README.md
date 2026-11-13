@@ -19,8 +19,16 @@ On start you will see `all listeners ready: http=... https=... socks5=... (queue
 | HTTPS    | `0.0.0.0:8443` | TLS front-end; self-signed cert auto-generated unless `tls_cert_file`/`tls_key_file` are set |
 | SOCKS5   | `0.0.0.0:1080` | RFC 1928 CONNECT only, no auth                   |
 | Admin    | `127.0.0.1:9090`| UI + `/health` + `/ready` + JSON API + WebSocket `/ws`. One port answers both HTTP and HTTPS. Optional `server.admin_token`; without it the page is open, so keep the bind loopback. |
+| List svc | `127.0.0.1:8899`| Read-only distribution channel (`[export]`, on in the shipped config): `GET /?count=N&format=txt\|json` returns live (proven) proxies with protocol and port; the served list is a random sample rebuilt every `export.refresh_minutes`. |
 
-Point any scraper at one of these as its proxy. Every request gets a different upstream proxy; dead ones are retried transparently and evicted.
+Point any scraper at one of the first three as its proxy. Every request gets a different upstream proxy; dead ones are retried transparently and evicted.
+
+Consumers who want the proxy list itself (not a proxy to route through) use the list service:
+
+```sh
+curl "http://127.0.0.1:8899/?count=50"                # txt: scheme://host:port per line
+curl "http://127.0.0.1:8899/?count=50&format=json"    # json: [{"url","schema","host","port"}, ...]
+```
 
 ## Admin page
 
@@ -36,11 +44,11 @@ Open `http://127.0.0.1:9090/` (or `https://127.0.0.1:9090/` — the same port) f
 The header tiles are the counters a supervisor would watch: `proven` (the
 tier `/ready` actually tests) rather than `live`.
 
-## New in v2
+## Highlights
 
 - **VLESS + REALITY support** — full VLESS protocol with REALITY handshake (x25519 + HKDF-SHA256), uTLS Chrome fingerprinting, Vision flow support. Config via `vless://uuid@host:port?flow=...&sni=...&pbk=...&sid=...`; `security=none` (plaintext, no uTLS) supported too.
 - **Trojan support** — `trojan://password@host:port` share lists parsed, validated, served and persisted end to end (raw TCP only; TLS with SNI or plaintext; same host:port with different passwords are distinct entries). Same pipeline as VLESS: credentials ride extraction → check → dial → pool/queue.
-- **Credentialed proxies** - `user:pass@host:port` and `host:port:user:pass` validate and connect for `http`/`https` (Basic `Proxy-Authorization` in the CONNECT handshake) and `socks5` (RFC 1929). The userinfo is kept raw percent-encoded and is part of the proxy's identity: same host:port with different credentials are distinct entries. Column exports emit the anonymous candidate too, so stale credentials do not hide a working socket. Socks4 stays out (the protocol has no auth).
+- **Credentialed proxies** — `user:pass@host:port` and `host:port:user:pass` validate and connect for `http`/`https` (Basic `Proxy-Authorization` in the CONNECT handshake) and `socks5` (RFC 1929). The userinfo is kept raw percent-encoded and is part of the proxy's identity: same host:port with different credentials are distinct entries. A userinfo without `:` is a mention, not auth (`name@host:port` stays anonymous). Column exports emit the anonymous candidate too, so stale credentials do not hide a working socket. Socks4 stays out (the protocol has no auth).
 - **GeoIP integration** — optional MaxMind GeoIP2-City.mmdb (`geoip_db_path` in config). Validated proxies get country/ASN attached; admin filters by `?country=US&asn=AS12345`.
 - **WebSocket live updates** — `/ws` pushes health/proxy/source updates instantly; UI switches from 15s polling to real-time.
 - **Admin enhancements** — CSV/JSONL export, bulk source delete, force revalidate selected proxies, per-proxy **drop** from the queue, logs viewer tab, Shutdown button, copy curl/wget button, 24h stats history (`/api/stats/history` + graphs).
@@ -64,7 +72,7 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Developer guide: [docs/DE
 
 | File | Purpose |
 |------|---------|
-| `config/config.toml` | All tunables (timeouts, workers, retries, thresholds). Defaults duplicated in `proxy/config.go:fillDefaults`. |
+| `config/config.toml` | All tunables (timeouts, workers, retries, thresholds); the shipped values are tuned, and `proxy/config.go:fillDefaults` only fills keys the file leaves out. |
 | `config/checkers.toml` | Test servers + expected-answer templates (`[[tests]]` with `url`, `must_contain`). |
 | `config/sites.txt` | Proxy-list sources (raw lists, HTML tables, github blob URLs auto-converted to raw). Curated by measurement: only sources that actually produced candidates. |
 | `config/sites_legacy.txt` | The pre-curation 87 MB list, kept as history. Not fed to the collector. |
@@ -90,4 +98,5 @@ go test ./... -count=1
 - [Architecture](docs/ARCHITECTURE.md) — system design, data flow, component map
 - [Developer Guide](docs/DEVELOPER.md) — contributing, testing, debugging, adding protocols
 - [Extractor & regexes](docs/REGEX.md) — what the collector can read and how to add a pattern
+- [Operator manual](main/OPS.md) — Russian runbook: ports, start/stop, config walkthrough, failure modes
 - [Changelog](CHANGELOG.md) — what changed, by release

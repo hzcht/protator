@@ -143,6 +143,22 @@ type Socks5Config struct {
 	IdleTimeout Duration `toml:"idle_timeout"`
 }
 
+// ExportConfig controls the list distribution service: a plain HTTP listener
+// that hands out the requested number of live (proven-tier) proxies as txt or
+// json. It is a read-only data channel — no editing, no token, loopback by
+// default, loud warning when bound outside the host.
+type ExportConfig struct {
+	Enabled bool   `toml:"enabled"`
+	Listen  string `toml:"listen"`
+	// RefreshMinutes is how often the served list is rebuilt: a random sample
+	// of the proven tier taken every n minutes, so consecutive rebuilds hand
+	// out different proxies and requests between rebuilds share one list.
+	RefreshMinutes int `toml:"refresh_minutes"`
+	// ListSize is both the sample size and the per-request count cap: the
+	// service never returns more proxies than the list holds.
+	ListSize int `toml:"list_size"`
+}
+
 // CheckerConfig controls proxy validation.
 type CheckerConfig struct {
 	SelfIPURLs   []string `toml:"self_ip_urls"`
@@ -275,6 +291,7 @@ type LoggingConfig struct {
 type Config struct {
 	Server    ServerConfig    `toml:"server"`
 	Socks5    Socks5Config    `toml:"socks5"`
+	Export    ExportConfig    `toml:"export"`
 	Checker   CheckerConfig   `toml:"checker"`
 	Collector CollectorConfig `toml:"collector"`
 	Storage   StorageConfig   `toml:"storage"`
@@ -429,6 +446,19 @@ func (c *Config) fillDefaults() error {
 	// instantly, so 0 means "use the default", not "off".
 	if c.Socks5.IdleTimeout.Duration <= 0 {
 		c.Socks5.IdleTimeout = Duration{time.Minute * 5}
+	}
+
+	// The list service is opt-in (Enabled), so a config without [export] gets
+	// the same defaults it would run with: the values are always filled so a
+	// later enabled=true cannot boot with zero/empty knobs.
+	if c.Export.Listen == "" {
+		c.Export.Listen = "127.0.0.1:8899"
+	}
+	if c.Export.RefreshMinutes <= 0 {
+		c.Export.RefreshMinutes = 5
+	}
+	if c.Export.ListSize <= 0 {
+		c.Export.ListSize = 1000
 	}
 
 	if len(c.Checker.SelfIPURLs) == 0 {

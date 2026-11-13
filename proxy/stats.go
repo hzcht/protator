@@ -74,6 +74,13 @@ type Registry struct {
 	AdminAuthFailures atomic.Int64 // admin token rejections
 	CollectorWakes    atomic.Int64 // emergency/admin collector wake signals
 
+	// List service (export.*): its own channel, deliberately NOT part of
+	// requests_total — that sum is the three serving fronts, and the watchdog
+	// rates built on it must not drift with list downloads.
+	ExportRequests      atomic.Int64 // list downloads served
+	ExportProxiesServed atomic.Int64 // proxies handed out in responses
+	ExportListRebuilds  atomic.Int64 // served-list rebuilds (heartbeat source)
+
 	RecoverPanics atomic.Int64 // panics RecoverPanic logged
 }
 
@@ -117,6 +124,9 @@ func (r *Registry) Reset() {
 	r.GoodWriteFailures.Store(0)
 	r.AdminAuthFailures.Store(0)
 	r.CollectorWakes.Store(0)
+	r.ExportRequests.Store(0)
+	r.ExportProxiesServed.Store(0)
+	r.ExportListRebuilds.Store(0)
 	r.RecoverPanics.Store(0)
 }
 
@@ -162,6 +172,9 @@ func (r *Registry) Snapshot() map[string]int64 {
 		"good_write_failures_total":    r.GoodWriteFailures.Load(),
 		"admin_auth_failures_total":    r.AdminAuthFailures.Load(),
 		"collector_wakes_total":        r.CollectorWakes.Load(),
+		"export_requests_total":        r.ExportRequests.Load(),
+		"export_proxies_served_total":  r.ExportProxiesServed.Load(),
+		"export_list_rebuilds_total":   r.ExportListRebuilds.Load(),
 		"recovered_panics_total":       r.RecoverPanics.Load(),
 	}
 }

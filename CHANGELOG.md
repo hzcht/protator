@@ -10,6 +10,22 @@ nobody can find.
 
 ### Added
 
+- **List distribution service (`[export]`)** — one more channel for handing
+  out proxies, next to the serving fronts and the admin page: a read-only
+  HTTP listener (`127.0.0.1:8899` in the shipped config) that answers
+  `GET /?count=N&format=txt|json` with the requested number of live proxies,
+  protocol and port included (txt: `scheme://host:port` lines, same rendering
+  as the admin downloads; json: `{"url","schema","host","port"}`). The served
+  list is a random sample of the proven tier (served or validated inside the
+  15-minute liveness window), rebuilt every `export.refresh_minutes` —
+  consecutive rebuilds hand out different proxies, requests inside a window
+  share one list; `export.list_size` is both the sample size and the
+  per-request count cap. No token, no editing; loopback by default, loud
+  startup warning on a non-loopback bind. Telemetry:
+  `export_requests_total`, `export_proxies_served_total`,
+  `export_list_rebuilds_total` (the new `/health` beat) — deliberately NOT in
+  `requests_total`, which stays the three serving fronts.
+
 - **Credentialed proxies are extracted, not only parsed.** The collector now
   reads `scheme://user:pass@ip:port` and bare `user:pass@ip:port` tokens and
   blanks them out of the text the anonymous passes see: the bare socket inside
@@ -35,8 +51,8 @@ nobody can find.
   with full-channel skip, non-blocking partial emit), `Collector.Run` (a
   panicking cycle is recovered and the loop keeps cycling), and the
   WebSocket admin-token gate (401 before the hijack; pass-through when no
-  token is configured). Coverage: proxy 69.8% → 72.9%, main 49.3% → 50.0%;
-  214 test/bench/fuzz functions.
+  token is configured). Coverage: proxy 69.8% → 73.1%, main 49.3% → 50.0%;
+  221 test/bench/fuzz functions.
 
 ### Changed
 
@@ -96,6 +112,43 @@ nobody can find.
   and problems.md §21. Case-folded literals reserve four UTF-8 bytes per rune,
   a probe plan is capped by its **total** window (not per step), and
   `FuzzAnchoredMatchesFindAll` adds arbitrary-body equivalence coverage.
+
+### Documentation
+
+- **Docs re-synced against the code** (post-release passes; everything
+  below was verified against the source, not proofread):
+  - **ARCHITECTURE** — the admin security paragraph now says what the code
+    does: the page shell `/` and `/static/*` are public by design (a
+    browser cannot attach a token to a subresource, and they carry no live
+    data), and mutating methods pass `requireSameOrigin` with or without a
+    token, closing the cross-site-POST and DNS-rebinding holes the token
+    cannot cover when unset. The route table gained `/static/admin.css` +
+    `/static/admin.js`; the loop table no longer hardcodes
+    `pool_retry_batch` (1000 shipped, 20000 in `fillDefaults`); the
+    config reference states its Default column is the shipped
+    `config/config.toml`, deliberately tuned, not `fillDefaults`; §9.5
+    rewritten for the three credential shapes (scheme / bare / column)
+    with the `:`-required rule and the narrow `SplitN(4)` column parser.
+  - **README** — the credentialed-proxies bullet records the
+    mention-not-auth rule (`name@host:port` stays anonymous); the file
+    table states the shipped `config.toml` values are tuned and
+    `fillDefaults` only fills keys the file leaves out; the index links
+    the operator manual; the stale "New in v2" heading (it predates the
+    version scheme — the only tag is v0.1.0) became "Highlights".
+  - **DEVELOPER** — coverage baseline refreshed (221 test/bench/fuzz
+    functions; `proxy` 73.1%, `main` 50.0%, re-measured); §2 tree
+    refreshed (ci.yml, both `doc.go`, OPS.md, jswrite.go, testdata/); §5
+    points at the loop-contract test files and names
+    `bucket_wait_test.go`; three pitfall rows (dedup/probe by `host:port`
+    alone — key on `Key()`; no `time.After` in waiting loops — use the
+    waitQueue timer; never feed credentialed tokens to the anonymous
+    passes).
+  - **OPS.md** (RU) — credentialed bullets in the universal-pattern list,
+    the Download-.txt note, a shame-table row about stripping
+    `user:pass@` from queue lines, and the curated source counts (290
+    unique sources, 306 lines with pagination).
+  - Comment mojibake (`…`/`—` stored as `вЂ¦`/`вЂ”`) fixed in
+    `proxy/model.go` / `proxy/model_proto.go`.
 
 ## [0.1.0] - 2026-11-09
 

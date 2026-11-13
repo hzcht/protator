@@ -39,6 +39,7 @@ protator/
 │   ├── proxy.go            # main() + wiring (buildPipeline, startCollector)
 │   ├── doc.go              # Package documentation
 │   ├── servers.go          # HTTP/HTTPS/SOCKS5 listeners
+│   ├── export.go           # List distribution service: GET /?count=N&format=txt|json, proven sample
 │   ├── loops.go            # Wiring + housekeeping loops (save, stats)
 │   ├── workers.go          # checkerWorkers: validation pool + supervisor
 │   ├── beats.go            # Subsystem heartbeats (last cycle/pass/save) + exposure warning
@@ -198,8 +199,8 @@ every push to master and every PR:
 - **windows** — the local gate verbatim: `go build ./...`, `go vet ./...`,
   `gofmt -l main proxy util` (must stay silent).
 
-Baseline as of this pass: 214 test/benchmark/fuzz functions; `go test
--cover` reports `protator/proxy` 72.9%, `protator/main` 50.0%. The largest
+Baseline as of this pass: 221 test/benchmark/fuzz functions; `go test
+-cover` reports `protator/proxy` 73.1%, `protator/main` 50.0%. The largest
 remaining gaps are `browser.go` (Playwright fallback, default-off) and the
 three listener front ends.
 

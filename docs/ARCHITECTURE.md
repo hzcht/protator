@@ -183,6 +183,7 @@ For `schema="vless"` the checker:
 | TLS | `proxy/tlsutil.go` | Load cert/key from disk or generate ephemeral self-signed. |
 | Browser fallback | `proxy/browser.go` | Lazy headless Chromium via playwright (off by default). |
 | Admin | `main/admin.go`, `main/adminapi.go`, `main/admin_sources.go`, `main/adminproxies.go`, `main/adminhealth.go`, `main/adminlive.go`, `main/adminws.go`, `main/adminassets.go` (embed of `adminweb/`) | `mixedListener` (0x16 sniffing, one port for HTTP and HTTPS), `routes`, source/live/site handlers, embedded page, WebSocket `/ws`. |
+| List service | `main/export.go` | Read-only distribution channel (opt-in via `[export]`): `GET /?count=N&format=txt\|json` hands out a random sample of the proven tier, rebuilt every `export.refresh_minutes`. Loopback default; no token, no editing. |
 | Logging | `main/logfiles.go`, `main/logging.go` | Per-category rotating sinks + `noiseWriter` (drops stdlib TLS-handshake noise, coalesces the goproxy dial-warn flood). `fileLogSink` backstop drops TLS handshake noise. |
 | Config | `proxy/config.go` | TOML structs + `fillDefaults` + `LoadTests`. |
 
@@ -217,13 +218,20 @@ HTTP and HTTPS: `mixedListener` reads the first byte of every connection and
 wraps it in `tls.Server` when it is `0x16`. That is the fix for a browser
 pointed at `https://127.0.0.1:9090/` getting `ERR_SSL_RECORD_TOO_LONG` from a
 plaintext listener. `server.admin_token` gates everything except `/health` and
-`/ready` (Bearer header or `?token=`); without a token a non-loopback bind logs
-a loud warning, because the page can edit `sites.txt` and drop proxies.
+`/ready` (Bearer header or `?token=`); the page shell (`/`) and `/static/*` are
+public too — a browser cannot attach a token to a subresource, and they carry
+no live data (the token prompt lives in that JS). Without a token a non-loopback
+bind logs a loud warning, because the page can edit `sites.txt` and drop
+proxies. Token or not, mutating methods also pass `requireSameOrigin`: a
+cross-site `Sec-Fetch-Site`/`Origin` is rejected, which closes the drive-by
+cross-site POST and DNS-rebinding holes the token cannot cover when it is
+unset; curl and scripts send neither header and pass.
 
 | Route | Purpose |
 |-------|---------|
 | `GET /` | Page with five tabs: live proxies (+ retest/drop), per-source stats (+ cooldown reset), 24h history graphs, `sites.txt` editor, logs tail. Header: `Collect now`, `Shutdown` and metric tiles. |
-| `GET /health` | Counters + loop heartbeats (last collector cycle / revalidation pass / queue save) + gauges (queue, proven, pool, channel depth, goroutines, WS clients) as JSON. |
+| `GET /static/admin.css`, `/static/admin.js` | Embedded page assets. Public by design: the browser cannot attach a token to a subresource, and they carry no live data. |
+| `GET /health` | Counters + loop heartbeats (last collector cycle / revalidation pass / queue save / list-service rebuild) + gauges (queue, proven, pool, channel depth, goroutines, WS clients) as JSON. |
 | `GET /ready` | 200 while the queue has **proven** proxies (`Bucket.ProvenCount`), 503 otherwise. Never on `Len()`: an unverified queue must not report healthy. |
 | `GET /api/sources` | One row per tracked source: alive, yield %, emitted, found, cycles, fails, cooldown, last note. |
 | `GET /api/proxies?scope=…` | `hot` (curated tail), `served` (carried real traffic), `checked` (validated recently), `all` (whole queue). `&format=text|csv|jsonl`, `&country=US`, `&asn=AS12345`. |
@@ -252,12 +260,12 @@ never been proven. `Bucket.LiveList` implements the same scopes for code.
 |------|------|----------|---------|
 | `saveLoop` | `main/loops.go` | `storage.save_interval` (1m) | Atomic rewrite of `proxy.lst`, only while the queue is dirty (the dirty flag is set by `Add`/`Remove`). |
 | `statsLoop` | `main/loops.go` | 1 min | Log the queue counts **and** the per-second rates (serve, dial-fail, eviction, checks) from `proxy.Stats`. After 2 empty minutes → emergency collector wake. |
-| `PoolReprobeLoop` | `proxy/poolloop.go` | `collector.pool_retry_interval` (3m) | Emit `pool_retry_batch` (1000) candidates from pool, non-blocking, adaptive room check. |
+| `PoolReprobeLoop` | `proxy/poolloop.go` | `collector.pool_retry_interval` (3m) | Emit up to `collector.pool_retry_batch` candidates (1000 in the shipped config) from the pool, non-blocking, with an adaptive room check. |
 | `RevalidateLoop` | `proxy/revalidate.go` | `storage.revalidate_interval` (15m) | Stale-first revalidation of bucket, capped at `revalidate_max_per_pass` (30k). Skips recently-served (`revalidate_fresh_servers`). |
 | `statsRecorder` (admin) | `main/adminapi.go` | 1 min | Ring buffer of 1440 samples (queue counts + rates) for `/api/stats/history`, the 24h graph and the WebSocket state message. |
 | `beatTracker` | `main/beats.go` | 5s | Stamps the last time each subsystem made progress, from its counter delta. |
-| `startWSNotifier` | `main/adminws.go` | 1s | Coalesced WebSocket delta: at most one broadcast per tick, skipped entirely when no client is connected. |
-| `startWSNotifier` (admin) | `main/adminws.go` | 1 s tick | Coalesces bucket-change flags into at most one delta broadcast per tick. |
+| `startWSNotifier` | `main/adminws.go` | 1 s tick | Coalesced WebSocket delta: bucket-change flags become at most one broadcast per tick, skipped entirely when no client is connected. |
+| `exportService.refreshLoop` | `main/export.go` | `export.refresh_minutes` (5m) | Re-randomizes the served list: unranked scan of the proven tier (`LiveListUnranked` scope=checked in the 15m window), shuffle, trim to `export.list_size`. Bumps `export_list_rebuilds_total`, the beat source for `/health`. |
 
 ## 8. Candidate Pool persistence
 
@@ -318,15 +326,22 @@ passwords are distinct entries everywhere (bucket dedup is by full URL).
 
 ### 9.5 Plain-scheme credentials
 
-`user:pass@host:port` on `http`/`https`/`socks5` lines is parsed end to end:
+Credentials arrive in three shapes: `scheme://user:pass@host:port`, the bare
+`user:pass@host:port` export form, and the column form `host:port:user:pass`.
+`ParseProxyLine` accepts all three. The scheme and bare forms require a `:` in
+the userinfo: `scheme://name@host:port` keeps the socket with its scheme but
+anonymous (a mention, not auth), and a bare `name@ip:port` is skipped as an
+email/contact line rather than guessed at. The column form is tried only when
+the line has no scheme and no `@`, and is deliberately narrow (`SplitN(4)`:
+one dotted host, one numeric port, further colons stay inside the password).
+
 `ParseProxyLine` stores the userinfo **raw** (percent-encoding preserved,
 never decoded/re-encoded — upstreams distinguish `%2F` from its decoded
 form) in `ProxyMeta.proxyAuth`; `Key()+URL()+URLLen()` include it, so
 credentials are part of the proxy's identity and the dedup rule above
 applies unchanged. The dialer turns it into a Basic `Proxy-Authorization`
 header for CONNECT and RFC 1929 for socks5. Socks4 is excluded (no auth in
-the protocol); `host:port:user:pass` column orderings remain unparsed (see
-`docs/REGEX.md`).
+the protocol).
 
 ## 10. GeoIP integration
 
@@ -336,6 +351,11 @@ the protocol); `host:port:user:pass` column orderings remain unparsed (see
 - Export formats include `country` column
 
 ## 11. Configuration reference (key tunables)
+
+The Default column is the value in the shipped `config/config.toml`; it is
+deliberately tuned for production and is **not** a verbatim copy of
+`proxy/config.go:fillDefaults`, which only fills keys the file leaves out
+(e.g. `pool_retry_batch`: 1000 here, 20000 in `fillDefaults`).
 
 ### `[server]`
 | Key | Default | Description |
@@ -393,6 +413,14 @@ the protocol); `host:port:user:pass` column orderings remain unparsed (see
 | `revalidate_max_per_pass` | 30000 | Budget per revalidation pass |
 | `revalidate_seed_rate` | 200/s | Startup re-seed drain rate into the checker (`RevalidateSeeded`) |
 | `revalidate_seed_max` | 5000 | Cap on seeded proxies re-checked at startup |
+
+### `[export]`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | true | List distribution service (off unless the section says so) |
+| `listen` | `127.0.0.1:8899` | Read-only list endpoint; non-loopback is allowed but shouted about at startup |
+| `refresh_minutes` | 5 | Rebuild the served list every n minutes |
+| `list_size` | 1000 | Sample size == max proxies per request |
 
 ## 12. Files on disk (do not delete)
 

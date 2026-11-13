@@ -22,6 +22,7 @@ type beats struct {
 	collector  atomic.Int64 // unix nanos of the last completed collector cycle
 	revalidate atomic.Int64 // last revalidation pass
 	save       atomic.Int64 // last successful queue save
+	export     atomic.Int64 // last list-service rebuild
 }
 
 func newBeats() *beats {
@@ -30,6 +31,7 @@ func newBeats() *beats {
 	b.collector.Store(now)
 	b.revalidate.Store(now)
 	b.save.Store(now)
+	b.export.Store(now)
 	return b
 }
 
@@ -37,7 +39,7 @@ func newBeats() *beats {
 // one moved. The tracker is one goroutine for the whole process, so the cost
 // does not scale with the number of tracked subsystems.
 func startBeatTracker(ctx context.Context, b *beats) {
-	var lastCycles, lastDones int64
+	var lastCycles, lastDones, lastExport int64
 	go func() {
 		defer proxy.RecoverPanic("beats")
 		t := time.NewTicker(5 * time.Second)
@@ -63,6 +65,10 @@ func startBeatTracker(ctx context.Context, b *beats) {
 					lastDones = d
 					b.revalidate.Store(now)
 				}
+				if e := proxy.Stats.ExportListRebuilds.Load(); e != lastExport {
+					lastExport = e
+					b.export.Store(now)
+				}
 			}
 		}
 	}()
@@ -73,28 +79,34 @@ type beatsView struct {
 	CollectorAgeS   float64 `json:"collector_age_s"`
 	RevalidateAgeS  float64 `json:"revalidate_age_s"`
 	SaveAgeS        float64 `json:"save_age_s"`
+	ExportAgeS      float64 `json:"export_age_s"`
 	CollectorStale  bool    `json:"collector_stale"`
 	RevalidateStale bool    `json:"revalidate_stale"`
 	SaveStale       bool    `json:"save_stale"`
+	ExportStale     bool    `json:"export_stale"`
 }
 
 // view renders the beats. Stale means older than two of the subsystem's own
 // intervals: one interval late is scheduling jitter, two is stuck. The save
 // beat only moves on a dirty save, so a quiet-but-healthy queue would show an
 // ever-growing age with no verdict without SaveStale: it uses the same rule
-// against the save interval.
-func (b *beats) view(revalidateInterval, cycleSleep, saveInterval time.Duration) beatsView {
+// against the save interval. exportRefresh <= 0 means the list service is
+// disabled: nothing will ever move that beat, so no verdict is given.
+func (b *beats) view(revalidateInterval, cycleSleep, saveInterval, exportRefresh time.Duration) beatsView {
 	now := time.Now().UnixNano()
 	col := time.Duration(now - b.collector.Load())
 	rev := time.Duration(now - b.revalidate.Load())
 	save := time.Duration(now - b.save.Load())
+	exp := time.Duration(now - b.export.Load())
 	return beatsView{
 		CollectorAgeS:   col.Seconds(),
 		RevalidateAgeS:  rev.Seconds(),
 		SaveAgeS:        save.Seconds(),
+		ExportAgeS:      exp.Seconds(),
 		CollectorStale:  col > 2*cycleSleep+30*time.Second,
 		RevalidateStale: rev > 2*revalidateInterval+30*time.Second,
 		SaveStale:       save > 2*saveInterval+30*time.Second,
+		ExportStale:     exportRefresh > 0 && exp > 2*exportRefresh+30*time.Second,
 	}
 }
 

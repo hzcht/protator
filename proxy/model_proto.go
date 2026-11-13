@@ -365,7 +365,7 @@ func proxyURLOf(p *Proxy) *url.URL {
 }
 
 // ensureMeta is a fallback for Proxy values built outside the known
-// construction sites (checker literals, ParseProxyLine вЂ” both allocate meta
+// construction sites (checker literals, ParseProxyLine — both allocate meta
 // eagerly now). SetGeoIP/SetVLESS still call it, but on the normal path it is
 // a nil check that never writes: the pointer is published before the bucket
 // ever sees the Proxy, so concurrent readers never race the field.

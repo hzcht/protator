@@ -109,6 +109,9 @@ func main() {
 	beats := newBeats()
 	startBeatTracker(ctx, beats)
 	startAdminServer(ctx, cfg, bucket, pool, collector, checker, debug, sink, beats, workers, wakeCollector, candidates, logNoise, procCancel)
+	// The list distribution channel: a third kind of listener, read-only and
+	// tokenless — see export.go.
+	startExportListServer(ctx, cfg, bucket, logNoise)
 	startBackgroundLoops(ctx, cfg, bucket, pool, checker, debug, candidates, wakeCollector, beats)
 
 	<-ctx.Done()
