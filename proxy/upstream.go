@@ -194,16 +194,18 @@ func (d *ForwardDialer) DialContext(ctx context.Context, network, addr string) (
 		conn, err := dialProxy(p, d.dialTimeout, ctx, network, addr)
 		if err != nil {
 			lastErr = err
-			Stats.DialFailures.Add(1)
+			countDialFailure(err)
 			if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 				d.bucket.Remove(p)
 				Stats.Evictions.Add(1)
+				Stats.EvictDial.Add(1)
 			}
 			if pinKey != "" {
 				d.pins.Del(pinKey) // remap next request to a fresh pick
 			}
 			continue
 		}
+		Stats.DialOK.Add(1)
 		st.setConnOK()
 		if pinKey != "" {
 			d.pins.Set(pinKey, p)
@@ -398,13 +400,22 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 	replay := bytes.NewBuffer(nil)
 	sent200 := false
 
-	markFailed := func(p *Proxy) {
+	// markFailed charges a tunnel attempt to the proxy. dialFailed says the
+	// upstream never accepted the tunnel (the dial itself failed, so the
+	// eviction reason is "unreachable"); otherwise the upstream answered and
+	// then blackholed the stream ("lies"), which is a different repair.
+	markFailed := func(p *Proxy, dialFailed bool) {
 		Stats.ServeFailures.Add(1) // blackhole/dial-dead tunnels are the class
 		// this counter documents; without it the probe supervision fired with
 		// evictions but no failures in the metrics.
 		if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 			d.bucket.Remove(p)
 			Stats.Evictions.Add(1)
+			if dialFailed {
+				Stats.EvictDial.Add(1)
+			} else {
+				Stats.EvictServe.Add(1)
+			}
 		}
 		if pinKey != "" {
 			d.pins.Del(pinKey) // remap the rest of the session to a fresh pick
@@ -424,11 +435,12 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 		Stats.DialAttempts.Add(1)
 		conn, err := dialProxy(p, d.dialTimeout, total, network, addr)
 		if err != nil {
-			Stats.DialFailures.Add(1)
+			countDialFailure(err)
 			log.Printf("serve: CONNECT %s via %s dial failed: %v", addr, p.URL(), err)
-			markFailed(p)
+			markFailed(p, true)
 			continue
 		}
+		Stats.DialOK.Add(1)
 		_ = conn.SetDeadline(time.Time{})
 		if !sent200 {
 			if _, werr := client.Write([]byte(connectOKLine)); werr != nil {
@@ -436,11 +448,12 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 				return werr
 			}
 			sent200 = true
+			Stats.TunnelsEstablished.Add(1)
 		}
 
 		if d.connectProbe > 0 {
 			if d.serveConnectStream(client, conn, p, start, replay) {
-				markFailed(p) // blackholed / died early: charge and evict
+				markFailed(p, false) // blackholed / died early: charge and evict
 				continue
 			}
 			if pinKey != "" {
@@ -603,6 +616,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 	case n > 0:
 		// Far target answered: the tunnel is alive. Write the first bytes
 		// through and keep the forwarder as the permanent client->tunnel leg.
+		Stats.FirstByteOK.Add(1)
 		_ = client.SetWriteDeadline(time.Now().Add(d.idleTimeout))
 		if _, werr := client.Write(first[:n]); werr != nil {
 			abort()
@@ -701,6 +715,7 @@ func (d *ForwardDialer) serveConnectStream(client, conn net.Conn, p *Proxy, star
 		if fails := p.MarkServeFail(); fails >= int64(d.serveMaxFails) {
 			d.bucket.Remove(p)
 			Stats.Evictions.Add(1)
+			Stats.EvictServe.Add(1)
 		}
 	case vol > 0:
 		Stats.ServedOK.Add(1)

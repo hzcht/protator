@@ -10,6 +10,56 @@ nobody can find.
 
 ### Added
 
+- **Two-strike revalidation (`storage.demote_after_fails`)** — a failed
+  revalidation used to remove the entry outright, so one throttled test server
+  or one bad minute on our uplink silently deleted healthy proxies. An entry is
+  now demoted only after N consecutive failures (default 2, `1` restores the old
+  behaviour); a cancelled pass is never a verdict at all. The retained failure is
+  visible as `reval_doubt_total` — doubt with a flat `reval_dropped_total` means
+  the checks are flaky, not the pool.
+- **Warm-tier restart covers aging entries and warns about capacity** — records
+  up to two `pick_fresh_window`s old are applied: inside the window they come
+  back proven, between one and two windows they come back stamped but unproven,
+  which puts them first in the stale-first revalidation pass instead of behind
+  the unstamped bulk. Startup also reports a warm tier larger than one window of
+  revalidation capacity (`revalidate_max_per_pass` × passes), which would decay
+  no matter how healthy it was at restart.
+- **Warm restart of the proven tier (`storage.proven_file`)** — `proxy.lst`
+  stores URLs only, so every restart used to come up with zero proven entries:
+  `/ready` reported an empty pool and requests went out through the unverified
+  bulk until revalidation churned its way back. A sidecar (`data/proven.idx`,
+  written with the same snapshot as the queue) now carries last-validation and
+  last-serve stamps, latency EMA, source and geo per entry, keyed by `Key()`.
+  Entries older than `pick_fresh_window` are skipped, so a stale file cannot
+  make the pool look healthy; an unreadable file is a slow start, never fatal.
+- **Serve funnel and dial failure classes** — the serving path now counts each
+  stage separately (`dial_ok_total`, `tunnels_established_total`,
+  `first_byte_ok_total`, `served_ok_total`), so a shrinking pool can be read as
+  "unreachable" versus "answers and serves nothing" without grepping logs.
+  Every failed dial also lands in exactly one class (`dial_fail_timeout_total`,
+  `dial_fail_refused_total`, `dial_fail_tls_total`, `dial_fail_reset_total`,
+  `dial_fail_other_total`), and `evictions_total` splits into
+  `evictions_dial_total` / `evictions_serve_total`.
+- **Sticky exit IP across a machine (`serve_pin_by`)** — pinning used to key
+  the client TCP connection, so a browser's parallel connections could leave
+  through different upstreams and there was no way to hold one exit IP for a
+  whole machine: inside a CONNECT tunnel the session header cannot be sent.
+  `serve_pin_by = "client"` keys the pin by the client host instead (source
+  port dropped); `"conn"` stays the default. An unknown value is reported in
+  the log and falls back to `"conn"` rather than silently changing behaviour.
+- **Session header alias and honest precedence** — `X-Proxy-Session` is
+  accepted next to `X-Sticky-Session`, both are now stripped together with
+  every other `X-Proxy-*` header (one that reached the target would name the
+  tool), and a named session now outranks the connection key. That last part
+  is a fix, not a feature: every front sets a connection key on every request,
+  so the header was read, stripped — and then never used. CONNECT requests
+  carry headers too, so a script that sends the session header on CONNECT gets
+  session stickiness for HTTPS as well.
+- **Pin metrics** — `pin_hits_total`, `pin_remaps_total`, `pin_evictions_total`,
+  `pin_expired_total` in `/api/metrics` and the Prometheus text output. Until
+  now the pin table was a black box: a client reporting a changing exit IP was
+  indistinguishable from a healthy pool.
+
 - **List distribution service (`[export]`)** — one more channel for handing
   out proxies, next to the serving fronts and the admin page: a read-only
   HTTP listener (`127.0.0.1:8899` in the shipped config) that answers

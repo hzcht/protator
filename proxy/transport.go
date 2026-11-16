@@ -198,6 +198,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 							if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
 								t.fwd.bucket.Remove(p)
 								Stats.Evictions.Add(1)
+								Stats.EvictServe.Add(1)
 							}
 							dropPin()
 						}
@@ -247,6 +248,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
 						t.fwd.bucket.Remove(p)
 						Stats.Evictions.Add(1)
+						Stats.EvictServe.Add(1)
 					}
 				}
 				if attempt < t.retries && ctx.Err() == nil {
@@ -280,6 +282,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				if fails := p.MarkServeFail(); fails >= int64(t.fwd.serveMaxFails) {
 					t.fwd.bucket.Remove(p)
 					Stats.Evictions.Add(1)
+					Stats.EvictServe.Add(1)
 				}
 				dropPin()
 			}

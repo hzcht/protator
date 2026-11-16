@@ -21,6 +21,9 @@ type Socks5Server struct {
 	idleTO     time.Duration
 	totalTO    time.Duration
 	listenAddr string
+	// pinBy mirrors server.serve_pin_by so this front derives the same
+	// stickiness key as the HTTP ones.
+	pinBy ServerConfig
 
 	mu sync.Mutex
 	ln net.Listener
@@ -37,6 +40,7 @@ func NewSocks5Server(cfg *Config, dialer *ForwardDialer) *Socks5Server {
 		// SOCKS5 handshake has no equivalent, so one slow upstream per retry
 		// could hold a client for dial_timeout × serve_retries with no cap.
 		totalTO: cfg.Server.ServeTotalTimeout.Duration,
+		pinBy:   cfg.Server,
 	}
 }
 
@@ -172,7 +176,7 @@ func (s *Socks5Server) handle(conn net.Conn) {
 	// One client TCP connection = one upstream, same contract as the HTTP
 	// front's ConnKey pin: without it every SOCKS session picked afresh and
 	// the config's stickiness promise did not cover this front.
-	if key := conn.RemoteAddr().String(); key != "" {
+	if key := s.pinBy.PinKey(conn.RemoteAddr().String()); key != "" {
 		ctx = WithConnKey(ctx, key)
 	}
 	// Bound the whole handshake by the same total the HTTP front enforces:
@@ -243,6 +247,7 @@ func (s *Socks5Server) settle(p *Proxy, toUp, toDown int64) {
 		if fails := p.MarkServeFail(); fails >= int64(s.dialer.serveMaxFails) {
 			s.dialer.bucket.Remove(p)
 			Stats.Evictions.Add(1)
+			Stats.EvictServe.Add(1)
 		}
 	}
 }

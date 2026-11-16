@@ -157,11 +157,19 @@ func saveQueue(cfg *proxy.Config, bucket *proxy.Bucket) bool {
 	// the next tick. Clearing after the write used to drop them silently
 	// until the next unrelated mutation.
 	bucket.MarkClean()
-	if err := proxy.SaveBucketAtomic(cfg.Storage.QueueFile, bucket.Snapshot(), cfg.Storage.MaxBytes); err != nil {
+	snap := bucket.Snapshot()
+	if err := proxy.SaveBucketAtomic(cfg.Storage.QueueFile, snap, cfg.Storage.MaxBytes); err != nil {
 		log.Printf("save: %v", err)
 		proxy.Stats.SaveFailures.Add(1)
 		bucket.MarkDirty() // retry next tick; do not pretend the file is current
 		return false
+	}
+	// Same snapshot: the index must describe the queue file exactly as it was
+	// just written, not a later state. A failure here costs a cold start, so
+	// it is logged and counted but never re-dirties the queue.
+	if err := proxy.SaveProvenIndex(cfg.Storage.ProvenFile, snap, time.Now(), cfg.Server.PickFreshWindow.Duration); err != nil {
+		log.Printf("save: proven index: %v", err)
+		proxy.Stats.ProvenWriteFailures.Add(1)
 	}
 	return true
 }

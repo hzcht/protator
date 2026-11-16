@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -190,14 +191,13 @@ func buildGoproxy(cfg *proxy.Config, fwd *proxy.ForwardDialer, noise *log.Logger
 		}
 		ctx.RoundTripper = rt
 		kctx := r.Context()
-		key := r.RemoteAddr
-		if key != "" {
+		if key := cfg.Server.PinKey(r.RemoteAddr); key != "" {
 			kctx = proxy.WithConnKey(kctx, key)
 		}
-		if sess := r.Header.Get("X-Sticky-Session"); sess != "" {
-			r.Header.Del("X-Sticky-Session")
+		if sess := stickySession(r.Header); sess != "" {
 			kctx = proxy.WithSessionKey(kctx, "s="+sess)
 		}
+		stripControlHeaders(r.Header)
 		return r.WithContext(kctx), nil
 	})
 
@@ -218,12 +218,59 @@ func buildGoproxy(cfg *proxy.Config, fwd *proxy.ForwardDialer, noise *log.Logger
 		// connection got a different exit IP and PinPool stayed empty for
 		// HTTPS traffic.
 		ctx := req.Context()
-		if key := req.RemoteAddr; key != "" {
+		if key := cfg.Server.PinKey(req.RemoteAddr); key != "" {
 			ctx = proxy.WithConnKey(ctx, key)
 		}
+		// A CONNECT request does carry headers (Proxy-Authorization always),
+		// so a client that bothers to send the session header gets true
+		// session stickiness for HTTPS too. Browsers cannot: the header would
+		// have to travel inside the tunnel. For them serve_pin_by = "client"
+		// is the only way to hold one exit IP.
+		if sess := stickySession(req.Header); sess != "" {
+			ctx = proxy.WithSessionKey(ctx, "s="+sess)
+		}
+		stripControlHeaders(req.Header)
 		_ = fwd.ServeConnect(ctx, client, "tcp", host)
 	})
 	return gop
+}
+
+// stickyHeaderNames are the accepted spellings of the session header, in
+// priority order. The X-Proxy-* spelling reads as the family the other control
+// headers use; the older one stays supported because the docs and the admin
+// page taught it.
+var stickyHeaderNames = []string{"X-Sticky-Session", "X-Proxy-Session"}
+
+// stickySessionIDMax bounds a client-supplied session id. The value becomes a
+// map key in PinPool, and an empty session id is indistinguishable from "no
+// header" — both would be wrong to accept.
+const stickySessionIDMax = 64
+
+// stickySession returns the session id from whichever spelling the client
+// used, truncated to a sane length.
+func stickySession(h http.Header) string {
+	for _, name := range stickyHeaderNames {
+		v := h.Get(name)
+		if v == "" {
+			continue
+		}
+		if len(v) > stickySessionIDMax {
+			v = v[:stickySessionIDMax]
+		}
+		return v
+	}
+	return ""
+}
+
+// stripControlHeaders removes every X-Proxy-* header from an incoming request.
+// They are addressed to this proxy; one that reaches the target would name the
+// tool and the session it belongs to in the target's own logs.
+func stripControlHeaders(h http.Header) {
+	for k := range h {
+		if len(k) > len("X-Proxy-") && strings.EqualFold(k[:len("X-Proxy-")], "X-Proxy-") {
+			h.Del(k)
+		}
+	}
 }
 
 // ctxRoundTripper adapts the http.RoundTripper contract to goproxy's

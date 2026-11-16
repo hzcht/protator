@@ -258,6 +258,8 @@ max_candidates_per_site = 1000
 | Dedup or probe by host:port alone | Same socket over http and socks5, or with different `user:pass@`, is a different proxy | Bucket dedup is by full URL incl. credentials — key on `Key()`, never host:port |
 | Poll a waiting loop with `time.After` | A fresh timer is allocated per iteration on hot paths | Reuse one caller-owned `time.Timer` (`waitQueue`, `proxy/bucket.go`) |
 | Feed credentialed tokens to the anonymous passes | Wasted check: an anonymous probe of an auth socket is 407/dead | The extractor blanks credentialed tokens first; contract in `docs/REGEX.md` |
+| Let the connection key outrank the session key | `X-Sticky-Session` is read, then silently ignored: every front sets a connection key on every request, so the header never reaches `PinPool` | `pinKeyFrom` prefers the session; a named session is the only key that survives connection churn |
+| Forward a client `X-Proxy-*` header | It names the tool (and the session id) in the target's own logs | `stripControlHeaders` removes the whole family before the request is forwarded, on both the plain and the CONNECT path |
 | Hardcode ports in tests | Flaky on CI | Use `net.Listen("tcp", "127.0.0.1:0")` |
 
 ## 9. Debugging
@@ -374,6 +376,7 @@ The UI lives in real files — `main/adminweb/{index.html,admin.css,admin.js}` �
 | Collector starves checker | `max_candidates_per_site` too high | Cap at 1000, enable `max_sites_per_cycle=60` |
 | Revalidation never finishes | `revalidate_max_per_pass` too low / queue too large | Increase to 30k-50k, enable `revalidate_fresh_servers` |
 | Hot tail empty | `pick_fresh_window` < `revalidate_interval` | Set `pick_fresh_window=20m`, `revalidate_interval=15m` |
+| Pool churns without cause | `reval_doubt_total` rising, `reval_dropped_total` flat | Checks are flaky, not the pool: raise `demote_after_fails` (2-3) or fix `self_ip_urls`; the startup `warnRevalCapacity` line names the sizing problem when it is capacity |
 
 ## 13. Release Checklist
 

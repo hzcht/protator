@@ -3,6 +3,8 @@ package proxy
 import (
 	"fmt"
 	"log"
+	"net"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -113,10 +115,20 @@ type ServerConfig struct {
 	ServeSniffTimeout Duration `toml:"serve_sniff_timeout"`
 	// Session stickiness. ConnKey pins the upstream proxy per client TCP
 	// connection (recommended); SessionKey (from the client-supplied
-	// "X-Sticky-Session" header, stripped before forwarding) pins across
-	// connections. A pinned proxy that fails is remapped to a fresh pick.
+	// "X-Sticky-Session" / "X-Proxy-Session" header, stripped before
+	// forwarding) pins across connections. A pinned proxy that fails is
+	// remapped to a fresh pick.
 	ServePinTTL Duration `toml:"serve_pin_ttl"`
 	ServePinMax int      `toml:"serve_pin_max"`
+	// What the connection key is: "conn" (default) keys each client TCP
+	// connection, so every connection pins independently; "client" drops the
+	// source port, so every connection from one machine shares one exit IP.
+	// A browser opens several proxy connections in parallel, and inside a
+	// CONNECT tunnel there is no header to carry a session id — "client" is
+	// the only way to give one machine a stable exit IP across them, at the
+	// cost of funnelling all of its traffic through one upstream (and
+	// capping that machine's parallelism at one proxy's capacity).
+	ServePinBy string `toml:"serve_pin_by"`
 	// Graceful shutdown: after SIGINT/SIGTERM, in-flight requests get up to
 	// this long to finish before the process exits.
 	ShutdownTimeout Duration `toml:"shutdown_timeout"`
@@ -235,8 +247,13 @@ type CollectorConfig struct {
 
 // StorageConfig controls queue persistence.
 type StorageConfig struct {
-	QueueFile          string   `toml:"queue_file"`
-	GoodFile           string   `toml:"good_file"`
+	QueueFile string `toml:"queue_file"`
+	GoodFile  string `toml:"good_file"`
+	// ProvenFile is the warm-tier sidecar: the queue file stores URLs only, so
+	// without it every restart forgets which entries had proof of life and
+	// /ready reports zero until revalidation churns the pool again
+	// (provenidx.go).
+	ProvenFile         string   `toml:"proven_file"`
 	SaveInterval       Duration `toml:"save_interval"`
 	RevalidateInterval Duration `toml:"revalidate_interval"`
 	RevalidateWorkers  int      `toml:"revalidate_workers"`
@@ -261,6 +278,14 @@ type StorageConfig struct {
 	// 65k at once — even rate-limited — keeps the checker busy with dead seeds
 	// for hours while fresh candidates wait.
 	RevalidateSeedMax int `toml:"revalidate_seed_max"`
+	// How many consecutive failed revalidations demote (remove) an entry
+	// (0 or 1 = drop on the first failure, the pre-I3 behaviour). A single
+	// failed pass is usually the wire, not the proxy: the test server
+	// throttled us, DNS blipped, our uplink hiccuped. Two strikes means the
+	// entry survived a full revalidate_interval between the failures, which
+	// is evidence. Costs one extra pass of checking per dying entry; buys a
+	// queue that does not churn on noise.
+	DemoteAfterFails int `toml:"demote_after_fails"`
 	// Path of the persisted candidate pool (found-but-not-yet-validated
 	// proxies that are re-probed on later cycles; see collector.pool_*).
 	CandidatesFile string `toml:"candidates_file"`
@@ -339,6 +364,32 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// Accepted values of server.serve_pin_by.
+const (
+	// PinByConn keys the upstream pin by the full client address. Each client
+	// TCP connection pins independently; a browser's parallel connections to
+	// the proxy can land on different exit IPs.
+	PinByConn = "conn"
+	// PinByClient keys it by the client host only, so every connection from
+	// one machine shares one exit IP.
+	PinByClient = "client"
+)
+
+// PinKey derives the stickiness key for a client network address. With
+// serve_pin_by = "client" the source port is dropped; otherwise the address is
+// used as-is. An address that does not parse is returned unchanged rather than
+// dropped: a pin on a malformed key is harmless, an empty key disables
+// stickiness for that connection.
+func (s ServerConfig) PinKey(remoteAddr string) string {
+	if remoteAddr == "" || s.ServePinBy != PinByClient {
+		return remoteAddr
+	}
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 // fillDefaults applies sane defaults for missing fields and validates values.
@@ -426,6 +477,18 @@ func (c *Config) fillDefaults() error {
 	}
 	if c.Server.ServePinMax <= 0 {
 		c.Server.ServePinMax = 100000
+	}
+	// A typo here would silently switch the deployment back to per-connection
+	// pinning, which is the one failure mode this knob exists to avoid, so an
+	// unknown value is reported instead of being accepted quietly.
+	switch c.Server.ServePinBy {
+	case "":
+		c.Server.ServePinBy = PinByConn
+	case PinByConn, PinByClient:
+	default:
+		log.Printf("config: unknown serve_pin_by %q (want %q or %q); using %q",
+			c.Server.ServePinBy, PinByConn, PinByClient, PinByConn)
+		c.Server.ServePinBy = PinByConn
 	}
 	if c.Server.ShutdownTimeout.Duration <= 0 {
 		c.Server.ShutdownTimeout = Duration{time.Second * 10}
@@ -539,12 +602,20 @@ func (c *Config) fillDefaults() error {
 	if c.Storage.RevalidateSeedMax < 0 {
 		c.Storage.RevalidateSeedMax = 5000
 	}
+	// Explicit 0/1 keeps the strict "drop on first failure" behaviour some
+	// operators want; only an unset key picks the two-strike default.
+	if c.Storage.DemoteAfterFails == 0 {
+		c.Storage.DemoteAfterFails = 2
+	}
 	if c.Collector.MaxCandidates <= 0 {
 		c.Collector.MaxCandidates = 200000
 	}
 
 	if c.Storage.QueueFile == "" {
 		c.Storage.QueueFile = "data/proxy.lst"
+	}
+	if c.Storage.ProvenFile == "" && c.Storage.QueueFile != "" {
+		c.Storage.ProvenFile = filepath.Join(filepath.Dir(c.Storage.QueueFile), "proven.idx")
 	}
 	if c.Storage.SaveInterval.Duration <= 0 {
 		c.Storage.SaveInterval = Duration{time.Minute}

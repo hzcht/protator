@@ -197,12 +197,40 @@ func revalidateOne(ctx context.Context, checker *Checker, bucket *Bucket, debug 
 		}
 	}()
 	if err := checker.Revalidate(p); err != nil {
+		// A cancelled pass is our own shutdown, not a verdict on the proxy.
+		// The feed loop stops on ctx.Done, but a check already in flight
+		// returns a transport error caused by that cancellation, and
+		// removing the entry for it threw away a healthy proxy at every
+		// reload.
+		if ctx.Err() != nil {
+			return nil
+		}
+		limit := demoteAfter(checker)
+		if streak := p.MarkCheckFail(); streak < limit {
+			Stats.RevalDoubt.Add(1)
+			log.Printf("revalidate: %s suspect (%d/%d): %v", p.URL(), streak, limit, err)
+			return nil
+		}
 		if bucket.Remove(p) {
 			Stats.RevalDropped.Add(1)
-			log.Printf("revalidate: dropped %s (%v)", p.URL(), err)
+			log.Printf("revalidate: dropped %s after %d failed checks (%v)", p.URL(), limit, err)
 		}
 		return nil
 	}
+	p.MarkCheckOK()
 	debug.Add(p.URL())
 	return nil
+}
+
+// demoteAfter is how many consecutive failed revalidations remove an entry.
+// A missing or non-positive setting means one strike — the pre-I3 behaviour,
+// which is what the in-test checkers (literal Config{}) get.
+func demoteAfter(c *Checker) int64 {
+	if c == nil || c.cfg == nil {
+		return 1
+	}
+	if n := int64(c.cfg.Storage.DemoteAfterFails); n > 1 {
+		return n
+	}
+	return 1
 }

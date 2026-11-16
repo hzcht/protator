@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -202,7 +204,7 @@ func socksDialTimeout(p *Proxy, timeout time.Duration, ctx context.Context, netw
 		return nil, ctx.Err()
 	case <-timer.C:
 		closeLateSocksDial(ch)
-		return nil, errors.New("socks dial timeout")
+		return nil, errSocksDialTimeout
 	}
 }
 
@@ -560,6 +562,72 @@ func dialTrojan(p *Proxy, timeout time.Duration, ctx context.Context, network, a
 		return nil, err
 	}
 	return conn, nil
+}
+
+// dialFailClass is the operator-facing cause of a failed dial.
+type dialFailClass int
+
+const (
+	dialFailOther dialFailClass = iota
+	dialFailTimeout
+	dialFailRefused
+	dialFailTLS
+	dialFailReset
+)
+
+// errSocksDialTimeout is the sentinel for the h12.io/socks path, which reports
+// its own deadline as a plain error rather than a net.Error.
+var errSocksDialTimeout = errors.New("socks dial timeout")
+
+// classifyDialErr buckets a dial error into the handful of causes an operator
+// can act on. The classes are ordered by how much they explain: a deadline is
+// a timeout even when the inner error looks like a reset, and "the peer is not
+// speaking TLS" is a property of the upstream, not of the target.
+func classifyDialErr(err error) dialFailClass {
+	if err == nil {
+		return dialFailOther
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return dialFailTimeout
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errSocksDialTimeout) {
+		return dialFailTimeout
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return dialFailRefused
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return dialFailReset
+	}
+	var recErr tls.RecordHeaderError
+	var unknownCA x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var certInvalid x509.CertificateInvalidError
+	if errors.As(err, &recErr) || errors.As(err, &unknownCA) ||
+		errors.As(err, &hostnameErr) || errors.As(err, &certInvalid) {
+		return dialFailTLS
+	}
+	return dialFailOther
+}
+
+// countDialFailure records one dial failure: the shared total plus exactly one
+// class counter, so the classes always add up to dial_failures_total.
+func countDialFailure(err error) {
+	Stats.DialFailures.Add(1)
+	switch classifyDialErr(err) {
+	case dialFailTimeout:
+		Stats.DialTimeout.Add(1)
+	case dialFailRefused:
+		Stats.DialRefused.Add(1)
+	case dialFailTLS:
+		Stats.DialTLS.Add(1)
+	case dialFailReset:
+		Stats.DialReset.Add(1)
+	default:
+		Stats.DialOther.Add(1)
+	}
 }
 
 // trojanHandshake writes the trojan request for target addr: the hex SHA224

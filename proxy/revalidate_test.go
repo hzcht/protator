@@ -204,3 +204,95 @@ func TestRevalidateManyNilDebug(t *testing.T) {
 		t.Errorf("dead entry survived: %d left", n)
 	}
 }
+
+// strikeChecker is revalidateChecker with an explicit demotion threshold.
+func strikeChecker(strikes int) *Checker {
+	c := revalidateChecker()
+	c.cfg.Storage.DemoteAfterFails = strikes
+	return c
+}
+
+// One failed pass is the wire, not the proxy: with demote_after_fails = 2 the
+// entry survives its first strike (and stays unstamped, so the stalest-first
+// sort retries it next pass) and is removed only on the second. The old
+// behaviour dropped it immediately, which is how a throttled test server
+// emptied the queue.
+func TestRevalidateDemotesOnlyAfterStrikes(t *testing.T) {
+	proxies := deadProxies(t, 1)
+	bucket := NewBucket(10)
+	bucket.Seed(proxies)
+	checker := strikeChecker(2)
+
+	doubtBefore := Stats.RevalDoubt.Load()
+	droppedBefore := Stats.RevalDropped.Load()
+
+	RevalidateMany(context.Background(), checker, bucket, bucket.Snapshot(), 1, 0, 0, nil)
+	if n := bucket.Len(); n != 1 {
+		t.Fatalf("entry dropped on the first strike: %d left, want 1", n)
+	}
+	if got := proxies[0].CheckFails(); got != 1 {
+		t.Errorf("strikes = %d, want 1", got)
+	}
+	if got := Stats.RevalDoubt.Load() - doubtBefore; got != 1 {
+		t.Errorf("reval_doubt delta = %d, want 1 (the retained failure must be visible)", got)
+	}
+
+	RevalidateMany(context.Background(), checker, bucket, bucket.Snapshot(), 1, 0, 0, nil)
+	if n := bucket.Len(); n != 0 {
+		t.Fatalf("second strike did not demote: %d left", n)
+	}
+	if got := Stats.RevalDropped.Load() - droppedBefore; got != 1 {
+		t.Errorf("reval_dropped delta = %d, want 1", got)
+	}
+}
+
+// A cancelled pass must not read as a verdict: the in-flight check fails
+// because we cancelled it, so the entry keeps its queue slot and its strikes.
+func TestRevalidateOneIgnoresCancelledCheck(t *testing.T) {
+	proxies := deadProxies(t, 1)
+	bucket := NewBucket(10)
+	bucket.Seed(proxies)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := revalidateOne(ctx, revalidateChecker(), bucket, nil, proxies[0]); err != nil {
+		t.Fatalf("revalidateOne: %v", err)
+	}
+	if n := bucket.Len(); n != 1 {
+		t.Fatalf("entry removed on a cancelled pass: %d left", n)
+	}
+	if got := proxies[0].CheckFails(); got != 0 {
+		t.Errorf("strikes = %d, want 0 after a cancelled check", got)
+	}
+}
+
+// demoteAfter is the config gate for the strike policy. Unset (the literal
+// Config{} every in-test checker gets) must mean one strike, i.e. the old
+// drop-on-first-failure behaviour, not "never demote".
+func TestDemoteAfter(t *testing.T) {
+	cases := []struct {
+		name  string
+		set   int
+		nilCk bool
+		want  int64
+	}{
+		{"unset means one strike", 0, false, 1},
+		{"explicit one", 1, false, 1},
+		{"negative", -3, false, 1},
+		{"three strikes", 3, false, 3},
+		{"nil checker", 0, true, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.nilCk {
+				if got := demoteAfter(nil); got != tc.want {
+					t.Fatalf("demoteAfter(nil) = %d, want %d", got, tc.want)
+				}
+				return
+			}
+			if got := demoteAfter(strikeChecker(tc.set)); got != tc.want {
+				t.Fatalf("demoteAfter(%d) = %d, want %d", tc.set, got, tc.want)
+			}
+		})
+	}
+}

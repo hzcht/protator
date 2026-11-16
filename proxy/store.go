@@ -200,6 +200,8 @@ func SaveSiteList(l *SiteList) error {
 const (
 	tmpPatternSites = ".sites-*.tmp"
 	tmpPatternQueue = ".queue-*.tmp"
+	// Proven index (provenidx.go): the warm-tier sidecar next to the queue.
+	tmpPatternProven = ".proven-*.tmp"
 )
 
 func writeFileAtomic(path string, data []byte) error {
@@ -255,7 +257,7 @@ func writeFileAtomicTo(path, pattern string, render func(w io.Writer) error) err
 // files. Safe at startup: no writer has run yet, so every matching file is an
 // orphan by definition.
 func SweepOrphanTMP(dirs ...string) {
-	patterns := []string{tmpPatternSites, tmpPatternQueue, "debug_proxies.txt.tmp*"}
+	patterns := []string{tmpPatternSites, tmpPatternQueue, tmpPatternProven, "debug_proxies.txt.tmp*"}
 	seen := make(map[string]struct{}, len(dirs))
 	for _, dir := range dirs {
 		if dir == "" || dir == "." {

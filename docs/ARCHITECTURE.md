@@ -119,6 +119,36 @@ revalidation passes the freshly-validated set is all the picker has to aim at;
 a shorter window empties it, and every client request quietly falls back to the
 unverified bulk. `fillDefaults` warns when the two conflict.
 
+### 2.2 The serve funnel (read this before trusting a pool number)
+
+A single failure counter cannot tell "the upstream is unreachable" from "the
+upstream accepts tunnels and then lies", and those two have different fixes.
+Every stage is counted on its own:
+
+| stage | counter | a drop here means |
+| --- | --- | --- |
+| dial accepted | `dial_ok_total` | see the classes below |
+| CONNECT established | `tunnels_established_total` | the upstream accepted the tunnel and then died |
+| first byte from target | `first_byte_ok_total` | the upstream blackholed the tunnel (looks alive, serves nothing) |
+| answered the client | `served_ok_total` | the target answered; junk answers land in `serve_failures_total` / `block_pages_total` |
+
+Each failed dial increments `dial_failures_total` and exactly one class:
+`dial_fail_timeout_total`, `dial_fail_refused_total`, `dial_fail_tls_total`,
+`dial_fail_reset_total`, `dial_fail_other_total`. Classes always add up to the
+total, so a funnel read never has a missing bucket.
+
+`evictions_total` splits by cause the same way: `evictions_dial_total` (the
+upstream was unreachable) versus `evictions_serve_total` (it answered and was
+useless). The third source of pool shrinkage is not a serving event at all —
+it is `reval_dropped_total`.
+
+Between those two — failed but not yet removed — sits `reval_doubt_total`:
+revalidations that failed and were absorbed as a strike instead of a verdict
+(`storage.demote_after_fails`, default 2). A high doubt count with a flat drop
+count means the checks are flaky (throttled test server, bad uplink), not that
+the pool is dead; the entry keeps its slot, loses its freshness, and is retried
+by the next pass because it is now the stalest thing in the queue.
+
 ## 3. Validation of one candidate
 
 ```mermaid
@@ -170,14 +200,14 @@ For `schema="vless"` the checker:
 | Bucket | `proxy/bucket.go` + `proxy/pick.go` + `proxy/bucket_live.go` | Concurrency-safe live queue (dedup by full URL, `Random`, `Subscribe` change notifications — a subscriber list: the forward dialer and the admin WebSocket both register, neither replaces the other), curated `hot` tail plus the cached proven pool (`freshPool`), per-source counts, `PickHealthy`/`Random`. The serving-path policy (proof tiers, `rankPick`, `betterPick`) is `pick.go`; the admin rendering surface (`LiveList`/`LiveListPage`, hot/served/checked/all) is `bucket_live.go`. |
 | ForwardDialer | `proxy/upstream.go` | `DialContext` with failover + passive feedback; `loop` set dials known-proxy addresses directly (anti self-loop); `NewTransport` (no keep-alives). |
 | ProxyTransport | `proxy/transport.go` | Request-level failover for plain HTTP (retries with a fresh transport, body rewound for retries), interstitial + block-page detection with a bounded `serve_sniff_timeout` sniff, device-junk/network-error classification. |
-| Sticky sessions | `proxy/sticky.go` | `PinPool`: pins a proxy to a connection/session key (`serve_pin_ttl`, optional `X-Sticky-Session` header), LRU eviction + reverse index; a pinned proxy's death rotates to a fresh one. |
+| Sticky sessions | `proxy/sticky.go` | `PinPool`: pins a proxy to a stickiness key (`serve_pin_ttl`, LRU eviction + reverse index). The key is the client-supplied session header (`X-Sticky-Session`, alias `X-Proxy-Session`, both stripped before forwarding — a session outranks the connection, otherwise the header could never reach the table) or the connection identity shaped by `serve_pin_by`: `conn` (each client TCP connection) or `client` (client host only, so a browser's parallel connections share one exit IP — the only option for HTTPS, where the header would have to travel inside the tunnel). A pinned proxy's death remaps to a fresh pick; `pin_hits_total`/`pin_remaps_total`/`pin_evictions_total`/`pin_expired_total` make that visible. |
 | Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT with Basic `Proxy-Authorization` when the URL carries userinfo; optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections; userinfo on the socks5 URL becomes RFC 1929 auth), `dialVLESS` (uTLS + REALITY + VLESS handshake; `security=none` runs it on raw TCP), `dialTrojan` (TLS-or-plaintext + SHA224 password handshake, password from the share-link userinfo). |
 | Checker | `proxy/checker.go` + `proxy/checker_probe.go` | Section 3: decisions (`Check`, `Revalidate`, `fullCheck`, bogon/self-IP rules). The evidence probes against the outside world — exit IP, content/leak verdicts, the end-to-end serving probe, the per-proxy transport, GeoIP (MaxMind MMDB) — are `checker_probe.go`. |
 | Collector | `proxy/collector.go` + `proxy/collect_fetch.go` | Section 1 left side. Cycle/scheduling: cookie jar, browser-grade headers, per-site cooldown, priority-ordered site walk with `max_sites_per_cycle` / `max_candidates_per_site` caps, blocking `emit`. One fetch: 429/503 + `Retry-After`, binary content-type guard, captcha/block-page classification, per-proxy transport cache, JS-protection hints in logs. |
 | Site telemetry | `proxy/sitestats.go` | `SiteRegistry`: per-source emitted/found/alive/fails, cooldown, deterministic rotation of untried sources, bounded to 200k tracked URLs. |
 | Extractor | `proxy/extract.go` (+ `extract_gate.go`, `extract_anchor.go`, `extract_share.go`, `extract_spys.go`, `extract_base64.go`, `jswrite.go`) | Universal `scheme://ip:port`, bare `ip:port`, `[ipv6]:port`, credentialed forms, spys XOR decoder, `document.write` JS reconstruction (`proxy/jswrite.go`), then `regexp.txt` patterns (2 groups either order, or 1 group + `portBefore`). Gates that may skip passes and the anchored fast path (probes at per-body quad offsets) are documented in `extract_gate.go`/`extract_anchor.go`; share links, spys and the base64 pass each have their own file. |
 | Proxy model | `proxy/model.go` + `proxy/model_proto.go` | `Proxy` + lock-free (`sync/atomic`) health stats: `consecFails`, `okTotal`/`failTotal`, latency EMA, `lastCheck`/`lastOK`, `source`. `Candidate`, `ParseProxyLine` (userinfo on `http`/`https`/`socks5` kept raw percent-encoded as `ProxyMeta.proxyAuth`). `model_proto.go` holds the cold `ProxyMeta` and its GeoIP/VLESS/trojan/auth accessors plus the share-link query builders. |
-| Storage | `proxy/store.go` | `LoadSites` (BOM strip, normalize, dedup), `SiteList` (`LoadSiteList`/`Add`/`Remove`/`Render`/`SaveSiteList` with `.bak` for the admin editor), `ReadQueue`, `LoadRegexLines`, `AppendGood`, and the one atomic writer `writeFileAtomicTo` (temp + fsync + rename, pattern swept by `SweepOrphanTMP`) that `SaveBucketAtomic`, the sites/pool saves and the debug-proxies file all go through. |
+| Storage | `proxy/store.go` + `proxy/provenidx.go` | `LoadSites` (BOM strip, normalize, dedup), `SiteList` (`LoadSiteList`/`Add`/`Remove`/`Render`/`SaveSiteList` with `.bak` for the admin editor), `ReadQueue`, `LoadRegexLines`, `AppendGood`, and the one atomic writer `writeFileAtomicTo` (temp + fsync + rename, pattern swept by `SweepOrphanTMP`) that `SaveBucketAtomic`, the sites/pool saves and the debug-proxies file all go through. `provenidx.go` saves and restores the warm tier (`storage.proven_file`): the queue stores URLs only, so proof of life, latency EMA, source and geo would otherwise die with the process. |
 | Candidate Pool | `proxy/pool.go` | Persisted failed candidates with source attribution (`addr\t<source-url>`). Rotating re-probe (`Batch`), `Good()` marks validated entries. Caps at `max_candidates`: the oldest line is evicted to make room (never a newly discovered one), the file is trimmed to the tail on load and periodically compacted so it cannot outgrow the cap. |
 | SOCKS5 front | `proxy/socks5_server.go` | Minimal RFC 1928 server, tunnels each session via `ForwardDialer`, idle-deadline relay. Volume-aware verdict (`relayCount`). |
 | TLS | `proxy/tlsutil.go` | Load cert/key from disk or generate ephemeral self-signed. |
@@ -193,11 +223,22 @@ For `schema="vless"` the checker:
 sites.txt → candidates (10-min seenRecently dedup, each tagged with its
           source URL) → validated → bucket (+ good_proxies.last audit)
           → proxy.lst (atomic rewrite each minute, only when the queue changed)
-          → on restart: ReadQueue → Seed → priority
-            revalidation of the old queue while the first collection cycle runs.
+          → proven.idx (same snapshot: which entries carried proof of life)
+          → on restart: ReadQueue → Seed → ApplyProvenIndex (warm tier back in
+            seconds, /ready honest immediately) → priority revalidation of the
+            old queue while the first collection cycle runs.
+
+ApplyProvenIndex applies records up to two freshness windows old. Entries
+inside the window come back proven; the ones between one and two windows come
+back stamped but unproven — they cannot make `/ready` lie, but they sort first
+in the stale-first revalidation pass, so the restart re-checks them before the
+unstamped bulk. A warm tier bigger than one freshness window of revalidation
+capacity decays by arithmetic; `warnRevalCapacity` says so at startup instead
+of letting it look like upstream rot.
 
 Dead proxies leave the queue through three paths:
-  - failed revalidation (stale-first, every 15 min)
+  - failed revalidation (stale-first, every 15 min; demoted only after
+    `demote_after_fails` consecutive failures, never on a cancelled pass)
   - serving-path failure streak (serve_max_fails)
   - capacity eviction (max_proxies, oldest-ish first, reported to subscribers)
 
@@ -372,6 +413,8 @@ deliberately tuned for production and is **not** a verbatim copy of
 | `serve_response_probe` | 3s | HTTP first-byte deadline |
 | `serve_sniff_timeout` | 3s | Budget for block-page body sniffing on small 200s |
 | `serve_require_proven` | false | Fail-closed serving: pick only proven tiers, `ErrNoProven` otherwise |
+| `serve_pin_by` | `conn` | Stickiness key: `conn` = client TCP connection, `client` = client host (one exit IP per machine across parallel browser connections) |
+| `serve_pin_ttl` / `serve_pin_max` | `10m` / 100000 | Pin idle TTL and table cap |
 | `admin_listen` | `127.0.0.1:9090` | Admin UI (empty = disabled) |
 
 ### `[checker]`
@@ -406,11 +449,13 @@ deliberately tuned for production and is **not** a verbatim copy of
 |-----|---------|-------------|
 | `queue_file` | `proxy.lst` | Live queue persistence |
 | `good_file` | `good_proxies.last` | Append-only audit of all accepted proxies |
+| `proven_file` | `data/proven.idx` | Warm-tier sidecar: per-entry proof of life, latency, source and geo, so a restart keeps `/ready` honest instead of reloading a queue where nothing is proven (see §5) |
 | `candidates_file` | `candidates.lst` | Failed candidates pool |
 | `save_interval` | 1m | Queue save interval |
 | `revalidate_interval` | 15m | Full revalidation interval |
 | `revalidate_fresh_servers` | 15m | Skip recently-served in revalidation |
 | `revalidate_max_per_pass` | 30000 | Budget per revalidation pass |
+| `demote_after_fails` | 2 | Consecutive failed revalidations before an entry is removed (1 = drop on the first failure). A single failed pass is usually the wire; a cancelled pass is never a verdict |
 | `revalidate_seed_rate` | 200/s | Startup re-seed drain rate into the checker (`RevalidateSeeded`) |
 | `revalidate_seed_max` | 5000 | Cap on seeded proxies re-checked at startup |
 
@@ -428,6 +473,7 @@ deliberately tuned for production and is **not** a verbatim copy of
 |------|---------|
 | `data/proxy.lst` | Live queue (atomic rewrite every minute) |
 | `data/good_proxies.last` | Append-only audit of every accepted proxy |
+| `data/proven.idx` | Warm-tier sidecar (`storage.proven_file`): key, last validation/serve stamps, latency EMA, source, country, ASN. Written with the queue save, read once at startup; deleting it costs one cold start |
 | `data/candidates.lst` | Failed candidates pool (survives restart) |
 | `config/sites.txt` | Curated source list (admin-editable, auto-reload) |
 | `config/sites.txt.bak` | Previous version (admin edits) |

@@ -241,6 +241,22 @@ func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.Can
 			log.Printf("queue: +%d from audit %s (total %d)", extra, cfg.Storage.GoodFile, bucket.Len())
 		}
 	}
+	// Warm restart: the queue file carries URLs only, so without this the
+	// process starts with zero proven entries — /ready reports a dead pool and
+	// every request goes out through the unverified bulk until revalidation
+	// catches up. A failure here is a slow start, never a fatal error.
+	if idx, bad, err := proxy.LoadProvenIndex(cfg.Storage.ProvenFile); err != nil {
+		log.Printf("queue: proven index %s unreadable: %v", cfg.Storage.ProvenFile, err)
+	} else if len(idx) > 0 {
+		restored, aging, discarded := proxy.ApplyProvenIndex(bucket, idx, time.Now(), cfg.Server.PickFreshWindow.Duration)
+		log.Printf("queue: restored %d proofs of life from %s (%d aging -> re-checked first, %d too old, %d malformed lines)",
+			restored, cfg.Storage.ProvenFile, aging, discarded, bad)
+		// Capacity invariant: a warm tier larger than what one periodic pass
+		// can reach inside a freshness window decays no matter how healthy it
+		// was at restart, and the decay shows up as "the pool is dying" long
+		// after the configuration caused it. Say it at startup instead.
+		warnRevalCapacity(cfg, bucket)
+	}
 
 	checker, err := proxy.NewChecker(cfg)
 	if err != nil {
@@ -260,6 +276,30 @@ func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.Can
 
 	candidates := make(chan proxy.Candidate, cfg.Checker.ChannelSize)
 	return bucket, checker, pool, debug, candidates
+}
+
+// warnRevalCapacity reports a warm tier that one freshness window of
+// revalidation cannot reach. capacity = revalidate_max_per_pass × how many
+// passes fit into pick_fresh_window; below the warm count the proven share
+// decays every window, and the symptom (a slowly dying pool) looks like
+// upstream rot rather than a configuration that was never sized. A zero
+// revalidate_max_per_pass means "no cap" and cannot be short.
+func warnRevalCapacity(cfg *proxy.Config, bucket *proxy.Bucket) {
+	window := cfg.Server.PickFreshWindow.Duration
+	interval := cfg.Storage.RevalidateInterval.Duration
+	perPass := cfg.Storage.RevalidateMaxPerPass
+	if window <= 0 || interval <= 0 || perPass <= 0 || bucket == nil {
+		return
+	}
+	passes := int64(window / interval)
+	if passes < 1 {
+		passes = 1
+	}
+	capacity := int64(perPass) * passes
+	if warm := int64(bucket.ProvenCount()); warm > capacity {
+		log.Printf("queue: warm tier %d exceeds revalidation capacity %d per %s (%d passes x %d) — proven share will decay; raise revalidate_max_per_pass or shorten pick_fresh_window",
+			warm, capacity, window, passes, perPass)
+	}
 }
 
 // startCollector launches the scraper; it emits candidates into the

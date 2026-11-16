@@ -20,6 +20,7 @@ type Proxy struct {
 	Port   int    `json:"port"`
 
 	consecFails int64 // consecutive serving-path dial failures
+	checkFails  int64 // consecutive failed revalidations (strikes, see demote_after_fails)
 	okTotal     int64 // lifetime successful dials/checks
 	failTotal   int64 // lifetime failed dials/checks
 	latencyEMA  int64 // exponential moving average of dial latency, ns
@@ -80,6 +81,22 @@ func (p *Proxy) MarkServeOK(latency time.Duration) {
 	atomic.AddInt64(&p.okTotal, 1)
 	atomic.StoreInt64(&p.lastOK, time.Now().UnixNano())
 	p.sampleLatency(latency)
+}
+
+// RestoreProof re-applies a persisted proof of life and its measurements
+// after a restart (see provenidx.go). It is called on the loading goroutine
+// before the proxy is published in the bucket, so the "write before publish"
+// rule that keeps Key() lock-free still holds; the stores are atomic anyway.
+func (p *Proxy) RestoreProof(lastCheck, lastOK, latencyEMA int64) {
+	if lastCheck > 0 {
+		atomic.StoreInt64(&p.lastCheck, lastCheck)
+	}
+	if lastOK > 0 {
+		atomic.StoreInt64(&p.lastOK, lastOK)
+	}
+	if latencyEMA > 0 {
+		atomic.StoreInt64(&p.latencyEMA, latencyEMA)
+	}
 }
 
 // MarkServeFail records a failed serving-path dial and returns the new
@@ -166,8 +183,24 @@ func (p *Proxy) lastCheckNanos() int64 { return atomic.LoadInt64(&p.lastCheck) }
 // own serving history rather than the throwaway re-validated object.
 func (p *Proxy) stampCheck(ns int64) {
 	atomic.StoreInt64(&p.consecFails, 0)
+	atomic.StoreInt64(&p.checkFails, 0)
 	atomic.StoreInt64(&p.lastCheck, ns)
 }
+
+// MarkCheckFail records one failed revalidation and returns the streak. The
+// revalidation loop demotes the entry only after demote_after_fails strikes:
+// a single failed pass is usually our side of the wire (a throttled test
+// server, a blip on the path to the proxy), and dropping on it churned the
+// queue. Serving-path failures keep their own streak (consecFails) and their
+// own, much shorter fuse (serve_max_fails) — a real request failing is much
+// stronger evidence than a check that never reached the target.
+func (p *Proxy) MarkCheckFail() int64 { return atomic.AddInt64(&p.checkFails, 1) }
+
+// MarkCheckOK clears the revalidation strike streak after a passing check.
+func (p *Proxy) MarkCheckOK() { atomic.StoreInt64(&p.checkFails, 0) }
+
+// CheckFails returns the current strike count (0 for a freshly validated entry).
+func (p *Proxy) CheckFails() int64 { return atomic.LoadInt64(&p.checkFails) }
 
 // Candidate is an unvalidated host:port discovered from a proxy-list page.
 // Schema may be empty, meaning the protocol is unknown and must be probed.

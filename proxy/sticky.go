@@ -30,19 +30,23 @@ func WithConnKey(ctx context.Context, key string) context.Context {
 }
 
 // WithSessionKey attaches a session identity to the context, pinning the
-// upstream for the client-supplied "X-Sticky-Session" header (stripped before
-// forwarding), which survives connection churn.
+// upstream for the client-supplied session header ("X-Sticky-Session" or its
+// "X-Proxy-Session" alias, both stripped before forwarding). The whole point
+// of a named session is to survive connection churn, so it outranks the
+// connection key: with the connection key winning, the header could never
+// reach the pin table at all — every front sets a connection key on every
+// request.
 func WithSessionKey(ctx context.Context, key string) context.Context {
 	return context.WithValue(ctx, keySession, key)
 }
 
-// pinKeyFrom extracts the stickiness key (connection or session) from the
-// context, connection identity taking precedence.
+// pinKeyFrom extracts the stickiness key (session or connection) from the
+// context, the named session taking precedence.
 func pinKeyFrom(ctx context.Context) string {
-	if k, _ := ctx.Value(keyConn).(string); k != "" {
+	if k, _ := ctx.Value(keySession).(string); k != "" {
 		return k
 	}
-	if k, _ := ctx.Value(keySession).(string); k != "" {
+	if k, _ := ctx.Value(keyConn).(string); k != "" {
 		return k
 	}
 	return ""
@@ -117,6 +121,7 @@ func (s *PinPool) Get(key string) *Proxy {
 		return nil
 	}
 	if now-e.Value.(*pinEntry).lastUsed > int64(s.ttl) {
+		Stats.PinExpired.Add(1)
 		s.removeLocked(key)
 		return nil
 	}
@@ -124,6 +129,7 @@ func (s *PinPool) Get(key string) *Proxy {
 	// A hit is the common case on the serving path, and sweeping here keeps
 	// the amortized counter honest for a Get/Del-heavy workload.
 	s.maybeSweepLocked(now)
+	Stats.PinHits.Add(1)
 	return e.Value.(*pinEntry).p
 }
 
@@ -154,14 +160,19 @@ func (s *PinPool) Set(key string, p *Proxy) {
 }
 
 // Del removes the pin for key (called when a pinned proxy fails, so the next
-// request remaps to a fresh pick).
+// request remaps to a fresh pick). The remap is counted only when a pin was
+// actually released: a Del on a key that was never pinned (every failed dial
+// on an unpinned request) is not a session losing its exit IP.
 func (s *PinPool) Del(key string) {
 	if key == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.removeLocked(key)
+	if _, ok := s.m[key]; ok {
+		Stats.PinRemaps.Add(1)
+		s.removeLocked(key)
+	}
 	s.maybeSweepLocked(time.Now().UnixNano())
 }
 
@@ -235,6 +246,7 @@ func (s *PinPool) removeLocked(key string) {
 // evictLRULocked drops the least recently used entry. Callers hold mu.
 func (s *PinPool) evictLRULocked() {
 	if e := s.lru.Back(); e != nil {
+		Stats.PinEvicts.Add(1)
 		s.removeLocked(e.Value.(*pinEntry).key)
 	}
 }
@@ -253,6 +265,7 @@ func (s *PinPool) maybeSweepLocked(now int64) {
 	for e := s.lru.Back(); e != nil; {
 		prev := e.Prev()
 		if e.Value.(*pinEntry).lastUsed < floor {
+			Stats.PinExpired.Add(1)
 			s.removeLocked(e.Value.(*pinEntry).key)
 		} else {
 			return // everything in front is more recent

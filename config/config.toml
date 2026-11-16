@@ -105,8 +105,15 @@ serve_block_max_bytes = 16384
 serve_sniff_timeout = "3s"
 # Session stickiness: connection pinning pins the upstream per client TCP
 # connection (no latency overhead); max entries caps the pin table. Clients can
-# additionally pin across connections by sending an "X-Sticky-Session" header
-# (stripped before forwarding). Pins expire after serve_pin_ttl of idleness.
+# additionally pin across connections by sending an "X-Sticky-Session" (or
+# "X-Proxy-Session") header (stripped before forwarding). Pins expire after
+# serve_pin_ttl of idleness.
+# serve_pin_by decides what "connection" means: "conn" keys each client TCP
+# connection; "client" keys the client host, so every connection from one
+# machine shares one exit IP — the only way to hold an exit IP across a
+# browser's parallel HTTPS connections, which cannot carry the header (at the
+# cost of funnelling that machine's traffic through a single upstream).
+serve_pin_by = "conn"
 serve_pin_ttl = "10m"
 serve_pin_max = 100000
 # Graceful shutdown: after SIGINT/SIGTERM, in-flight requests get up to this
@@ -245,6 +252,11 @@ max_sites_per_cycle = 60
 [storage]
 queue_file = "data/proxy.lst"
 good_file = "data/good_proxies.last"
+# Warm-tier sidecar. The queue file stores URLs only, so without this file a
+# restart starts with zero proven proxies: /ready reports an empty pool and
+# requests go out through unvalidated entries until revalidation catches up.
+# Safe to delete (costs one cold start); never fatal when unreadable.
+proven_file = "data/proven.idx"
 save_interval = "1m"
 revalidate_interval = "15m"
 revalidate_workers = 200
@@ -263,6 +275,13 @@ revalidate_fresh_servers = "15m"
 # can hold 50k+ entries; a per-pass budget (stalest first) always converges
 # instead of chasing a tail that grows faster than it shrinks.
 revalidate_max_per_pass = 30000
+# How many consecutive failed revalidations remove an entry (1 = the old
+# drop-on-first-failure). A single failed pass is usually the wire, not the
+# proxy: the test server throttled us or our uplink blipped. Two strikes come
+# a full revalidate_interval apart, which is evidence. Watch
+# reval_doubt_total in /api/metrics: a high ratio means the checks are
+# flaky, not that the pool is dead.
+demote_after_fails = 2
 # Keep the on-disk queue below this many bytes.
 max_bytes = 268435456
 # Found-but-not-yet-validated proxies survive restarts here and are re-probed

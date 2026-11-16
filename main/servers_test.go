@@ -15,6 +15,54 @@ import (
 	"protator/proxy"
 )
 
+// The two control-header helpers are the only place where a client-supplied
+// header is interpreted and removed: a mistake here either drops stickiness
+// (header read but never applied) or fingerprints the tool in the target's
+// logs (header forwarded).
+func TestStickySessionHeaderAliases(t *testing.T) {
+	cases := []struct {
+		name string
+		h    http.Header
+		want string
+	}{
+		{"legacy", http.Header{"X-Sticky-Session": {"cart-1"}}, "cart-1"},
+		{"new", http.Header{"X-Proxy-Session": {"cart-2"}}, "cart-2"},
+		{"legacy wins", http.Header{"X-Sticky-Session": {"a"}, "X-Proxy-Session": {"b"}}, "a"},
+		{"absent", http.Header{}, ""},
+	}
+	for _, c := range cases {
+		if got := stickySession(c.h); got != c.want {
+			t.Errorf("%s: stickySession = %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// A session id becomes a PinPool map key; an unbounded one is a memory
+	// write primitive handed to any client.
+	long := strings.Repeat("x", stickySessionIDMax*2)
+	if got := stickySession(http.Header{"X-Proxy-Session": {long}}); len(got) != stickySessionIDMax {
+		t.Fatalf("long session id = %d bytes, want %d", len(got), stickySessionIDMax)
+	}
+}
+
+func TestStripControlHeaders(t *testing.T) {
+	h := http.Header{
+		"X-Proxy-Session": {"cart-1"},
+		"X-Proxy-Country": {"DE"},
+		"x-proxy-lower":   {"1"},
+		"User-Agent":      {"curl/8"},
+		"Cookie":          {"a=b"},
+	}
+	stripControlHeaders(h)
+	for _, name := range []string{"X-Proxy-Session", "X-Proxy-Country", "x-proxy-lower"} {
+		if v := h.Get(name); v != "" {
+			t.Errorf("%s leaked through: %q", name, v)
+		}
+	}
+	if h.Get("User-Agent") == "" || h.Get("Cookie") == "" {
+		t.Fatalf("stripControlHeaders ate unrelated headers: %v", h)
+	}
+}
+
 // The ACL/waste chain must hold end to end through the real front: a request
 // to a waste host is short-circuited without ever dialing, and a CONNECT to a
 // blocked host is rejected without a tunnel. Unit tests cover the dial layer;
