@@ -136,7 +136,7 @@ func runOne(cand Candidate, checker *Checker, pool *CandidatePool, bucket *Bucke
 	// admin page reports them, and the attribution is frozen from here on.
 	p.SetSource(cand.Source)
 	if bucket.Add(p) {
-		AppendGood(cfg.Storage.GoodFile, p.URL())
+		AppendGood(cfg.Storage.GoodFile, p.URL(), cfg.Storage.GoodFileMaxLines)
 		if bucket.Len()%1000 == 0 {
 			log.Printf("checker: added %s queue=%d", p.URL(), bucket.Len())
 		}
@@ -151,6 +151,12 @@ func runOne(cand Candidate, checker *Checker, pool *CandidatePool, bucket *Bucke
 // fits and skips the tick otherwise). The seeds are mostly dead anyway — the
 // periodic revalidation pass churns them — so there is no reason to let them
 // starve everything else at startup.
+//
+// A seed that cannot enter the channel within one pacing interval is skipped,
+// not waited on: the collector's emit is deliberately blocking because fresh
+// candidates are the only way the pool grows, while a queue seed missed here
+// is picked up by the next periodic pass. Skips are counted in
+// reval_seed_skipped_total instead of being silent.
 func RevalidateSeeded(ctx context.Context, candidates chan<- Candidate, snap []*Proxy, rate, maxSeeds int) {
 	defer RecoverPanic("revalidate: seeds")
 	if rate <= 0 {
@@ -176,13 +182,27 @@ func RevalidateSeeded(ctx context.Context, candidates chan<- Candidate, snap []*
 	interval := time.Second / time.Duration(rate)
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	skipped := 0
 	for _, p := range snap {
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return
+		}
 		c := candidateFromProxy(p, p.Source())
 		select {
 		case candidates <- c:
 		case <-ctx.Done():
 			return
+		default:
+			// Channel full: a collector worker is likely blocking on
+			// emit right now. Dropping this seed frees the loop to
+			// try again next tick instead of holding the slot hostage.
+			skipped++
 		}
-		<-t.C
+	}
+	if skipped > 0 {
+		Stats.RevalSeedSkipped.Add(int64(skipped))
+		log.Printf("revalidate: %d startup seeds skipped (checker channel full)", skipped)
 	}
 }

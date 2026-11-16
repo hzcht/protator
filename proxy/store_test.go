@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -386,5 +387,68 @@ func TestSweepOrphanTMP(t *testing.T) {
 		if _, err := os.Stat(f); err != nil {
 			t.Errorf("sweep removed a file it must not touch: %s (%v)", filepath.Base(f), err)
 		}
+	}
+}
+
+// readLinesTail must return exactly the newest maxLines lines, in order, and
+// must not need the file to fit in memory to do it.
+func TestReadLinesTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	var b strings.Builder
+	for i := 1; i <= 10; i++ {
+		fmt.Fprintf(&b, "line-%d\n", i)
+	}
+	writeSites(t, path, b.String())
+
+	got, err := readLinesTail(path, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"line-8", "line-9", "line-10"}
+	if len(got) != len(want) {
+		t.Fatalf("tail = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tail = %v, want %v", got, want)
+		}
+	}
+	// Fewer lines than the cap must not pad or reorder.
+	all, err := readLinesTail(path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 10 || all[0] != "line-1" || all[9] != "line-10" {
+		t.Fatalf("short file tail = %v", all)
+	}
+}
+
+// The audit trail is append-only and grows with every validated proxy. At the
+// configured cap it must rewrite itself down to the newest half atomically,
+// so a 500k-line file from an older build cannot decide startup RSS.
+func TestAppendGoodRotatesAtCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "good_proxies.last")
+	for i := 1; i <= 4; i++ {
+		AppendGood(path, fmt.Sprintf("http://10.9.0.%d:80", i), 0)
+	}
+	CloseGoodWriters()
+
+	rotations := Stats.GoodRotations.Load()
+	AppendGood(path, "http://10.9.0.5:80", 4)
+	CloseGoodWriters()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("after rotation the file has %d lines, want the newest 2: %v", len(lines), lines)
+	}
+	if lines[0] != "http://10.9.0.4:80" || lines[1] != "http://10.9.0.5:80" {
+		t.Fatalf("rotation kept the wrong lines: %v", lines)
+	}
+	if got := Stats.GoodRotations.Load() - rotations; got != 1 {
+		t.Fatalf("good_rotations delta = %d, want 1", got)
 	}
 }

@@ -202,6 +202,9 @@ const (
 	tmpPatternQueue = ".queue-*.tmp"
 	// Proven index (provenidx.go): the warm-tier sidecar next to the queue.
 	tmpPatternProven = ".proven-*.tmp"
+	// Good-file rotation (goodWriter.rotateLocked): same atomic-replace rules
+	// as every other writer.
+	tmpPatternGood = ".good-*.tmp"
 )
 
 func writeFileAtomic(path string, data []byte) error {
@@ -257,7 +260,7 @@ func writeFileAtomicTo(path, pattern string, render func(w io.Writer) error) err
 // files. Safe at startup: no writer has run yet, so every matching file is an
 // orphan by definition.
 func SweepOrphanTMP(dirs ...string) {
-	patterns := []string{tmpPatternSites, tmpPatternQueue, tmpPatternProven, "debug_proxies.txt.tmp*"}
+	patterns := []string{tmpPatternSites, tmpPatternQueue, tmpPatternProven, tmpPatternGood, "debug_proxies.txt.tmp*"}
 	seen := make(map[string]struct{}, len(dirs))
 	for _, dir := range dirs {
 		if dir == "" || dir == "." {
@@ -328,7 +331,16 @@ func queueLoadIsFailed(path string) bool {
 }
 
 func readQueueCapped(path string, maxLines int) []*Proxy {
-	lines, err := readLines(path)
+	var lines []string
+	var err error
+	if maxLines > 0 {
+		// Bind the whole read, not just the slice afterwards: the audit file
+		// can hold half a million lines, and readLines materialized every one
+		// of them (strings included) only for the tail to be kept.
+		lines, err = readLinesTail(path, maxLines)
+	} else {
+		lines, err = readLines(path)
+	}
 	if err != nil {
 		// Used to vanish silently: an unreadable/missing proxy.lst looked
 		// exactly like an empty one, and an incident could not tell "cold
@@ -341,9 +353,6 @@ func readQueueCapped(path string, maxLines int) []*Proxy {
 		return nil
 	}
 	setQueueLoadFailed(path, false)
-	if maxLines > 0 && len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:] // audit files: tail is freshest
-	}
 	seen := make(map[string]struct{}, len(lines))
 	out := make([]*Proxy, 0, len(lines))
 	for _, l := range lines {
@@ -481,13 +490,25 @@ type goodWriter struct {
 	mu   sync.Mutex
 	w    *bufio.Writer
 	f    *os.File
+	// lines is the current line count, used to trigger rotation at maxLines,
+	// and counted once when the file is first opened. counted distinguishes
+	// "not counted yet" from a genuinely empty file.
+	lines    int64
+	maxLines int
+	counted  bool
 }
 
 // AppendGood appends one validated proxy URL to the audit file, flushing past
 // 4 KB so memory and crash loss stay bounded. Safe for concurrent use: the
 // per-path writer is cached and locked. A write or flush failure is logged and
 // counted, never returned — the audit file is a record, not a control path.
-func AppendGood(path, line string) {
+//
+// maxLines caps the file (<= 0 disables rotation). At the cap the file is
+// rewritten atomically to its newest half, so an append-only audit cannot
+// become an unbounded disk and startup-memory leak. Rotation happens under the
+// same per-path lock as the append: no reader ever sees a truncated file, and
+// the writer is never swapped while a buffer is dirty.
+func AppendGood(path, line string, maxLines int) {
 	if path == "" {
 		return
 	}
@@ -497,11 +518,22 @@ func AppendGood(path, line string) {
 	}
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
+	if maxLines > 0 {
+		gw.maxLines = maxLines
+	}
+	if gw.maxLines > 0 && !gw.counted {
+		gw.lines = countLines(gw.path)
+		gw.counted = true
+	}
+	if gw.w == nil || gw.f == nil {
+		return // a failed rotation left the writer unusable until restart
+	}
 	if _, err := gw.w.WriteString(line + "\n"); err != nil {
 		Stats.GoodWriteFailures.Add(1)
 		log.Printf("good: write %s: %v", path, err)
 		return
 	}
+	gw.lines++
 	// Flush past 4 KB to bound memory (and bound loss on a crash).
 	if gw.w.Buffered() > 4096 {
 		if err := gw.w.Flush(); err != nil {
@@ -509,6 +541,69 @@ func AppendGood(path, line string) {
 			log.Printf("good: flush %s: %v", path, err)
 		}
 	}
+	if gw.maxLines > 0 && gw.lines >= int64(gw.maxLines) {
+		gw.rotateLocked()
+	}
+}
+
+// rotateLocked rewrites the audit file down to its newest half. The half-full
+// hysteresis keeps rotation amortized O(1) per appended line instead of
+// rewriting the file on every write at the cap.
+func (gw *goodWriter) rotateLocked() {
+	keep := gw.maxLines / 2
+	if keep < 1 {
+		keep = 1
+	}
+	if err := gw.w.Flush(); err != nil {
+		Stats.GoodWriteFailures.Add(1)
+		log.Printf("good: flush before rotation %s: %v", gw.path, err)
+	}
+	if err := gw.f.Close(); err != nil {
+		Stats.GoodWriteFailures.Add(1)
+		log.Printf("good: close before rotation %s: %v", gw.path, err)
+	}
+	gw.f, gw.w = nil, nil
+	tail, err := readLinesTail(gw.path, keep)
+	if err != nil {
+		Stats.GoodWriteFailures.Add(1)
+		log.Printf("good: read tail for rotation %s: %v", gw.path, err)
+		gw.reopenLocked()
+		return
+	}
+	err = writeFileAtomicTo(gw.path, tmpPatternGood, func(w io.Writer) error {
+		bw := bufio.NewWriterSize(w, 64<<10)
+		for _, l := range tail {
+			if _, err := bw.WriteString(l + "\n"); err != nil {
+				return err
+			}
+		}
+		return bw.Flush()
+	})
+	if err != nil {
+		Stats.GoodWriteFailures.Add(1)
+		log.Printf("good: rotate %s: %v", gw.path, err)
+		gw.reopenLocked()
+		return
+	}
+	gw.lines = int64(len(tail))
+	gw.counted = true
+	Stats.GoodRotations.Add(1)
+	log.Printf("good: rotated %s to %d lines (cap %d)", gw.path, len(tail), gw.maxLines)
+	gw.reopenLocked()
+}
+
+// reopenLocked re-opens the append handle after rotation. A failure leaves the
+// writer disabled rather than panicking on a nil file handle; the audit trail
+// is already counted as failed and the process keeps serving.
+func (gw *goodWriter) reopenLocked() {
+	f, err := os.OpenFile(gw.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		Stats.GoodWriteFailures.Add(1)
+		log.Printf("good: reopen %s after rotation: %v (audit trail disabled until restart)", gw.path, err)
+		return
+	}
+	gw.f = f
+	gw.w = bufio.NewWriter(f)
 }
 
 // CloseGoodWriters flushes and closes every cached audit file, then forgets
@@ -518,13 +613,17 @@ func CloseGoodWriters() {
 	goodWriters.Range(func(k, v interface{}) bool {
 		gw := v.(*goodWriter)
 		gw.mu.Lock()
-		if err := gw.w.Flush(); err != nil {
-			Stats.GoodWriteFailures.Add(1)
-			log.Printf("good: final flush %s: %v", gw.path, err)
+		if gw.w != nil {
+			if err := gw.w.Flush(); err != nil {
+				Stats.GoodWriteFailures.Add(1)
+				log.Printf("good: final flush %s: %v", gw.path, err)
+			}
 		}
-		if err := gw.f.Close(); err != nil {
-			Stats.GoodWriteFailures.Add(1)
-			log.Printf("good: close %s: %v", gw.path, err)
+		if gw.f != nil {
+			if err := gw.f.Close(); err != nil {
+				Stats.GoodWriteFailures.Add(1)
+				log.Printf("good: close %s: %v", gw.path, err)
+			}
 		}
 		gw.mu.Unlock()
 		goodWriters.Delete(k)
@@ -559,6 +658,81 @@ func openGoodWriter(path string) *goodWriter {
 // the first entry of sites.txt comes out as "\ufeff# comment" — no longer a
 // comment, so the collector would try to fetch the BOM as part of a URL. The
 // rest are cheap insurance against a BOM that arrived by copy-paste.
+// cleanLine trims a CR and a leading UTF-8 BOM, and maps a blank line to "".
+// Every reader of sites/queue/audit files goes through it so the BOM handling
+// cannot drift between them.
+func cleanLine(s string) string {
+	l := strings.TrimPrefix(strings.TrimRight(s, "\r"), "\ufeff")
+	if strings.TrimSpace(l) == "" {
+		return ""
+	}
+	return l
+}
+
+// readLinesTail is readLines capped at the last maxLines non-empty lines. It
+// keeps a ring buffer the size of the cap instead of materializing the file:
+// the audit trail can hold half a million lines, and only its tail is worth
+// loading. maxLines <= 0 falls back to readLines.
+func readLinesTail(path string, maxLines int) ([]string, error) {
+	if maxLines <= 0 {
+		return readLines(path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	ring := make([]string, maxLines)
+	n, next := 0, 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		l := cleanLine(sc.Text())
+		if l == "" {
+			continue
+		}
+		ring[next] = l
+		next = (next + 1) % maxLines
+		if n < maxLines {
+			n++
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, n)
+	start := next - n
+	if start < 0 {
+		start += maxLines
+	}
+	for i := 0; i < n; i++ {
+		out = append(out, ring[(start+i)%maxLines])
+	}
+	return out, nil
+}
+
+// countLines counts non-empty lines without retaining them (the audit file is
+// the one input that can be large on disk but must not be large in memory).
+func countLines(path string) int64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	var n int64
+	for sc.Scan() {
+		if strings.TrimSpace(sc.Text()) != "" {
+			n++
+		}
+	}
+	if sc.Err() != nil {
+		return 0
+	}
+	return n
+}
+
 func readLines(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -573,8 +747,8 @@ func readLines(path string) ([]string, error) {
 	// memory spent for a line length that never occurs.
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	for sc.Scan() {
-		l := strings.TrimPrefix(strings.TrimRight(sc.Text(), "\r"), "\ufeff")
-		if strings.TrimSpace(l) == "" {
+		l := cleanLine(sc.Text())
+		if l == "" {
 			continue
 		}
 		lines = append(lines, l)

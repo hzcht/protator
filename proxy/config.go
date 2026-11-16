@@ -220,6 +220,12 @@ type CollectorConfig struct {
 	// after this many consecutive failures.
 	SiteCooldown Duration `toml:"site_cooldown"`
 	SiteMaxFails int      `toml:"site_max_fails"`
+	// SiteZeroYieldCycles is how many fetches a source must have attempted
+	// before the stats loop reports it when it has never emitted a single
+	// candidate (Total == 0) and is not in cooldown. Visibility only: scoring
+	// and ordering already deprioritise such sources, but without a periodic
+	// line they stay invisible until somebody opens /api/sources.
+	SiteZeroYieldCycles int `toml:"site_zero_yield_cycles"`
 	// Persisted-candidate re-probing: every PoolRetryInterval the pool
 	// re-emits up to PoolRetryBatch candidates (oldest first) for another
 	// validation pass. Dead-at-probe-time proxies often come up later.
@@ -249,6 +255,12 @@ type CollectorConfig struct {
 type StorageConfig struct {
 	QueueFile string `toml:"queue_file"`
 	GoodFile  string `toml:"good_file"`
+	// GoodFileMaxLines caps the append-only audit trail. It grows with every
+	// validated proxy and used to be unbounded (20 MB / 500k lines on the
+	// author's box, and the startup seed read every one of them). At the cap
+	// the file is rewritten atomically down to its newest half, so the audit
+	// stays useful without becoming a memory and disk leak.
+	GoodFileMaxLines int `toml:"good_file_max_lines"`
 	// ProvenFile is the warm-tier sidecar: the queue file stores URLs only, so
 	// without it every restart forgets which entries had proof of life and
 	// /ready reports zero until revalidation churns the pool again
@@ -584,6 +596,11 @@ func (c *Config) fillDefaults() error {
 	if c.Collector.SiteMaxFails <= 0 {
 		c.Collector.SiteMaxFails = 3
 	}
+	// 0 = the default, not "report immediately": a source needs a few cycles
+	// before zero yield means anything.
+	if c.Collector.SiteZeroYieldCycles <= 0 {
+		c.Collector.SiteZeroYieldCycles = 3
+	}
 	if c.Collector.PoolRetryBatch <= 0 {
 		c.Collector.PoolRetryBatch = 20000
 	}
@@ -616,6 +633,12 @@ func (c *Config) fillDefaults() error {
 	}
 	if c.Storage.ProvenFile == "" && c.Storage.QueueFile != "" {
 		c.Storage.ProvenFile = filepath.Join(filepath.Dir(c.Storage.QueueFile), "proven.idx")
+	}
+	// 0 = default, never "unbounded": an append-only audit file is exactly the
+	// kind of leak that looks harmless for months and then costs 640 MB at
+	// startup.
+	if c.Storage.GoodFileMaxLines <= 0 {
+		c.Storage.GoodFileMaxLines = 50000
 	}
 	if c.Storage.SaveInterval.Duration <= 0 {
 		c.Storage.SaveInterval = Duration{time.Minute}

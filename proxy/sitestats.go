@@ -219,6 +219,35 @@ func (r *SiteRegistry) Snapshot() []SiteStat {
 	return out
 }
 
+// ZeroYield reports sources that have been fetched at least minCycles times,
+// have never emitted a candidate (Total == 0), and are not in cooldown. It
+// returns the count and up to sampleLimit URLs (sorted, so a log line is
+// stable between minutes).
+//
+// This is a visibility probe, not a policy: scoreLocked already puts a
+// productive source ahead of these, Order already rotates the unproven, and
+// Failed already cools the ones that keep erroring. The missing piece was a
+// periodic line that names a source burning fetch slots with nothing to show.
+func (r *SiteRegistry) ZeroYield(minCycles, sampleLimit int) (count int, sample []string) {
+	if minCycles < 1 {
+		minCycles = 1
+	}
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.stats {
+		if s.untracked || s.Cycles < int64(minCycles) || s.Total != 0 || s.Cooling(now) {
+			continue
+		}
+		count++
+		if sampleLimit <= 0 || len(sample) < sampleLimit {
+			sample = append(sample, s.URL)
+		}
+	}
+	sort.Strings(sample)
+	return count, sample
+}
+
 // SetAlive replaces the per-source live counts (from the bucket) and recomputes
 // priorities.
 func (r *SiteRegistry) SetAlive(counts map[string]int) {

@@ -112,7 +112,7 @@ func main() {
 	// The list distribution channel: a third kind of listener, read-only and
 	// tokenless — see export.go.
 	startExportListServer(ctx, cfg, bucket, logNoise)
-	startBackgroundLoops(ctx, cfg, bucket, pool, checker, debug, candidates, wakeCollector, beats)
+	startBackgroundLoops(ctx, cfg, bucket, pool, collector, checker, debug, candidates, wakeCollector, beats)
 
 	<-ctx.Done()
 	stop()
@@ -237,7 +237,11 @@ func buildPipeline(cfg *proxy.Config) (*proxy.Bucket, *proxy.Checker, *proxy.Can
 	seedN := bucket.Seed(proxy.ReadQueue(cfg.Storage.QueueFile))
 	log.Printf("queue: loaded %d unique proxies from %s", seedN, cfg.Storage.QueueFile)
 	if cfg.Storage.GoodFile != "" {
-		if extra := bucket.Seed(proxy.ReadQueueLast(cfg.Storage.GoodFile, 500000)); extra > 0 {
+		// Audit trail: only the tail is seeded. The file is capped by
+		// good_file_max_lines, but a file from an older build can still hold
+		// half a million lines, and a bounded read means the number of lines
+		// on disk never decides the process's RSS.
+		if extra := bucket.Seed(proxy.ReadQueueLast(cfg.Storage.GoodFile, cfg.Storage.RevalidateSeedMax)); extra > 0 {
 			log.Printf("queue: +%d from audit %s (total %d)", extra, cfg.Storage.GoodFile, bucket.Len())
 		}
 	}

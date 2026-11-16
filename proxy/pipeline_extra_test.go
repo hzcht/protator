@@ -104,6 +104,36 @@ func TestRevalidateSeededIsRateLimited(t *testing.T) {
 	}
 }
 
+// A full channel must cost a seed, not the collector: the seed loop is
+// best-effort (the periodic pass re-checks the entry), while every fresh
+// candidate that waits behind it is collection that never happened.
+func TestRevalidateSeededSkipsWhenChannelFull(t *testing.T) {
+	snap := make([]*Proxy, 5)
+	for i := range snap {
+		snap[i] = &Proxy{Schema: "http", Host: "10.9.9.9", Port: 9000 + i}
+	}
+	cands := make(chan Candidate, 1)
+	cands <- Candidate{Host: "127.0.0.1", Port: 1} // occupy the only slot
+
+	before := Stats.RevalSeedSkipped.Load()
+	done := make(chan struct{})
+	go func() {
+		RevalidateSeeded(context.Background(), cands, snap, 1000, 0)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RevalidateSeeded blocked on a full channel instead of skipping seeds")
+	}
+	if got := Stats.RevalSeedSkipped.Load() - before; got != int64(len(snap)) {
+		t.Fatalf("skipped = %d, want %d", got, len(snap))
+	}
+	if len(cands) != 1 {
+		t.Fatalf("channel holds %d items, want the original sentinel only", len(cands))
+	}
+}
+
 // A rate of 0 must fall back to the default rather than dividing by zero.
 func TestRevalidateSeededDefaultRate(t *testing.T) {
 	snap := []*Proxy{{Schema: "http", Host: "10.2.2.2", Port: 80}}

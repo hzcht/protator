@@ -31,7 +31,7 @@ protator/
 │   └── sites_legacy.txt   # Pre-curation original (history only)
 ├── data/                    # Runtime data
 │   ├── proxy.lst           # Persisted live queue
-│   ├── good_proxies.last   # Append-only audit of accepted proxies
+│   ├── good_proxies.last   # Audit of accepted proxies (capped: good_file_max_lines)
 │   ├── candidates.lst     # Failed candidates pool
 │   ├── debug_proxies.txt   # Last N validated proxies
 │   └── logs/               # Rotating log files
@@ -377,6 +377,7 @@ The UI lives in real files — `main/adminweb/{index.html,admin.css,admin.js}` �
 | Revalidation never finishes | `revalidate_max_per_pass` too low / queue too large | Increase to 30k-50k, enable `revalidate_fresh_servers` |
 | Hot tail empty | `pick_fresh_window` < `revalidate_interval` | Set `pick_fresh_window=20m`, `revalidate_interval=15m` |
 | Pool churns without cause | `reval_doubt_total` rising, `reval_dropped_total` flat | Checks are flaky, not the pool: raise `demote_after_fails` (2-3) or fix `self_ip_urls`; the startup `warnRevalCapacity` line names the sizing problem when it is capacity |
+| Sources burn cycles silently | `collector_zero_yield_sources` > 0, stats log names them | Not a bug by itself: open `/api/sources`, then fix or remove the source. The line appears after `site_zero_yield_cycles` fetches and repeats at most every 10 min |
 
 ## 13. Release Checklist
 

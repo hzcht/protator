@@ -211,6 +211,12 @@ cycle_sleep = "25m"
 # after this many consecutive failures.
 site_cooldown = "30m"
 site_max_fails = 3
+# A source fetched at least this many times that has emitted zero candidates
+# (and is not cooling) is reported by the one-minute stats loop and counted in
+# collector_zero_yield_sources. Visibility only: scoring keeps such a source
+# behind productive ones already; this just makes it visible without opening
+# /api/sources.
+site_zero_yield_cycles = 3
 # Cap on the persisted candidate pool. The checker churns a few candidates per
 # second, so a pool much larger than this is dead weight: new candidates get
 # dropped once it is full. 200k is ~10x the checker's hourly throughput.
@@ -252,6 +258,11 @@ max_sites_per_cycle = 60
 [storage]
 queue_file = "data/proxy.lst"
 good_file = "data/good_proxies.last"
+# Cap on the append-only audit trail. It grows with every validated proxy, and
+# an old build's file can hold 500k lines — the whole file used to be loaded at
+# startup just to seed the queue. At this many lines it is rewritten atomically
+# to its newest half. 0 = default (never unbounded).
+good_file_max_lines = 50000
 # Warm-tier sidecar. The queue file stores URLs only, so without this file a
 # restart starts with zero proven proxies: /ready reports an empty pool and
 # requests go out through unvalidated entries until revalidation catches up.

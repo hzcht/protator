@@ -301,3 +301,44 @@ func itoa(n int) string {
 	}
 	return string(b)
 }
+
+// ZeroYield names the silent source and only the silent source: enough cycles
+// with nothing emitted, not cooling, and not productive. This is a visibility
+// probe — it must not influence ordering or cooldown, so the test only asks
+// what the registry reports.
+func TestSiteRegistryZeroYield(t *testing.T) {
+	r := NewSiteRegistry(3, time.Minute)
+	const (
+		silent     = "http://silent.example/list"
+		young      = "http://young.example/list"
+		productive = "http://productive.example/list"
+		cooling    = "http://dead.example/list"
+	)
+	for i := 0; i < 3; i++ {
+		r.Record(silent, true, 0, 0, "200")
+	}
+	r.Record(young, true, 0, 0, "200")
+	for i := 0; i < 3; i++ {
+		r.Record(productive, true, 10, 2, "200")
+	}
+	for i := 0; i < 3; i++ {
+		r.Record(cooling, false, 0, 0, "500")
+	}
+
+	n, sample := r.ZeroYield(3, 5)
+	if n != 1 {
+		t.Fatalf("zero-yield count = %d, want 1 (silent only): %v", n, sample)
+	}
+	if len(sample) != 1 || sample[0] != silent {
+		t.Fatalf("zero-yield sample = %v, want [%s]", sample, silent)
+	}
+
+	// The sample is capped, but the count still reports the whole set.
+	for i := 0; i < 3; i++ {
+		r.Record("http://silent2.example/list", true, 0, 0, "200")
+	}
+	n, sample = r.ZeroYield(3, 1)
+	if n != 2 || len(sample) != 1 {
+		t.Fatalf("capped sample: count=%d sample=%v, want count 2 and one URL", n, sample)
+	}
+}

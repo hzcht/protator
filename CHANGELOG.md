@@ -10,6 +10,32 @@ nobody can find.
 
 ### Added
 
+- **The audit trail is capped and its seed is bounded** — `good_proxies.last`
+  grew with every validated proxy (20 MB / 500k lines on the author's box) and
+  startup loaded all of it into memory just to keep the tail. It now rotates
+  itself at `storage.good_file_max_lines` (default 50000), atomically to its
+  newest half, and the startup seed reads only the newest
+  `revalidate_seed_max` lines through a ring buffer. Rotation count is exposed
+  as `good_rotations_total`; the bounded read makes even a pre-cap file
+  harmless to RSS.
+- **Silent zero-yield sources are visible** — a source that keeps fetching
+  successfully but emits no candidates never cools down and never scores, so
+  nothing used to mention it. The one-minute stats loop now counts sources with
+  at least `collector.site_zero_yield_cycles` fetches, zero lifetime output and
+  no cooldown (`collector_zero_yield_sources`, a gauge) and logs up to five
+  URLs at most every ten minutes. Fetch order and cooldown are deliberately
+  untouched.
+- **No seed dump can starve fresh collection** — startup queue seeds are still
+  paced by `revalidate_seed_rate`, but a seed that cannot enter the checker
+  channel within one pacing interval is now skipped instead of blocking. The
+  periodic pass re-checks it later; the collector's blocking `emit` keeps the
+  channel for new candidates, which are the only way the pool grows. Skips are
+  visible as `reval_seed_skipped_total`.
+- **Serving-only proof survives a restart** — `data/proven.idx` used to be
+  written only from validation stamps, so audit-seeded entries that went green
+  on real client traffic (no check stamp in this process) came back cold after
+  every restart. The sidecar now stores the newest of `lastCheck` and `lastOK`,
+  which is exactly what `freshnessRank` counts as proof.
 - **Two-strike revalidation (`storage.demote_after_fails`)** — a failed
   revalidation used to remove the entry outright, so one throttled test server
   or one bad minute on our uplink silently deleted healthy proxies. An entry is

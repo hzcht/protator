@@ -162,3 +162,46 @@ func TestLoadProvenIndexTolerant(t *testing.T) {
 		t.Fatalf("record = %+v, want geo preserved", rec)
 	}
 }
+
+// A proxy can be green from real serving traffic alone: audit-seeded entries
+// often carry lastOK and no check stamp in this process. freshnessRank counts
+// that as proof, so dropping it from the sidecar cost every restart the
+// strongest evidence in the pool.
+func TestSaveProvenIndexKeepsServingOnlyProof(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proven.idx")
+	now := time.Now()
+
+	served := mustProxy(t, "http://10.4.0.1:8080")
+	served.MarkServeOK(25 * time.Millisecond)
+	if served.lastCheckNanos() != 0 {
+		t.Fatal("test setup: serving-only proof has a check stamp")
+	}
+	never := mustProxy(t, "http://10.4.0.2:8080")
+	if err := SaveProvenIndex(path, []*Proxy{served, never}, now, 20*time.Minute); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	idx, bad, err := LoadProvenIndex(path)
+	if err != nil || bad != 0 {
+		t.Fatalf("load: idx=%d bad=%d err=%v", len(idx), bad, err)
+	}
+	if len(idx) != 1 {
+		t.Fatalf("indexed %d entries, want 1 (no stamp = no proof)", len(idx))
+	}
+
+	b := NewBucket(10)
+	restarted := mustProxy(t, "http://10.4.0.1:8080")
+	if !b.Add(restarted) {
+		t.Fatal("seed add failed")
+	}
+	restored, aging, discarded := ApplyProvenIndex(b, idx, now, 20*time.Minute)
+	if restored != 1 || aging != 0 || discarded != 0 {
+		t.Fatalf("restored=%d aging=%d discarded=%d, want 1/0/0", restored, aging, discarded)
+	}
+	if !b.IsProven(restarted) {
+		t.Fatal("serving-only proof was not restored as proof of life")
+	}
+	if restarted.lastOKNanos() == 0 {
+		t.Fatal("serving stamp was not restored")
+	}
+}

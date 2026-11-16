@@ -44,9 +44,11 @@ type provenRecord struct {
 	ASN       string
 }
 
-// SaveProvenIndex writes every entry whose last validation is younger than
-// maxAge. Older proofs cannot pass freshnessRank anyway, so they are left out
-// of the file instead of being carried around forever.
+// SaveProvenIndex writes every entry whose newest proof of life is younger than
+// maxAge. Proof means validation (lastCheck) or real serving traffic
+// (lastOK): freshnessRank treats both as proof, so the sidecar must not forget
+// one of them. Older proofs cannot pass freshnessRank anyway, so they are left
+// out of the file instead of being carried around forever.
 func SaveProvenIndex(path string, proxies []*Proxy, now time.Time, maxAge time.Duration) error {
 	if path == "" {
 		return nil
@@ -61,7 +63,15 @@ func SaveProvenIndex(path string, proxies []*Proxy, now time.Time, maxAge time.D
 			return err
 		}
 		for _, p := range proxies {
+			// Most audit-seeded entries are green from real traffic and
+			// carry no check stamp in this process. Saving only lastCheck
+			// dropped exactly the strongest proof from the sidecar. Store
+			// the newest stamp as the index's freshness field; both
+			// columns are restored by ApplyProvenIndex.
 			lc := p.lastCheckNanos()
+			if lo := p.lastOKNanos(); lo > lc {
+				lc = lo
+			}
 			if lc == 0 || nowNs-lc > int64(maxAge) {
 				continue
 			}

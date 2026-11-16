@@ -234,7 +234,16 @@ back stamped but unproven — they cannot make `/ready` lie, but they sort first
 in the stale-first revalidation pass, so the restart re-checks them before the
 unstamped bulk. A warm tier bigger than one freshness window of revalidation
 capacity decays by arithmetic; `warnRevalCapacity` says so at startup instead
-of letting it look like upstream rot.
+of letting it look like upstream rot. The sidecar stores the newest of
+`lastCheck` and `lastOK`: a proxy that went green purely from real serving
+traffic (common for the audit seed) counts as proof to the picker and must not
+be forgotten at restart just because nobody revalidated it in this process.
+
+Startup queue seeds share the candidate channel with fresh collection. They
+are paced by `revalidate_seed_rate` and, if the channel stays full for a whole
+pacing interval, skipped rather than waited on — `reval_seed_skipped_total`
+counts those skips. Losing a seed costs one later periodic pass; blocking the
+channel would stop the collector from finding new proxies at all.
 
 Dead proxies leave the queue through three paths:
   - failed revalidation (stale-first, every 15 min; demoted only after
@@ -246,10 +255,22 @@ Candidates that fail validation go to candidates.lst (with source attribution).
 Pool re-probe loop emits up to pool_retry_batch every pool_retry_interval,
 respecting channel backpressure (non-blocking emit, logs skips).
 
+The audit trail (`good_proxies.last`) is append-only by nature, so it is the
+one file whose growth is not bounded by a save rewrite. It rotates itself at
+`storage.good_file_max_lines`, atomically down to its newest half; the startup
+seed reads only the newest `revalidate_seed_max` lines through a ring buffer,
+never the whole file. Both halves matter: rotation bounds the disk, the
+bounded read bounds RSS even for a file left over from a build without the cap.
+
 Sites leave sites.txt by hand (admin page) or by accumulating site_max_fails
 fetch failures, which puts them on a site_cooldown. The list is not pruned
 automatically — the cooldown is what stops wasted fetches, and deleting a line
-is the operator's decision, informed by /api/sources.
+is the operator's decision, informed by /api/sources. A source that keeps
+fetching successfully but emits nothing is the silent case: it never cools
+down and never scores, so the one-minute stats loop names it after
+`collector.site_zero_yield_cycles` fetches and exposes the count as
+`collector_zero_yield_sources` (a gauge). Visibility only — the fetch order is
+left alone.
 ```
 
 ## 6. Admin surface
@@ -442,6 +463,7 @@ deliberately tuned for production and is **not** a verbatim copy of
 | `max_candidates_per_site` | 1000 | Cap per source per cycle |
 | `pool_retry_batch` | 1000 | Pool re-probe batch size |
 | `pool_retry_interval` | 3m | Pool re-probe interval |
+| `site_zero_yield_cycles` | 3 | Fetches after which a source with `Total == 0` and no cooldown is reported by the stats loop and counted in `collector_zero_yield_sources` (visibility only; scoring already deprioritises it) |
 | `use_browser` | false | Playwright fallback (off by default) |
 
 ### `[storage]`
@@ -449,6 +471,7 @@ deliberately tuned for production and is **not** a verbatim copy of
 |-----|---------|-------------|
 | `queue_file` | `proxy.lst` | Live queue persistence |
 | `good_file` | `good_proxies.last` | Append-only audit of all accepted proxies |
+| `good_file_max_lines` | 50000 | Audit file cap. At the cap it is rewritten atomically to its newest half; startup seeds only the newest `revalidate_seed_max` lines, so a huge file from an older build cannot decide RSS |
 | `proven_file` | `data/proven.idx` | Warm-tier sidecar: per-entry proof of life, latency, source and geo, so a restart keeps `/ready` honest instead of reloading a queue where nothing is proven (see §5) |
 | `candidates_file` | `candidates.lst` | Failed candidates pool |
 | `save_interval` | 1m | Queue save interval |
@@ -456,7 +479,7 @@ deliberately tuned for production and is **not** a verbatim copy of
 | `revalidate_fresh_servers` | 15m | Skip recently-served in revalidation |
 | `revalidate_max_per_pass` | 30000 | Budget per revalidation pass |
 | `demote_after_fails` | 2 | Consecutive failed revalidations before an entry is removed (1 = drop on the first failure). A single failed pass is usually the wire; a cancelled pass is never a verdict |
-| `revalidate_seed_rate` | 200/s | Startup re-seed drain rate into the checker (`RevalidateSeeded`) |
+| `revalidate_seed_rate` | 200/s | Startup re-seed drain rate into the checker (`RevalidateSeeded`); a full channel for one interval skips the seed (`reval_seed_skipped_total`) |
 | `revalidate_seed_max` | 5000 | Cap on seeded proxies re-checked at startup |
 
 ### `[export]`
@@ -472,7 +495,7 @@ deliberately tuned for production and is **not** a verbatim copy of
 | File | Purpose |
 |------|---------|
 | `data/proxy.lst` | Live queue (atomic rewrite every minute) |
-| `data/good_proxies.last` | Append-only audit of every accepted proxy |
+| `data/good_proxies.last` | Audit of every accepted proxy, capped at `storage.good_file_max_lines` (rewritten to its newest half at the cap; startup seeds only the tail) |
 | `data/proven.idx` | Warm-tier sidecar (`storage.proven_file`): key, last validation/serve stamps, latency EMA, source, country, ASN. Written with the queue save, read once at startup; deleting it costs one cold start |
 | `data/candidates.lst` | Failed candidates pool (survives restart) |
 | `config/sites.txt` | Curated source list (admin-editable, auto-reload) |

@@ -84,6 +84,13 @@ type Registry struct {
 	CollectorSitesOK     atomic.Int64
 	CollectorSitesFailed atomic.Int64
 	CandidatesEmitted    atomic.Int64
+	// CollectorZeroYield is a gauge, not a counter: the number of sources
+	// that have been fetched at least collector.site_zero_yield_cycles times,
+	// have never emitted a candidate, and are not cooling. Set by the stats
+	// loop every minute. A source that stays here is burning a fetch slot and
+	// a worker while producing nothing — visible now instead of only in
+	// /api/sources after somebody thought to look.
+	CollectorZeroYield atomic.Int64
 
 	// Revalidation.
 	RevalPasses   atomic.Int64 // periodic passes started
@@ -94,8 +101,14 @@ type Registry struct {
 	// (storage.demote_after_fails). Without it a pool full of proxies that
 	// fail every other pass looks healthy in the metrics: nothing is dropped,
 	// so reval_dropped_total stays flat while the proven tier starves.
-	RevalDoubt  atomic.Int64
-	ForcedReval atomic.Int64 // re-checks requested from the admin page
+	RevalDoubt atomic.Int64
+	// RevalSeedSkipped counts startup seeds that found the candidate channel
+	// full for a whole pacing interval. Seeds are best-effort (the periodic
+	// pass re-checks them), fresh candidates from the collector are not: a
+	// skipped seed is the fair alternative to blocking the only producer of
+	// new proxies behind a 5k queue dump.
+	RevalSeedSkipped atomic.Int64
+	ForcedReval      atomic.Int64 // re-checks requested from the admin page
 
 	// Persistence / ops: failure modes that used to be log-only (or fully
 	// silent) and were therefore invisible in /api/metrics during an incident.
@@ -105,6 +118,7 @@ type Registry struct {
 	LogWriteFailures    atomic.Int64 // per-category log file write failures
 	PoolWriteFailures   atomic.Int64 // candidate pool write/flush/compact failures
 	GoodWriteFailures   atomic.Int64 // good-proxy audit write/flush failures
+	GoodRotations       atomic.Int64 // good-proxy audit rotations at good_file_max_lines
 	ProvenWriteFailures atomic.Int64 // proven index write/rename failures
 	AdminAuthFailures   atomic.Int64 // admin token rejections
 	CollectorWakes      atomic.Int64 // emergency/admin collector wake signals
@@ -160,11 +174,13 @@ func (r *Registry) Reset() {
 	r.CollectorSitesOK.Store(0)
 	r.CollectorSitesFailed.Store(0)
 	r.CandidatesEmitted.Store(0)
+	r.CollectorZeroYield.Store(0)
 	r.RevalPasses.Store(0)
 	r.RevalLoopDone.Store(0)
 	r.RevalChecked.Store(0)
 	r.RevalDropped.Store(0)
 	r.RevalDoubt.Store(0)
+	r.RevalSeedSkipped.Store(0)
 	r.ForcedReval.Store(0)
 	r.SaveFailures.Store(0)
 	r.QueueLoadFailures.Store(0)
@@ -172,6 +188,7 @@ func (r *Registry) Reset() {
 	r.LogWriteFailures.Store(0)
 	r.PoolWriteFailures.Store(0)
 	r.GoodWriteFailures.Store(0)
+	r.GoodRotations.Store(0)
 	r.ProvenWriteFailures.Store(0)
 	r.AdminAuthFailures.Store(0)
 	r.CollectorWakes.Store(0)
@@ -224,11 +241,13 @@ func (r *Registry) Snapshot() map[string]int64 {
 		"collector_sites_ok_total":     r.CollectorSitesOK.Load(),
 		"collector_sites_failed_total": r.CollectorSitesFailed.Load(),
 		"candidates_emitted_total":     r.CandidatesEmitted.Load(),
+		"collector_zero_yield_sources": r.CollectorZeroYield.Load(),
 		"reval_passes_total":           r.RevalPasses.Load(),
 		"reval_loop_done_total":        r.RevalLoopDone.Load(),
 		"reval_checked_total":          r.RevalChecked.Load(),
 		"reval_dropped_total":          r.RevalDropped.Load(),
 		"reval_doubt_total":            r.RevalDoubt.Load(),
+		"reval_seed_skipped_total":     r.RevalSeedSkipped.Load(),
 		"forced_reval_total":           r.ForcedReval.Load(),
 		"save_failures_total":          r.SaveFailures.Load(),
 		"queue_load_failures_total":    r.QueueLoadFailures.Load(),
@@ -236,6 +255,7 @@ func (r *Registry) Snapshot() map[string]int64 {
 		"log_write_failures_total":     r.LogWriteFailures.Load(),
 		"pool_write_failures_total":    r.PoolWriteFailures.Load(),
 		"good_write_failures_total":    r.GoodWriteFailures.Load(),
+		"good_rotations_total":         r.GoodRotations.Load(),
 		"proven_write_failures_total":  r.ProvenWriteFailures.Load(),
 		"admin_auth_failures_total":    r.AdminAuthFailures.Load(),
 		"collector_wakes_total":        r.CollectorWakes.Load(),

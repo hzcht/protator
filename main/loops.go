@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"runtime"
+	"strings"
 	"time"
 
 	"protator/proxy"
@@ -17,9 +18,9 @@ import (
 //
 // beats, when non-nil, is stamped by the save path so the admin page can say
 // when the queue was last persisted.
-func startBackgroundLoops(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, checker *proxy.Checker, debug *proxy.DebugProxies, candidates chan<- proxy.Candidate, wakeCollector chan<- struct{}, beats *beats) {
+func startBackgroundLoops(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, collector *proxy.Collector, checker *proxy.Checker, debug *proxy.DebugProxies, candidates chan<- proxy.Candidate, wakeCollector chan<- struct{}, beats *beats) {
 	go saveLoop(ctx, cfg, bucket, beats)
-	go statsLoop(ctx, cfg, bucket, pool, candidates, wakeCollector)
+	go statsLoop(ctx, cfg, bucket, pool, collector, candidates, wakeCollector)
 	// Both policy loops are bare goroutines started here; a panic in either
 	// without RecoverPanic would take the whole process down (through main's
 	// deferred saves) — same contract as every other spawned goroutine.
@@ -64,13 +65,14 @@ func saveLoop(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, beat
 // The rates matter: "live proxies = 41234" cannot tell an operator whether
 // the pool is improving. A pool whose dial-failure rate is climbing while its
 // served rate is flat is dying, and that is visible only in the rates.
-func statsLoop(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, candidates chan<- proxy.Candidate, wakeCollector chan<- struct{}) {
+func statsLoop(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, pool *proxy.CandidatePool, collector *proxy.Collector, candidates chan<- proxy.Candidate, wakeCollector chan<- struct{}) {
 	defer proxy.RecoverPanic("stats loop")
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	empty := false
 	badMinutes := 0
 	prev := proxy.Stats.Snapshot()
+	lastZeroYieldLog := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -93,6 +95,30 @@ func statsLoop(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, poo
 				runtime.NumGoroutine(),
 			)
 			prev = cur
+			// Zero-yield visibility: a source fetched N times with nothing to
+			// show is burning a fetch slot and a worker, but scoring only
+			// deprioritises it — nothing said so out loud. Count it every
+			// minute (the gauge is cheap) and log the sample at most every
+			// ten minutes so a list of dead sources cannot flood the log.
+			if collector != nil {
+				cycles := cfg.Collector.SiteZeroYieldCycles
+				if cycles < 1 {
+					cycles = 3
+				}
+				n, sample := collector.Stats().ZeroYield(cycles, 5)
+				proxy.Stats.CollectorZeroYield.Store(int64(n))
+				if n > 0 && time.Since(lastZeroYieldLog) >= 10*time.Minute {
+					more := ""
+					if n > len(sample) {
+						more = " (+more)"
+					}
+					log.Printf("collector: %d sources with %d+ cycles and zero candidates (not cooling): %s%s",
+						n, cycles, strings.Join(sample, " "), more)
+					lastZeroYieldLog = time.Now()
+				}
+			} else {
+				proxy.Stats.CollectorZeroYield.Store(0)
+			}
 			// The pool is dying faster than revalidation replaces it: most
 			// dials fail while requests keep coming. Two bad minutes in a row
 			// shout and kick an emergency collector cycle, same as the empty
