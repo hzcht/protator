@@ -44,6 +44,11 @@ TEST*.xml
 # Scratch/junk
 comm.cmd
 AGENTS.md
+AGENTS.md.bak-*
+
+# Local OpenCode session state and tool config
+/opencode.json
+/.opencode/
 
 # Audit findings: local working notes, not part of the tree
 problems.md
