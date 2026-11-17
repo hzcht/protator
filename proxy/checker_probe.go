@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -86,7 +87,7 @@ func (c *Checker) ipThrough(client *http.Client, p *Proxy) (net.IP, bool, string
 }
 
 // contentPass races the content tests; the first fully-matching test wins.
-func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
+func (c *Checker) contentPass(client *http.Client, p *Proxy, budget time.Duration) (bool, bool) {
 	if len(c.tests) == 0 {
 		return true, false
 	}
@@ -135,7 +136,7 @@ func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
 	select {
 	case r := <-ch:
 		return true, r.viaConnect
-	case <-time.After(c.cfg.Checker.TotalT.Duration):
+	case <-time.After(budget):
 		return false, false
 	}
 }
@@ -146,14 +147,14 @@ func (c *Checker) contentPass(client *http.Client, p *Proxy) (bool, bool) {
 //
 // Every request here goes through `client`, which is already bound to the proxy
 // under test, so no proxy identity is needed on the parameters.
-func (c *Checker) leakCheck(client *http.Client) error {
+func (c *Checker) leakCheck(client *http.Client, budget time.Duration) error {
 	urls := c.cfg.Checker.LeakProbeURLs
 	if len(urls) == 0 {
 		return nil
 	}
 	self := c.selfIP.String()
 	type res struct{ leaked bool }
-	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Checker.TotalT.Duration)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	ch := make(chan res, len(urls))
 	for _, u := range urls {
@@ -224,7 +225,7 @@ func (c *Checker) confirmExitIP(client *http.Client, first net.IP, u string) err
 // e2eProbe opens a tunnel through the exact serving dial path (dialProxy,
 // the same code the forward servers use) and carries a real GET over it,
 // verifying the proxy can move actual client bytes end to end.
-func (c *Checker) e2eProbe(p *Proxy) error {
+func (c *Checker) e2eProbe(p *Proxy, budget time.Duration) error {
 	if !c.cfg.Checker.E2EProbe || len(c.cfg.Checker.SelfIPURLs) == 0 {
 		return nil
 	}
@@ -242,10 +243,20 @@ func (c *Checker) e2eProbe(p *Proxy) error {
 		}
 	}
 	addr := net.JoinHostPort(host, port)
+	// Same rule as every other stage: this probe may not outlive the attempt
+	// it belongs to. connect_timeout + response_timeout is the stage's own
+	// ceiling (90s in production), which alone is longer than a whole check.
 	total := c.cfg.Checker.ConnectT.Duration + c.cfg.Checker.ResponseT.Duration
+	if budget > 0 && budget < total {
+		total = budget
+	}
+	connect := c.cfg.Checker.ConnectT.Duration
+	if total < connect {
+		connect = total
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), total)
 	defer cancel()
-	conn, err := dialProxy(p, c.cfg.Checker.ConnectT.Duration, ctx, "tcp", addr)
+	conn, err := dialProxy(p, connect, ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("e2e tunnel: %w", err)
 	}
@@ -279,6 +290,76 @@ func (c *Checker) e2eProbe(p *Proxy) error {
 		return errors.New("e2e tunnel returned no foreign IP")
 	}
 	return nil
+}
+
+// tlsProbeBudget bounds the exit-honesty probe. The exit has just answered a
+// full HTTP request (the IP stage), so its TCP path is warm and one TLS
+// handshake is all that is left; a probe that cannot finish in this window is
+// inconclusive, not a verdict.
+const tlsProbeBudget = 15 * time.Second
+
+// tlsHonestyProbe asks the exit to present the certificate of a known TLS host
+// and verifies the chain against real roots.
+//
+// ~90% of free exits terminate TLS themselves and answer with a leaf carrying
+// the right CN over a chain no verifier accepts (measured 2026-11: 9 of 10
+// exits, issuer `O="None, LLC"`). Every client that verifies certificates then
+// fails on that exit — while we keep serving it, because the checker's own TLS
+// probes run with InsecureSkipVerify: validation asks "does this socket carry
+// traffic", not "is the exit honest".
+//
+// This probe answers the second question and records it as evidence. It never
+// fails the check: a forging exit still carries plain HTTP perfectly well and
+// remains a usable rotation member, so the picker merely prefers an honest one
+// (see betterPick). Only a chain the verifier rejects counts as a verdict —
+// a timeout, a reset or a missing target is inconclusive and leaves whatever
+// evidence was there before.
+func (c *Checker) tlsHonestyProbe(p *Proxy, budget time.Duration) {
+	if c.tlsProbeAddr == "" {
+		return
+	}
+	total := tlsProbeBudget
+	if budget > 0 && budget < total {
+		total = budget
+	}
+	if total <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), total)
+	defer cancel()
+	conn, err := dialProxy(p, total, ctx, "tcp", c.tlsProbeAddr)
+	if err != nil {
+		Stats.CheckTLSInconclusive.Add(1)
+		return
+	}
+	defer conn.Close()
+	tc := tls.Client(conn, &tls.Config{ServerName: c.tlsProbeName, RootCAs: c.probeRoots})
+	tc.SetDeadline(time.Now().Add(total))
+	if err := tc.HandshakeContext(ctx); err != nil {
+		if isCertChainRejection(err) {
+			p.MarkTLSHonesty(false)
+			Stats.CheckTLSForged.Add(1)
+			return
+		}
+		Stats.CheckTLSInconclusive.Add(1)
+		return
+	}
+	p.MarkTLSHonesty(true)
+	Stats.CheckTLSHonest.Add(1)
+}
+
+// isCertChainRejection reports whether err is the chain itself being
+// unacceptable — an unknown issuer or a wrong hostname, which is the forgery
+// signature — as opposed to a timeout, a broken handshake, or our own missing
+// system roots. Only these count as evidence: marking proxies forged because
+// our root store failed to load would silently sentence the whole pool.
+func isCertChainRejection(err error) bool {
+	var unknown x509.UnknownAuthorityError
+	if errors.As(err, &unknown) {
+		return true
+	}
+	var hostname x509.HostnameError
+	return errors.As(err, &hostname)
 }
 
 // transportFor returns a per-check transport routing through p with

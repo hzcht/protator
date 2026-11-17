@@ -10,6 +10,51 @@ nobody can find.
 
 ### Added
 
+- **Where a validation died is now a counter.** Every failed `Checker.Check`
+  charges exactly one `check_fail_<stage>_total` (predial / ip / leak / e2e /
+  content / connect / budget) and every fresh check one
+  `check_duration_<band>_total` bucket (<1/≤5/≤15/≤60/≤230/>230 s); the TCP
+  pre-dial is timed separately (`check_tcp_dials_total`,
+  `check_tcp_ns_total`, `check_tcp_timeouts_total`). Errors carry their stage
+  through an `errors.Is`-transparent wrapper, so logs are unchanged. Rechecks
+  keep their own throughput counter (`reval_checked_total`) and are excluded
+  from the duration histogram.
+- **A check has a deadline (`checker.check_budget`, default 60 s).** The
+  candidate's clock starts at the first pre-dial and every stage shares it;
+  `0` disables it. A candidate now pays for **one** TCP pre-dial per host:port
+  instead of one per protocol in `probe_order`, and `attemptBudget` clamps
+  each attempt to `min(total_timeout, remaining)`. `Revalidate` runs under the
+  same budget. The shipped `total_timeout` dropped 230 s → 60 s to match the
+  measured cost. Deaths at the deadline show up as `check_fail_budget_total`.
+- **Serve-grade gate (`checker.proven_latency_max`, default 0 = off).** A
+  validation whose IP stage took longer than the knob is marked on the entry
+  (`Proxy.MarkCheckSlow`) and `freshnessRank` demotes it out of the hot fresh
+  tier — a check that cannot answer inside the serving budget must not look
+  like proof. Real traffic proof still outranks the flag; `/ready` and the
+  proven tier are untouched because the flag only reorders freshness.
+- **The collector's progress is observable mid-cycle.**
+  `collector_site_dones_total` counts per-site completions inside `cycle`,
+  `collector_emit_blocked_total` / `collector_emit_wait_ns_total` count
+  backpressure in `emit`, and the collector beat is stamped from that
+  progress instead of from a finished cycle — a cycle that never ends used to
+  look identical to a collector that was merely slow.
+- **Exit honesty is measured, not assumed.** ~90% of free exits terminate TLS
+  themselves and answer with a leaf carrying the right CN over a chain no
+  verifier accepts (`issuer O="None, LLC"`), so every certificate-verifying
+  client fails on them while we keep serving them — the checker's own probes
+  run with `InsecureSkipVerify` by design. After a pass, the checker now opens
+  one TLS handshake through the exit to `checker.tls_probe_host` (default
+  `api.ipify.org:443`, `"off"` disables) and verifies the presented chain
+  against the system roots. The verdict is evidence, never a check result:
+  `check_tls_honest_total` / `check_tls_forged_total` /
+  `check_tls_inconclusive_total` count it, `Proxy.TLSHonestyRank` carries it
+  (+1 honest / 0 unknown / −1 forged), and `betterPick` prefers it when
+  freshness ties — an unknown entry outranks a forged one, an honest one
+  outranks both. Nothing is dropped: a forging exit still serves plain HTTP
+  and keeps its place in the rotation. Only `x509.UnknownAuthorityError` and
+  `x509.HostnameError` count as "forged" — clock skew or a missing system root
+  store must not sentence the pool.
+
 - **The audit trail is capped and its seed is bounded** — `good_proxies.last`
   grew with every validated proxy (20 MB / 500k lines on the author's box) and
   startup loaded all of it into memory just to keep the tail. It now rotates
@@ -157,6 +202,27 @@ nobody can find.
 
 ### Fixed
 
+- **`servertest/stress.ps1` no longer measures the exit pool's certificates.**
+  The `http` branch was the only one built without `-k`, so `-Front http`
+  verified the *target's* chain — and with ~90% of free exits forging TLS
+  leaves (same CN, issuer `O="None, LLC"`) it reported `success 0/60` while the
+  app counted the same window as `served_ok +60`, `serve_failures +0`. All
+  three fronts now pass `-k`, with the reason in a comment; the tunnel itself
+  was always byte-clean (`-k` is 10/10, §30.7 in `problems.md`).
+- **The collector could freeze for hours inside the extractor (P0).**
+  `findAtQuadTokens` probes the regex once per IPv4 token inside a window its
+  tail plan computes; a class-run tail (`[^>]*`, `\s*`) is charged nothing at
+  plan build time because its length is data, so on a page that is sparse in
+  quads but short on `>` every token got the **whole rest of the body** as its
+  window. That is T·N engine scans instead of the single N scan the legacy
+  pass costs — one 8 MB page ran a single `Extract` for ~10 h, pegged a core
+  at 95% `regexp.(*machine).match`, and blocked `cycle` in `wg.Wait` with no
+  log line and no counter (`collector_stale=true`, 1 cycle in 13.6 h, checker
+  starved at 0 fresh checks/s). Each pattern now gets a budget of one body's
+  worth of window and falls back to the legacy `FindAll` when it runs out,
+  which caps the path at 2× the pass it replaces.
+  `TestFindAtQuadTokensBoundsTotalWindow` reproduces the hang (it times out
+  at 60 s with the budget removed) and asserts the fallback loses no match.
 - **Scheme userinfo without `:` no longer manufactures a credential.**
   `https://user@1.2.3.4:8080` now stays the anonymous socket with its scheme
   instead of becoming a Basic credential with an empty password — symmetric
@@ -191,6 +257,18 @@ nobody can find.
 
 ### Documentation
 
+- **The stability pass is documented where it lives.** `docs/REGEX.md` gains
+  the anchored path's runtime window budget (why a class-run tail cannot be
+  charged at plan time, and what the legacy fallback guarantees);
+  `docs/DEVELOPER.md` gains a "Reading the validation funnel" how-to
+  (`check_fail_*` / `check_duration_*` / `check_tcp_*`, plus how to add a
+  stage) and a pitfall row for launching `start.ps1` through a pipe — the
+  daemon inherits the pipe's stdout, the launcher never exits, and the
+  harness's timeout kills `main.exe` along with it (observed as a process
+  that vanished with no `stop.ps1` line and nothing in `instance_err.log`);
+  `main/OPS.md` gains §5.6 «`collector_stale: true`, а `queue_live` не
+  падает» with the pprof recipe, and the same launch warning next to the
+  start command. `problems.md` §30 has the measurements behind all of it.
 - **Docs re-synced against the code** (post-release passes; everything
   below was verified against the source, not proofread):
   - **ARCHITECTURE** — the admin security paragraph now says what the code

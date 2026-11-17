@@ -19,14 +19,20 @@ type Proxy struct {
 	Host   string `json:"host"`
 	Port   int    `json:"port"`
 
-	consecFails int64 // consecutive serving-path dial failures
-	checkFails  int64 // consecutive failed revalidations (strikes, see demote_after_fails)
-	okTotal     int64 // lifetime successful dials/checks
-	failTotal   int64 // lifetime failed dials/checks
-	latencyEMA  int64 // exponential moving average of dial latency, ns
-	inFlight    int64 // currently open upstream connections through this proxy
-	lastCheck   int64 // unix nanos of last successful validation
-	lastOK      int64 // unix nanos of last successful serving dial
+	consecFails int64       // consecutive serving-path dial failures
+	checkFails  int64       // consecutive failed revalidations (strikes, see demote_after_fails)
+	okTotal     int64       // lifetime successful dials/checks
+	failTotal   int64       // lifetime failed dials/checks
+	latencyEMA  int64       // exponential moving average of dial latency, ns
+	inFlight    int64       // currently open upstream connections through this proxy
+	lastCheck   int64       // unix nanos of last successful validation
+	lastOK      int64       // unix nanos of last successful serving dial
+	slowCheck   atomic.Bool // last validation passed, but slower than the serving budget (proven_latency_max)
+
+	// tlsHonesty is the exit-honesty evidence (see MarkTLSHonesty): +1 an
+	// honest chain, 0 never probed, -1 the exit forges TLS. Ordered so a
+	// larger value is the better serving target.
+	tlsHonesty atomic.Int32
 
 	// source is the sites.txt entry this proxy was discovered on ("" for
 	// hand-added entries and for anything loaded from disk). Written once,
@@ -114,6 +120,43 @@ func (p *Proxy) MarkAlive(latency time.Duration) {
 	atomic.StoreInt64(&p.lastCheck, time.Now().UnixNano())
 	p.sampleLatency(latency)
 }
+
+// MarkCheckSlow records whether the latest validation answered, but slower
+// than the serving path tolerates (checker.proven_latency_max). Atomic, like
+// every health field: the picker reads it on the serving path while the
+// checker writes it. A later fast check clears the flag — it describes the
+// most recent check, not the proxy's whole history.
+func (p *Proxy) MarkCheckSlow(slow bool) { p.slowCheck.Store(slow) }
+
+// CheckIsSlow reports whether the latest validation was slower than the
+// serving budget. The picker downgrades such entries to stale so the warm
+// tier stays servable by construction.
+func (p *Proxy) CheckIsSlow() bool { return p.slowCheck.Load() }
+
+// Exit-honesty evidence. The values are ranks, not booleans, because "never
+// probed" is a real state and sits between the two: an exit we have not tested
+// is a coin flip, one we caught forging is a known-bad HTTPS exit.
+const (
+	tlsForged  = int32(-1) // the chain did not verify: the exit terminates TLS itself
+	tlsUnknown = int32(0)  // never probed, or the probe was inconclusive
+	tlsHonest  = int32(1)  // the chain verified against real roots
+)
+
+// MarkTLSHonesty records what the exit-honesty probe saw. Evidence, never a
+// verdict: a forging exit still carries plain HTTP perfectly well, so it keeps
+// serving — it only loses to a probed-honest one when the picker compares two
+// entries of the same proof tier. Atomic for the same reason as every other
+// health field: written by a checker worker, read on the serving path.
+func (p *Proxy) MarkTLSHonesty(honest bool) {
+	if honest {
+		p.tlsHonesty.Store(tlsHonest)
+		return
+	}
+	p.tlsHonesty.Store(tlsForged)
+}
+
+// TLSHonestyRank returns the honesty evidence as one comparable integer.
+func (p *Proxy) TLSHonestyRank() int32 { return p.tlsHonesty.Load() }
 
 // sampleLatency folds a sample into the EMA (alpha = 1/8, CAS loop).
 func (p *Proxy) sampleLatency(d time.Duration) {

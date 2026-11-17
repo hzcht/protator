@@ -69,6 +69,7 @@ protator/
 │   ├── poolloop.go         # PoolReprobeLoop (adaptive re-probe batch)
 │   ├── checker.go          # Validation pipeline (Check/fullCheck) + GeoIP
 │   ├── checker_probe.go    # Evidence probes: exit IP, leaks, e2e serve, transport
+│   ├── checkstage.go       # Where a validation died + how long it took (check_fail_*/check_duration_*)
 │   ├── collector.go        # Site scraping: rotation, cycles, emit, dedup
 │   ├── collect_fetch.go    # One fetch: transport cache + response classification
 │   ├── upstream.go         # ForwardDialer with failover + passive feedback
@@ -261,6 +262,7 @@ max_candidates_per_site = 1000
 | Let the connection key outrank the session key | `X-Sticky-Session` is read, then silently ignored: every front sets a connection key on every request, so the header never reaches `PinPool` | `pinKeyFrom` prefers the session; a named session is the only key that survives connection churn |
 | Forward a client `X-Proxy-*` header | It names the tool (and the session id) in the target's own logs | `stripControlHeaders` removes the whole family before the request is forwarded, on both the plain and the CONNECT path |
 | Hardcode ports in tests | Flaky on CI | Use `net.Listen("tcp", "127.0.0.1:0")` |
+| Launch `start.ps1` through a pipe (`\| Out-File`, `Tee-Object`) from a background shell | The daemon inherits the pipe's stdout, so the shell never exits; when the harness kills it on timeout it takes `main.exe` with it — a silent hard kill with **no** `stop.ps1` line and nothing in `instance_err.log` | Detach the launcher: `Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','main\start.ps1' -WindowStyle Hidden -RedirectStandardOutput <file> -RedirectStandardError <file>` |
 
 ## 9. Debugging
 
@@ -287,6 +289,29 @@ Every counter lives in `proxy/stats.go`; a loop or failure mode with no
 counter is invisible during an incident, so add one when you add a subsystem.
 The 1-minute `queue:` line already prints the rates (serve, dial-fail,
 eviction, checks) alongside the queue counts.
+
+### Reading the validation funnel
+
+`proxy/checkstage.go` is the whole story: `Check` names its stage, wraps the
+error so `stagedError` records exactly one `check_fail_<stage>_total`, and
+records one `check_duration_<band>_total` per **fresh** check.
+
+| What you see | What it means |
+| --- | --- |
+| `check_fail_predial_total` | the socket itself never opened — the proxy is gone |
+| `check_fail_ip_total` | reached, but the exit-IP probe failed — usually the biggest bucket |
+| `check_fail_e2e_total` | tunnel established, the end-to-end probe failed |
+| `check_fail_content_total` | body did not come back as expected |
+| `check_fail_budget_total` | died at `check_budget` — the per-candidate deadline, not a verdict on the proxy |
+| `check_tls_honest_total` / `check_tls_forged_total` / `check_tls_inconclusive_total` | the exit-honesty probe: the exit presented a chain real roots accept / a chain no verifier accepts (~90% of free exits — see problems.md §30.7) / no verdict (tunnel failed, timeout). Evidence only — `freshnessRank`'s honesty preference orders picks, nothing is dropped |
+| `check_duration_gt_230s_total` | anything growing here means a stage is not honouring its deadline |
+| `check_tcp_dials_total / checks_total` | ~1.0 is healthy; ~3 means one pre-dial per protocol crept back in |
+| `reval_checked_total` | revalidations, deliberately absent from the duration histogram |
+
+Adding a stage: give it a `checkStage` constant, wrap the error with
+`stageErr(err, stage)` at the return site, and add the matching
+`check_fail_*_total` to `stats.go` (`Snapshot` **and** `Reset` both — a
+counter missing from `Reset` survives across tests).
 
 ### Profiling
 ```powershell

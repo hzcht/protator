@@ -182,7 +182,25 @@ type CheckerConfig struct {
 	TLSHandshake Duration `toml:"tls_handshake_timeout"`
 	ResponseT    Duration `toml:"response_timeout"`
 	TotalT       Duration `toml:"total_timeout"`
-	ProbeOrder   []string `toml:"probe_order"`
+	// Budget is the whole-candidate ceiling: pre-dial plus every protocol
+	// attempt together, not per protocol. TotalT stays the per-attempt
+	// ceiling, so an attempt gets min(TotalT, what is left of Budget).
+	//
+	// It exists because a candidate used to get a fresh TotalT for each of
+	// probe_order's protocols: 4 x (tcp_timeout + total_timeout) is ~18
+	// minutes of one worker for a dead host, which is how 600 workers ended
+	// up producing 5 checks/s at 6% CPU. It is also the acceptance/serving
+	// coherence knob: a proxy that cannot be confirmed inside this window
+	// cannot serve a 25s request either.
+	Budget Duration `toml:"check_budget"`
+	// ProvenLatencyMax is the serve-grade gate: a validation whose IP stage
+	// (first answer through the proxy) took longer than this still enters the
+	// queue, but the picker ranks it as stale instead of warm — the acceptance
+	// tolerance must not exceed what serving can use. 0 disables the gate
+	// (default): it ships off until the check-duration histogram says where
+	// the threshold belongs.
+	ProvenLatencyMax Duration `toml:"proven_latency_max"`
+	ProbeOrder       []string `toml:"probe_order"`
 	// Header-echo endpoints used to detect proxies that forward the client
 	// IP in X-Forwarded-For/Via headers (transparent-leak detection).
 	// Empty = stage skipped. Leak verdicts are only trusted when the echo
@@ -194,6 +212,14 @@ type CheckerConfig struct {
 	// E2EProbe opens a tunnel through the exact serving dial path
 	// (dialProxy) to the first self-IP URL before accepting a proxy.
 	E2EProbe bool `toml:"e2e_probe"`
+	// TLSProbeHost is the exit-honesty probe target, "host:port" (a bare host
+	// means :443). The probe tunnels through the exit and verifies the chain
+	// against the system roots; an exit that forges certificates is marked,
+	// never rejected — it still carries plain HTTP, so the picker merely
+	// prefers a probed-honest one. Defaults to "api.ipify.org:443" (already a
+	// checker dependency); the literal "off" disables the probe, because an
+	// empty string cannot express "disabled" when the default fills it in.
+	TLSProbeHost string `toml:"tls_probe_host"`
 	// GeoIPDBPath is the path to a MaxMind GeoIP2-City.mmdb file.
 	// If set, the checker looks up the country for each validated proxy's
 	// exit IP and attaches it for admin display and the country filter.
@@ -554,11 +580,19 @@ func (c *Config) fillDefaults() error {
 	if c.Checker.TLSHandshake.Duration <= 0 {
 		c.Checker.TLSHandshake = Duration{time.Second * 10}
 	}
+	if c.Checker.TLSProbeHost == "" {
+		c.Checker.TLSProbeHost = "api.ipify.org:443"
+	}
 	if c.Checker.ResponseT.Duration <= 0 {
 		c.Checker.ResponseT = Duration{time.Second * 20}
 	}
 	if c.Checker.TotalT.Duration <= 0 {
 		c.Checker.TotalT = Duration{time.Second * 30}
+	}
+	// Default is ≥ 2 attempts at the default TotalT, so a mislabeled list
+	// still gets its protocol fallback (see Check's hint handling).
+	if c.Checker.Budget.Duration <= 0 {
+		c.Checker.Budget = Duration{time.Second * 60}
 	}
 	if len(c.Checker.ProbeOrder) == 0 {
 		c.Checker.ProbeOrder = []string{"http", "socks5", "socks4", "https"}

@@ -71,10 +71,16 @@ $jobs = 1..$Concurrency | ForEach-Object {
         $curlArgs = @("-s", "-A", "servertest/1.0", "-w", "`n__STATS__ %{http_code} %{time_total} %{size_download}",
                       "--max-time", "$timeout", "--connect-timeout", "10")
         switch ($front) {
-            "http"   { $curlArgs += @("-x", $httpFront) }
             # -k for the target, --proxy-insecure for the proxy's own self-signed
             # certificate: curl verifies the two chains separately, and skipping
             # the second one fails every HTTPS-proxy request (exit 52/56).
+            # -k goes on EVERY front on purpose: ~90% of the free exits terminate
+            # TLS with a forged leaf (same CN, issuer "None, LLC"), so verifying
+            # the target would measure exit honesty, not this proxy — and the
+            # http branch used to be the only one without -k, i.e. the only one
+            # whose "success rate" was really a certificate survey
+            # (problems.md §30.7).
+            "http"   { $curlArgs += @("-k", "-x", $httpFront) }
             "https"  { $curlArgs += @("-k", "--proxy-insecure", "-x", $httpsFront) }
             "socks5" { $curlArgs += @("-k", "--socks5-hostname", $socks) }
         }
@@ -170,8 +176,14 @@ Start-Sleep -Seconds $SettleSec
 $gAfter = HealthField "goroutines"
 Write-Host ("  goroutines    : {0} -> {1} after {2}s settle" -f $gBefore, $gAfter, $SettleSec)
 if ($gBefore -and $gAfter -and $gAfter -gt ($gBefore + $Concurrency)) {
-    Write-Host "  WARNING: goroutines grew by more than the concurrency; possible leak" -ForegroundColor Yellow
-    $verdict = 1
+    # Observation, deliberately NOT a verdict. This process runs 600 checker
+    # workers whose in-flight HTTP transports dominate NumGoroutine: a single
+    # before/after pair swings by a thousand while nothing leaks (measured:
+    # 3261 at soak start -> 3053 at soak end, with per-run spikes in between).
+    # A leak is monotonic, so it is judged across the whole soak by the
+    # operator, not inside a 10 s settle window. Failing a run here reported
+    # PASS runs as exit 1 and taught everyone to ignore the exit code.
+    Write-Host ("  WARNING: goroutines +{0} over this run - usually in-flight checker work (600 workers + transports), not a leak; judge by the soak-wide trend" -f ($gAfter - $gBefore)) -ForegroundColor Yellow
 }
 $live = HealthField "queue_live"; $proven = HealthField "queue_proven"
 Write-Host ("  queue         : live={0} proven={1}" -f $live, $proven)

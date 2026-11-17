@@ -110,6 +110,16 @@ Restrictions the tests pin, so nobody "generalizes" them wrongly:
 - The cap is on the plan's **total** window, not on each step: many
   individually-legal repeats must not add up to a window larger than a whole
   body scan would cost. `TestAnchoredPlanTotalIsBounded` pins both sides.
+- The plan total is charged at *build* time, and a class-run step
+  (`\s*`, `[^>]*`) cannot be charged then — its length is data, not syntax.
+  The loop therefore caps what it *spends*: each pattern gets a budget of one
+  body's worth of window, and once that runs out the pattern goes back to the
+  legacy `FindAll`. Without it a page that is sparse in quads but short on `>`
+  hands every token the whole rest of the body as its window — T·N engine
+  scans instead of N, which froze a production collector for ~10 h inside
+  `wg.Wait` with no log line. The fallback is the pre-anchoring path, so it
+  cannot drop a match the anchored loop would have found.
+  `TestFindAtQuadTokensBoundsTotalWindow` pins it.
 - A case-folded literal in a site pattern is bounded at four UTF-8 bytes per
   rune. Go's `(?i)` can match a longer Unicode fold variant (`k` ↔ KELVIN
   SIGN, `s` ↔ LONG S); budgeting source-byte length would let the probe window

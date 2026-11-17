@@ -293,7 +293,7 @@ func TestPreDialRefused(t *testing.T) {
 	c := testChecker(nil, "9.9.9.9")
 	p2 := &Proxy{Schema: "http", Host: "127.0.0.1", Port: closedPort(t)}
 	start := time.Now()
-	if err := c.preDial(p2); err == nil {
+	if err := c.preDial(p2.Host, p2.Port, c.cfg.Checker.TCPTimeout.Duration); err == nil {
 		t.Fatal("pre-dial to closed port succeeded")
 	} else if time.Since(start) > c.cfg.Checker.TCPTimeout.Duration {
 		t.Fatalf("pre-dial too slow: %s", time.Since(start))
@@ -362,7 +362,7 @@ func TestContentPassRace(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	p := &Proxy{Schema: "http", Host: "127.0.0.1", Port: 1}
 	start := time.Now()
-	ok, _ := c.contentPass(client, p)
+	ok, _ := c.contentPass(client, p, c.cfg.Checker.TotalT.Duration)
 	if !ok {
 		t.Fatal("matching test did not pass")
 	}
@@ -371,7 +371,7 @@ func TestContentPassRace(t *testing.T) {
 	}
 
 	c.tests = []ContentTest{{Name: "bad", URL: slowBad.URL, MustContain: []string{"Example"}}}
-	if ok, _ := c.contentPass(client, p); ok {
+	if ok, _ := c.contentPass(client, p, c.cfg.Checker.TotalT.Duration); ok {
 		t.Fatal("non-matching test passed")
 	}
 }

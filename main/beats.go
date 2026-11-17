@@ -19,7 +19,7 @@ import (
 // collector that is merely slow look identical in a counter, and completely
 // different in a timestamp.
 type beats struct {
-	collector  atomic.Int64 // unix nanos of the last completed collector cycle
+	collector  atomic.Int64 // unix nanos of the last collector progress (per-site done or cycle end)
 	revalidate atomic.Int64 // last revalidation pass
 	save       atomic.Int64 // last successful queue save
 	export     atomic.Int64 // last list-service rebuild
@@ -39,7 +39,7 @@ func newBeats() *beats {
 // one moved. The tracker is one goroutine for the whole process, so the cost
 // does not scale with the number of tracked subsystems.
 func startBeatTracker(ctx context.Context, b *beats) {
-	var lastCycles, lastDones, lastExport int64
+	var lastCycles, lastDones, lastExport, lastSiteDones int64
 	go func() {
 		defer proxy.RecoverPanic("beats")
 		t := time.NewTicker(5 * time.Second)
@@ -50,6 +50,18 @@ func startBeatTracker(ctx context.Context, b *beats) {
 				return
 			case <-t.C:
 				now := time.Now().UnixNano()
+				// The collector beat follows per-site progress, not completed
+				// cycles: a cycle blocked in emit (channel full, checker
+				// starved) used to leave collector_age_s growing for hours
+				// while the collector was in fact alive — and a really dead
+				// collector was indistinguishable from the same picture.
+				// Sites finish every few seconds while anything at all is
+				// moving; only a genuinely stuck collector lets the age grow
+				// past the stale threshold.
+				if s := proxy.Stats.CollectorSiteDones.Load(); s != lastSiteDones {
+					lastSiteDones = s
+					b.collector.Store(now)
+				}
 				if c := proxy.Stats.CollectorCycles.Load(); c != lastCycles {
 					lastCycles = c
 					b.collector.Store(now)

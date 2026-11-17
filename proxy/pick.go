@@ -78,6 +78,13 @@ func (b *Bucket) freshnessRank(now int64, p *Proxy) int64 {
 	if lo := p.lastOKNanos(); lo != 0 && now-lo <= int64(serve) {
 		return freshGreen
 	}
+	// A warm check the serving path could never afford (slow gate,
+	// checker.proven_latency_max) must not rank as warm proven stock: the
+	// warm tier exists to feed serving, and this entry flunks that job.
+	// Serving proof above still wins — real traffic outranks any check.
+	if p.CheckIsSlow() {
+		return freshStale
+	}
 	if lc := p.lastCheckNanos(); lc != 0 && now-lc <= int64(fresh) {
 		return freshWarm
 	}
@@ -204,7 +211,7 @@ func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, n
 		probes = scaled
 	}
 	var best *Proxy
-	var bestFresh, bestFails, bestLat, bestLoad int64
+	var bestFresh, bestHonest, bestFails, bestLat, bestLoad int64
 	for i := 0; i < probes; i++ {
 		p := pool[rand.IntN(n)]
 		// Both guards are folded behind their own precondition: an empty skip
@@ -226,10 +233,11 @@ func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, n
 		l := p.latencyEMAValue()
 		load := p.InFlight()
 		fresh := b.freshnessRank(nowNanos, p)
-		if best == nil || betterPick(fresh, f, l, load, bestFresh, bestFails, bestLat, bestLoad) {
-			best, bestFresh, bestFails, bestLat, bestLoad = p, fresh, f, l, load
-			if fresh == freshGreen && f == 0 && l == 0 && load == 0 {
-				break // unmeasured, freshly proven proxy: good enough
+		h := int64(p.TLSHonestyRank())
+		if best == nil || betterPick(fresh, h, f, l, load, bestFresh, bestHonest, bestFails, bestLat, bestLoad) {
+			best, bestFresh, bestHonest, bestFails, bestLat, bestLoad = p, fresh, h, f, l, load
+			if fresh == freshGreen && h == int64(tlsHonest) && f == 0 && l == 0 && load == 0 {
+				break // unmeasured, freshly proven, honest proxy: good enough
 			}
 		}
 	}
@@ -237,16 +245,25 @@ func (b *Bucket) rankPick(pool []*Proxy, probes int, skip map[string]struct{}, n
 }
 
 // betterPick orders two candidates for the serving path. Lower is better at
-// every step: newer proof first, then fewer consecutive failures, then lower
-// latency, then fewer open tunnels.
+// every step: newer proof first, then honest TLS evidence, then fewer
+// consecutive failures, then lower latency, then fewer open tunnels.
+//
+// Honesty is a preference between equals, never a rejection: a forged exit
+// still serves plain HTTP perfectly well, so an unknown (0) entry outranks a
+// forged (-1) one and an honest (+1) one outranks both — but the ordering
+// only breaks fresh-tier ties, it does not demote anything out of a tier the
+// way the slow-check gate does.
 //
 // Latency needs care: 0 means "never measured", not "infinitely fast", so an
 // unmeasured entry must lose to any measured one. Comparing the raw values
 // with a plain `<` gets that backwards for the very first candidate, which is
 // how an unproven entry with no samples at all could win a whole pick.
-func betterPick(fresh, fails, lat, load, bestFresh, bestFails, bestLat, bestLoad int64) bool {
+func betterPick(fresh, honest, fails, lat, load, bestFresh, bestHonest, bestFails, bestLat, bestLoad int64) bool {
 	if fresh != bestFresh {
 		return fresh > bestFresh
+	}
+	if honest != bestHonest {
+		return honest > bestHonest
 	}
 	if fails != bestFails {
 		return fails < bestFails

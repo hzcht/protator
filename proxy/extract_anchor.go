@@ -339,6 +339,17 @@ func findAtQuadTokens(re *regexp.Regexp, text string, tokens []int, h *probeHint
 	if h == nil || len(tokens) == 0 {
 		return re.FindAllStringSubmatchIndex(text, -1)
 	}
+	// The anchored path is an optimization only while its windows stay cheap
+	// in total: legacy scans the body once, this loop once per token. A
+	// class-run tail (`[^>]*`) walks to the end of the body, so a page that is
+	// sparse in quads but long past them gets the whole body as every token's
+	// window — T*N engine scans instead of N. Measured: one 8 MB page ran one
+	// Extract for ~10 h, pegged a core and froze the collector in wg.Wait.
+	// The budget is the break-even the sparsity rule already assumes (T <=
+	// N/64, so a window under 64 bytes pays for itself): spend at most one
+	// body's worth of window, then hand the pattern to the legacy pass, which
+	// runs the same engine under the same leftmost policy over the same text.
+	budget := len(text)
 	var out [][]int
 	cursor := 0
 	for _, t := range tokens {
@@ -349,6 +360,10 @@ func findAtQuadTokens(re *regexp.Regexp, text string, tokens []int, h *probeHint
 			continue // the real \b fails here; the slice cannot see text[t-1]
 		}
 		end := probeEnd(text, t, h.tail)
+		if end-t > budget {
+			return re.FindAllStringSubmatchIndex(text, -1)
+		}
+		budget -= end - t
 		m := re.FindStringSubmatchIndex(text[t:end])
 		if len(m) < 2 || m[0] != 0 {
 			continue

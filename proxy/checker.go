@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +62,13 @@ type Checker struct {
 	// allowBogon disables the loopback/private filter (integration tests
 	// run everything on 127.0.0.1). Never set in production.
 	allowBogon bool
+
+	// Exit-honesty probe target (checker.tls_probe_host). Addr empty means the
+	// probe is off. probeRoots overrides the system roots; tests set the test
+	// server's own pool so "honest" is reachable without a public CA.
+	tlsProbeAddr string
+	tlsProbeName string
+	probeRoots   *x509.CertPool
 }
 
 var reAnyIP = regexp.MustCompile(`([0-9]{1,3}(?:\.[0-9]{1,3}){3})`)
@@ -73,6 +82,18 @@ func NewChecker(cfg *Config) (*Checker, error) {
 		return nil, fmt.Errorf("resolve self IP: %w", err)
 	}
 	c.selfIP = self
+
+	// Exit-honesty probe target: "host", "host:port", or "off".
+	if host := strings.TrimSpace(cfg.Checker.TLSProbeHost); host != "" && !strings.EqualFold(host, "off") {
+		addr := host
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			addr = net.JoinHostPort(host, "443")
+		}
+		if name, _, err := net.SplitHostPort(addr); err == nil {
+			c.tlsProbeAddr = addr
+			c.tlsProbeName = strings.Trim(name, "[]")
+		}
+	}
 
 	// Initialize GeoIP database if path is configured
 	if cfg.Checker.GeoIPDBPath != "" {
@@ -205,25 +226,41 @@ func proxyForCandidate(cand Candidate, schema string) *Proxy {
 	return p
 }
 
-func (c *Checker) Check(cand Candidate) (*Proxy, error) {
+func (c *Checker) Check(cand Candidate) (found *Proxy, err error) {
+	start := time.Now()
+	// Measurement only: the named results let one defer see every exit path,
+	// so no future branch can quietly fall out of the cost histogram.
+	defer func() {
+		recordCheckDuration(time.Since(start))
+		recordCheckFail(err)
+	}()
 	Stats.Checks.Add(1)
 	if cand.Port < 1 || cand.Port > 65535 {
 		Stats.ChecksFailed.Add(1)
-		return nil, errors.New("bad port")
+		return nil, stageErr(stagePredial, errors.New("bad port"))
 	}
 	if !c.allowBogon {
 		if err := rejectBogon(cand.Host, c.selfIP); err != nil {
 			Stats.ChecksFailed.Add(1)
-			return nil, err
+			return nil, stageErr(stagePredial, err)
 		}
 	}
+	// One budget for the whole candidate and one TCP pre-dial for its address.
+	//
+	// Both are deliberate: the SYN goes to the same host:port whichever
+	// protocol turns out to be right, so probing four protocols against a dead
+	// host used to burn four tcp_timeout waits, and every attempt then got a
+	// fresh total_timeout, so one hopeless candidate could occupy a worker for
+	// ~18 minutes. A candidate now costs at most check_budget end to end, which
+	// is also the only way a worker count means anything.
+	deadline := c.checkDeadline()
+	if err := c.preDial(cand.Host, cand.Port, c.attemptBudget(deadline)); err != nil {
+		Stats.ChecksFailed.Add(1)
+		return nil, stageErr(stagePredial, err)
+	}
 	if cand.Schema != "" && validSchema(cand.Schema) {
-		p := proxyForCandidate(cand, cand.Schema)
-		if err := c.preDial(p); err != nil {
-			Stats.ChecksFailed.Add(1)
-			return nil, err
-		}
-		if err := c.fullCheck(p); err != nil {
+		p, err := c.attempt(cand, cand.Schema, deadline)
+		if err != nil {
 			Stats.ChecksFailed.Add(1)
 			return nil, err
 		}
@@ -238,18 +275,64 @@ func (c *Checker) Check(cand Candidate) (*Proxy, error) {
 	if cand.Prefer != "" && validSchema(cand.Prefer) {
 		order = preferFirst(order, cand.Prefer)
 	}
+	var lastErr error
 	for _, s := range order {
-		p := proxyForCandidate(cand, s)
-		if err := c.preDial(p); err != nil {
-			continue
-		}
-		if err := c.fullCheck(p); err == nil {
+		p, err := c.attempt(cand, s, deadline)
+		if err == nil {
 			Stats.ChecksPassed.Add(1)
 			return p, nil
 		}
+		lastErr = err
+		if stageOf(err) == stageBudget {
+			// Out of candidate budget: further protocols would only re-test
+			// the same exhausted clock.
+			break
+		}
 	}
 	Stats.ChecksFailed.Add(1)
-	return nil, errors.New("no protocol works")
+	if lastErr == nil {
+		// Empty probe_order: nothing was attempted, so nothing can be blamed.
+		lastErr = errors.New("no protocol works")
+	}
+	return nil, lastErr
+}
+
+// attempt makes one protocol attempt inside the candidate's budget. It never
+// spends more than min(total_timeout, whatever is left of the candidate), so a
+// long probe order cannot multiply the deadline.
+func (c *Checker) attempt(cand Candidate, schema string, deadline time.Time) (*Proxy, error) {
+	budget := c.attemptBudget(deadline)
+	if budget <= 0 {
+		return nil, stageErr(stageBudget, errors.New("check budget exhausted"))
+	}
+	p := proxyForCandidate(cand, schema)
+	if err := c.fullCheck(p, budget); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// checkDeadline is the candidate's whole-check deadline. It returns the zero
+// time when the budget is disabled (0), which attemptBudget reads as unbounded:
+// a hand-built Config in tests then behaves like the old per-attempt clock
+// instead of failing every check with "no time left".
+func (c *Checker) checkDeadline() time.Time {
+	if b := c.cfg.Checker.Budget.Duration; b > 0 {
+		return time.Now().Add(b)
+	}
+	return time.Time{}
+}
+
+// attemptBudget is what a single attempt may spend: the per-attempt ceiling
+// (total_timeout) clipped to what remains of the candidate budget.
+func (c *Checker) attemptBudget(deadline time.Time) time.Duration {
+	left := c.cfg.Checker.TotalT.Duration
+	if !deadline.IsZero() {
+		if rem := time.Until(deadline); rem < left {
+			left = rem
+		}
+	}
+	return left
 }
 
 // preferFirst returns the probe order with pref moved to the front (deduped).
@@ -266,11 +349,24 @@ func preferFirst(order []string, pref string) []string {
 
 // Revalidate confirms that a previously-good proxy still passes, without
 // re-probing alternative protocols.
-func (c *Checker) Revalidate(p *Proxy) error {
-	if err := c.preDial(p); err != nil {
-		return err
+//
+// It runs under the same budget a fresh check gets: a proxy that cannot be
+// re-confirmed inside the acceptance window is not evidence of a working proxy,
+// and the old total_timeout (230s in production) let a single revalidation
+// occupy a worker for four minutes while the pool starved.
+func (c *Checker) Revalidate(p *Proxy) (err error) {
+	// Stage only, no duration: revalidation skips the protocol loop, and its
+	// throughput is already counted as reval_checked_total.
+	defer func() { recordCheckFail(err) }()
+	deadline := c.checkDeadline()
+	if err = c.preDial(p.Host, p.Port, c.attemptBudget(deadline)); err != nil {
+		return stageErr(stagePredial, err)
 	}
-	return c.fullCheck(p)
+	budget := c.attemptBudget(deadline)
+	if budget <= 0 {
+		return stageErr(stageBudget, errors.New("check budget exhausted"))
+	}
+	return c.fullCheck(p, budget)
 }
 
 // rejectBogon refuses loopback/private/link-local addresses and our own IP.
@@ -297,19 +393,46 @@ func rejectBogon(host string, selfIP net.IP) error {
 
 // preDial opens and immediately closes a TCP connection to the proxy.
 // Dead hosts fail here in ~seconds instead of burning full HTTP timeouts.
-func (c *Checker) preDial(p *Proxy) error {
+//
+// It takes host:port rather than a Proxy because it runs once per candidate,
+// before any protocol has been chosen: the SYN reaches the same socket whether
+// the proxy turns out to speak http or socks5. budget is what remains of the
+// candidate's clock; the wait is clipped to it so a pre-dial can never outlive
+// the check that owns it.
+//
+// The duration is measured separately from the rest of the check: on a dead
+// host this stage is pure SYN timeout, and until the TCP counters existed there
+// was no way to tell that cost from a proxy that connected and then stalled.
+func (c *Checker) preDial(host string, port int, budget time.Duration) error {
 	to := c.cfg.Checker.TCPTimeout.Duration
+	if budget < to {
+		to = budget
+	}
+	if to <= 0 {
+		return errors.New("tcp pre-dial: no time left in the check budget")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), to)
 	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", p.Addr())
+	start := time.Now()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	Stats.CheckTCPNanos.Add(int64(time.Since(start)))
+	Stats.CheckTCPDials.Add(1)
 	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			Stats.CheckTCPTimeouts.Add(1)
+		}
 		return fmt.Errorf("tcp pre-dial: %w", err)
 	}
 	conn.Close()
 	return nil
 }
 
-func (c *Checker) fullCheck(p *Proxy) error {
+// fullCheck runs every acceptance stage for one protocol attempt. budget is
+// what this attempt may spend (see attemptBudget); it replaces the old
+// per-client total_timeout, which was per protocol and let one candidate
+// multiply the deadline by the length of probe_order.
+func (c *Checker) fullCheck(p *Proxy, budget time.Duration) error {
 	// Use the cached transport, not a throwaway: the whole point of the cache
 	// is reusing this transport's connection pool across checks of the same
 	// proxy. fullCheck used to CloseIdleConnections on the way out, which
@@ -318,7 +441,7 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	tr := c.transportFor(p)
 	client := &http.Client{
 		Transport: tr,
-		Timeout:   c.cfg.Checker.TotalT.Duration,
+		Timeout:   budget,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -326,14 +449,28 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	start := time.Now()
 	ip, viaConnect, winURL, err := c.ipThrough(client, p)
 	if err != nil {
-		return err
+		return stageErr(stageIP, err)
 	}
+	// Serve-grade gate: a proxy whose first answer through itself took longer
+	// than proven_latency_max cannot serve a request inside the serving
+	// budget either, so it enters the queue but never ranks as warm proven
+	// stock (freshnessRank downgrades it). 0 disables the gate; the flag is
+	// only meaningful on a real answer, which is why a failed probe does not
+	// touch it.
+	if lim := c.cfg.Checker.ProvenLatencyMax.Duration; lim > 0 {
+		p.MarkCheckSlow(time.Since(start) > lim)
+	}
+	// Exit-honesty evidence on the same warm path: the proxy has just carried
+	// a real HTTP request, so one TLS handshake to a known host is cheap and
+	// settles whether it forges certificates for its clients. Non-fatal by
+	// design — see tlsHonestyProbe.
+	c.tlsHonestyProbe(p, budget)
 	// IP-stage extras: header-leak must pass before content stage.
-	if err := c.leakCheck(client); err != nil {
-		return err
+	if err := c.leakCheck(client, budget); err != nil {
+		return stageErr(stageLeak, err)
 	}
-	if err := c.e2eProbe(p); err != nil {
-		return err
+	if err := c.e2eProbe(p, budget); err != nil {
+		return stageErr(stageE2E, err)
 	}
 	// Run confirmExitIP and contentPass in parallel to reduce per-check latency.
 	var contentOK, testConnect bool
@@ -351,16 +488,16 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	go func() {
 		defer wg.Done()
 		defer RecoverPanic("checker: contentPass")
-		contentOK, testConnect = c.contentPass(client, p)
+		contentOK, testConnect = c.contentPass(client, p, budget)
 	}()
 	wg.Wait()
 	if confirmErr != nil {
-		return confirmErr
+		return stageErr(stageContent, confirmErr)
 	}
 	// A recovered panic in contentPass leaves the zero values, which read as a
 	// clean pass. Fail closed instead of admitting an unchecked proxy.
 	if !contentOK && len(c.tests) > 0 {
-		return errors.New("content check failed")
+		return stageErr(stageContent, errors.New("content check failed"))
 	}
 	// CONNECT is proven only when some stage actually tunnelled. Skipping the
 	// check when no evidence could exist at all is not the same as "no
@@ -369,7 +506,7 @@ func (c *Checker) fullCheck(p *Proxy) error {
 	// used to reject every http/https proxy purely for lack of
 	// configuration.
 	if needsConnect(p.Schema) && !viaConnect && !testConnect && c.connectEvidencePossible() {
-		return errors.New("proxy does not support CONNECT")
+		return stageErr(stageConnect, errors.New("proxy does not support CONNECT"))
 	}
 	p.MarkAlive(time.Since(start))
 	// Set GeoIP from the exit IP discovered during validation

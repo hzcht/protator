@@ -7,6 +7,7 @@ import (
 	"regexp/syntax"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The site-pattern loop may take the anchored fast path only if it is
@@ -337,4 +338,52 @@ func FuzzAnchoredMatchesFindAll(f *testing.F) {
 			}
 		}
 	})
+}
+
+// A class-run tail (`[^>]*`) walks to the end of the body, so on a page that
+// is sparse in quads but has no '>' past them every token gets the whole rest
+// of the body as its window: T*N engine scans instead of the single N scan the
+// legacy pass costs. That is what froze a production collector for ~10 h
+// (problems.md). The anchored path must cap its total window at one body and
+// hand the pattern to the legacy pass, returning the same matches.
+func TestFindAtQuadTokensBoundsTotalWindow(t *testing.T) {
+	const (
+		quad = "1.2.3.4"
+		gap  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 80, no '>'
+		reps = 12000                                                                              // ~1 MB, one token per 87 bytes: sparse enough to keep the list
+	)
+	var b strings.Builder
+	b.Grow(reps * (len(quad) + len(gap)))
+	for i := 0; i < reps; i++ {
+		b.WriteString(quad)
+		b.WriteString(gap)
+	}
+	b.WriteString(quad + "<td>8080") // a real match, past the whole body
+	text := b.String()
+
+	tokens := appendIPv4Tokens(nil, text)
+	if len(tokens) == 0 || int64(len(tokens)) > int64(len(text))/ipTokenSparsity {
+		t.Fatalf("fixture must keep its tokens: %d tokens over %d bytes", len(tokens), len(text))
+	}
+
+	const src = `([0-9]{1,3}(?:\.[0-9]{1,3}){3})<[^>]*>([0-9]{1,5})`
+	h := buildQuadHint(src)
+	if h == nil {
+		t.Fatal("fixture pattern must build a probe hint")
+	}
+	re := regexp.MustCompile(src)
+
+	want := re.FindAllStringSubmatchIndex(text, -1)
+	if len(want) == 0 {
+		t.Fatal("fixture must contain at least one real match")
+	}
+
+	start := time.Now()
+	got := findAtQuadTokens(re, text, tokens, h)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("anchored probe took %v: the window budget is not bounding the work", d)
+	}
+	if !sameSpans(want, got) {
+		t.Fatalf("budget fallback lost matches: want %v got %v", want, got)
+	}
 }

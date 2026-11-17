@@ -129,3 +129,159 @@ func TestFrontWasteAndBlockRules(t *testing.T) {
 		t.Fatalf("blocked CONNECT: got %q (err=%v), want EOF (closed, no tunnel)", line, err)
 	}
 }
+
+// TestFrontTunnelsConnectThroughUpstream walks the whole serving path a client
+// actually takes: client → goproxy front → hijack handler → forward dialer →
+// upstream CONNECT proxy → target. The rule test above stops at the
+// short-circuits and proxy/connect_test.go covers ServeConnect directly, so
+// this is the only test that crosses the library's hijack handover.
+//
+// That seam is exactly what a goproxy upgrade can move: 1.9.3 started replaying
+// bytes a client pipelined with its CONNECT into the tunnel, and a regression
+// there looks like "the tunnel opens and then hangs" — invisible to every
+// handler-level test.
+func TestFrontTunnelsConnectThroughUpstream(t *testing.T) {
+	echo := startTestEchoTarget(t)
+	upstream := startTestConnectUpstream(t)
+
+	p, err := proxy.ParseProxyLine("http://" + upstream)
+	if err != nil {
+		t.Fatalf("ParseProxyLine(%s): %v", upstream, err)
+	}
+	bucket := proxy.NewBucket(16)
+	if !bucket.Add(p) {
+		t.Fatal("bucket rejected the upstream")
+	}
+
+	// A literal Config{} leaves ServeRetries at 0, and ForwardDialer.DialContext
+	// loops "attempt < serveRetries" — zero attempts, and the tunnel would fail
+	// with no upstream ever being tried. IdleConnTimeout is the relay write
+	// deadline; at 0 every write gets "deadline now" and the probe kills a
+	// tunnel that is working perfectly.
+	cfg := &proxy.Config{}
+	cfg.Server.DialTimeout = proxy.Duration{Duration: 2 * time.Second}
+	cfg.Server.ServeTotalTimeout = proxy.Duration{Duration: 10 * time.Second}
+	cfg.Server.ServeConnectProbe = proxy.Duration{Duration: 2 * time.Second}
+	cfg.Server.IdleConnTimeout = proxy.Duration{Duration: 5 * time.Second}
+	cfg.Server.ServeRetries = 2
+	cfg.Server.ServeMaxFails = 3
+	cfg.Server.PickProbes = 1
+
+	fwd := proxy.NewForwardDialer(bucket, cfg)
+	gop := buildGoproxy(cfg, fwd, log.New(io.Discard, "", 0))
+	srv := httptest.NewServer(gop)
+	defer srv.Close()
+
+	c, err := net.DialTimeout("tcp", strings.TrimPrefix(srv.URL, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo, echo)
+	br := bufio.NewReader(c)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading CONNECT status %q: %v", status, err)
+	}
+	var proto string
+	var code int
+	if _, err := fmt.Sscanf(status, "%s %d", &proto, &code); err != nil {
+		t.Fatalf("bad CONNECT status line %q: %v", status, err)
+	}
+	if code != http.StatusOK {
+		t.Fatalf("CONNECT status = %d (%q), want 200", code, status)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading CONNECT headers (%q): %v", line, err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Once the tunnel is up it must be byte-transparent in both directions.
+	payload := []byte("ping-through-the-front")
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("write into tunnel: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, got); err != nil {
+		t.Fatalf("read from tunnel: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("tunnel echoed %q, want %q", got, payload)
+	}
+}
+
+// startTestEchoTarget starts a listener that echoes every byte back. The
+// returned address is what the CONNECT request names as its target.
+func startTestEchoTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// startTestConnectUpstream starts a deliberately minimal CONNECT proxy: it
+// parses one request line, dials the named host and splices the two
+// connections. No keep-alive, no auth, no CONNECT probing of its own — the path
+// under test is our dialer and our hijack handler, not this half.
+func startTestConnectUpstream(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				req, err := http.ReadRequest(bufio.NewReader(c))
+				if err != nil {
+					return
+				}
+				target, err := net.DialTimeout("tcp", req.Host, 2*time.Second)
+				if err != nil {
+					fmt.Fprintf(c, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+					return
+				}
+				defer target.Close()
+				if _, err := io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+					return
+				}
+				done := make(chan struct{})
+				go func() {
+					io.Copy(target, c)
+					close(done)
+				}()
+				io.Copy(c, target)
+				<-done
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}

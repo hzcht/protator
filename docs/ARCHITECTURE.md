@@ -155,9 +155,9 @@ by the next pass because it is now the stalest thing in the queue.
 flowchart TB
     C["candidate (host, port, schema?)"]
     PORT{"port 1-65535?<br/>not bogon/private?"}
-    PRE["TCP pre-dial (tcp_timeout ~4s)<br/>fast reject of dead hosts"]
+    PRE["TCP pre-dial, ONCE per candidate<br/>(min tcp_timeout, remaining budget)<br/>fast reject of dead hosts"]
     SCHEMA{"explicit schema?"}
-    PROBE["probe in probe_order<br/>(http, socks5, socks4, https —<br/>trojan/vless always carry an explicit schema)"]
+    PROBE["probe in probe_order<br/>(http, socks5, socks4, https —<br/>trojan/vless always carry an explicit schema)<br/>one attempt ≤ total_timeout,<br/>whole candidate ≤ check_budget"]
     ANON["anonymity race<br/>all self-IP services in parallel<br/>first non-self IP wins"]
     TRANS{"all answers = our IP?"}
     CONTENT["content race<br/>all checkers.toml tests in parallel<br/>first full template match wins"]
@@ -179,9 +179,33 @@ flowchart TB
     CONN -->|no| GEO --> GOOD
 ```
 
-Worst-case cost of one check ≈ one `TotalT` (stages race internally), not the sum
-of all service/test timeouts. Sub-requests of a check share one keep-alive
-transport bound to that proxy.
+Worst-case cost of one check is `check_budget` (90s in production) for the whole
+candidate — the pre-dial plus every protocol attempt together — where each
+attempt is additionally clipped by `total_timeout` (60s). Stages race
+internally, so the cost is not the sum of all service/test timeouts.
+Sub-requests of a check share one keep-alive transport bound to that proxy.
+
+Both numbers exist because the old shape multiplied them: one `total_timeout`
+per protocol in `probe_order` meant up to 4×(34s + 230s) for a single dead
+candidate. Measured before the fix: 3.25 TCP pre-dials per check, 64% of checks
+in the 60–230s band, 5.4 checks/s on 600 workers at 6% of one core.
+
+### 3.0 Validation funnel (read this before trusting a check count)
+
+The same reasoning as the serve funnel: "which stage killed it" and "how long
+did it take" are separate questions, and neither is answerable from
+`checks_failed_total`.
+
+| question | counters | reading |
+| --- | --- | --- |
+| where did it die | `check_fail_predial_total` (bad port, bogon, TCP), `check_fail_ip_total` (first request through the proxy), `check_fail_leak_total`, `check_fail_e2e_total`, `check_fail_content_total`, `check_fail_connect_total` (no CONNECT evidence) | exactly one stage per failure; the sums cover fresh checks **and** revalidations, so they exceed `checks_failed_total` by the revalidation failures |
+| did we run out of clock | `check_fail_budget_total` | the candidate hit `check_budget` — a tuning signal (budget too small, or too many protocols), not a dead proxy |
+| how long did a fresh check take | `check_duration_le_1s_total`, `_le_5s_`, `_le_15s_`, `_le_60s_`, `_le_230s_`, `_gt_230s_` | one bucket per `Check`; read as deltas. `le_230s` and above means the acceptance window is still wider than serving |
+| was TCP the cost | `check_tcp_dials_total`, `check_tcp_ns_total`, `check_tcp_timeouts_total` | `ns/dials` is the mean pre-dial; `dials/checks ≈ 1` is what the single pre-dial is for |
+
+Revalidations are deliberately excluded from the duration histogram: they skip
+the protocol loop, so mixing them in would blur the number the timeout tuning
+moves. Their throughput is `reval_checked_total`.
 
 ### 3.1 VLESS validation
 
@@ -202,10 +226,10 @@ For `schema="vless"` the checker:
 | ProxyTransport | `proxy/transport.go` | Request-level failover for plain HTTP (retries with a fresh transport, body rewound for retries), interstitial + block-page detection with a bounded `serve_sniff_timeout` sniff, device-junk/network-error classification. |
 | Sticky sessions | `proxy/sticky.go` | `PinPool`: pins a proxy to a stickiness key (`serve_pin_ttl`, LRU eviction + reverse index). The key is the client-supplied session header (`X-Sticky-Session`, alias `X-Proxy-Session`, both stripped before forwarding — a session outranks the connection, otherwise the header could never reach the table) or the connection identity shaped by `serve_pin_by`: `conn` (each client TCP connection) or `client` (client host only, so a browser's parallel connections share one exit IP — the only option for HTTPS, where the header would have to travel inside the tunnel). A pinned proxy's death remaps to a fresh pick; `pin_hits_total`/`pin_remaps_total`/`pin_evictions_total`/`pin_expired_total` make that visible. |
 | Dials | `proxy/dial.go` | `connectHTTPProxy` (CONNECT with Basic `Proxy-Authorization` when the URL carries userinfo; optional TLS for `https:` proxies), `socksDialTimeout` (hands h12.io/socks a `?timeout=` so the library bounds its own connect and handshake, then clears the socket deadlines it left armed and closes late connections; userinfo on the socks5 URL becomes RFC 1929 auth), `dialVLESS` (uTLS + REALITY + VLESS handshake; `security=none` runs it on raw TCP), `dialTrojan` (TLS-or-plaintext + SHA224 password handshake, password from the share-link userinfo). |
-| Checker | `proxy/checker.go` + `proxy/checker_probe.go` | Section 3: decisions (`Check`, `Revalidate`, `fullCheck`, bogon/self-IP rules). The evidence probes against the outside world — exit IP, content/leak verdicts, the end-to-end serving probe, the per-proxy transport, GeoIP (MaxMind MMDB) — are `checker_probe.go`. |
+| Checker | `proxy/checker.go` + `proxy/checker_probe.go` + `proxy/checkstage.go` | Section 3: decisions (`Check`, `Revalidate`, `fullCheck`, the per-candidate `check_budget` clock, bogon/self-IP rules). The evidence probes against the outside world — exit IP, content/leak verdicts, the end-to-end serving probe, the exit-honesty TLS probe (verify the chain a known host presents; feeds the picker's honesty preference, never a verdict), the per-proxy transport, GeoIP (MaxMind MMDB) — are `checker_probe.go`. `checkstage.go` classifies *where* a validation died and *how long* it took (the `check_fail_*` / `check_duration_*` / `check_tcp_*` counters). |
 | Collector | `proxy/collector.go` + `proxy/collect_fetch.go` | Section 1 left side. Cycle/scheduling: cookie jar, browser-grade headers, per-site cooldown, priority-ordered site walk with `max_sites_per_cycle` / `max_candidates_per_site` caps, blocking `emit`. One fetch: 429/503 + `Retry-After`, binary content-type guard, captcha/block-page classification, per-proxy transport cache, JS-protection hints in logs. |
 | Site telemetry | `proxy/sitestats.go` | `SiteRegistry`: per-source emitted/found/alive/fails, cooldown, deterministic rotation of untried sources, bounded to 200k tracked URLs. |
-| Extractor | `proxy/extract.go` (+ `extract_gate.go`, `extract_anchor.go`, `extract_share.go`, `extract_spys.go`, `extract_base64.go`, `jswrite.go`) | Universal `scheme://ip:port`, bare `ip:port`, `[ipv6]:port`, credentialed forms, spys XOR decoder, `document.write` JS reconstruction (`proxy/jswrite.go`), then `regexp.txt` patterns (2 groups either order, or 1 group + `portBefore`). Gates that may skip passes and the anchored fast path (probes at per-body quad offsets) are documented in `extract_gate.go`/`extract_anchor.go`; share links, spys and the base64 pass each have their own file. |
+| Extractor | `proxy/extract.go` (+ `extract_gate.go`, `extract_anchor.go`, `extract_share.go`, `extract_spys.go`, `extract_base64.go`, `jswrite.go`) | Universal `scheme://ip:port`, bare `ip:port`, `[ipv6]:port`, credentialed forms, spys XOR decoder, `document.write` JS reconstruction (`proxy/jswrite.go`), then `regexp.txt` patterns (2 groups either order, or 1 group + `portBefore`). Gates that may skip passes and the anchored fast path (probes at per-body quad offsets, budgeted at one body of window per pattern with a legacy `FindAll` fallback) are documented in `extract_gate.go`/`extract_anchor.go`; share links, spys and the base64 pass each have their own file. |
 | Proxy model | `proxy/model.go` + `proxy/model_proto.go` | `Proxy` + lock-free (`sync/atomic`) health stats: `consecFails`, `okTotal`/`failTotal`, latency EMA, `lastCheck`/`lastOK`, `source`. `Candidate`, `ParseProxyLine` (userinfo on `http`/`https`/`socks5` kept raw percent-encoded as `ProxyMeta.proxyAuth`). `model_proto.go` holds the cold `ProxyMeta` and its GeoIP/VLESS/trojan/auth accessors plus the share-link query builders. |
 | Storage | `proxy/store.go` + `proxy/provenidx.go` | `LoadSites` (BOM strip, normalize, dedup), `SiteList` (`LoadSiteList`/`Add`/`Remove`/`Render`/`SaveSiteList` with `.bak` for the admin editor), `ReadQueue`, `LoadRegexLines`, `AppendGood`, and the one atomic writer `writeFileAtomicTo` (temp + fsync + rename, pattern swept by `SweepOrphanTMP`) that `SaveBucketAtomic`, the sites/pool saves and the debug-proxies file all go through. `provenidx.go` saves and restores the warm tier (`storage.proven_file`): the queue stores URLs only, so proof of life, latency EMA, source and geo would otherwise die with the process. |
 | Candidate Pool | `proxy/pool.go` | Persisted failed candidates with source attribution (`addr\t<source-url>`). Rotating re-probe (`Batch`), `Good()` marks validated entries. Caps at `max_candidates`: the oldest line is evicted to make room (never a newly discovered one), the file is trimmed to the tail on load and periodically compacted so it cannot outgrow the cap. |
@@ -443,13 +467,16 @@ deliberately tuned for production and is **not** a verbatim copy of
 |-----|---------|-------------|
 | `workers` | 600 | Parallel validation workers |
 | `channel_size` | 10,000 | Candidate channel buffer |
-| `tcp_timeout` | 34s | TCP pre-dial timeout |
+| `tcp_timeout` | 34s | TCP pre-dial timeout (one pre-dial per **candidate**, not per protocol) |
 | `connect_timeout` | 30s | TLS handshake / proxy dial timeout |
 | `response_timeout` | 60s | HTTP response timeout |
-| `total_timeout` | 230s | Total validation timeout |
+| `total_timeout` | 60s | Per-**attempt** ceiling: one protocol attempt may spend this much |
+| `check_budget` | 90s | Whole-**candidate** ceiling: pre-dial + every attempt together (0 = disabled, per-attempt clock only) |
 | `probe_order` | `["http","socks5","socks4","https"]` | Protocol probe order |
 | `require_stable_exit` | true | Reject rotating exit IPs |
 | `e2e_probe` | true | End-to-end tunnel test |
+| `tls_probe_host` | `api.ipify.org:443` | Exit-honesty probe target (`"off"` disables): after a pass, verify the chain the exit presents for this host against the system roots; evidence only — the picker ranks honest > unknown > forged, nothing is dropped |
+| `proven_latency_max` | 0 (off) | Mark a validation whose IP stage exceeded this (`#proven_latency_max` in config to enable); `freshnessRank` demotes it out of the hot fresh tier |
 | `geoip_db_path` | "" | Path to MaxMind GeoIP2-City.mmdb |
 
 ### `[collector]`

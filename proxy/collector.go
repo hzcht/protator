@@ -182,6 +182,10 @@ sitesLoop:
 			// A panic here would otherwise exit the process, and wg.Wait below
 			// would never return, so the recovery has to come after wg.Done.
 			defer RecoverPanic("collector: site " + url)
+			// Counted even when fetch panics (the defers run before the
+			// recovery): this is the collector's progress heartbeat, and a
+			// panicking fetch is progress — the site's turn ended.
+			defer Stats.CollectorSiteDones.Add(1)
 			if n := c.fetch(ctx, url, out); n >= 0 {
 				atomic.AddInt64(&okSites, 1)
 				atomic.AddInt64(&totalCands, int64(n))
@@ -363,15 +367,26 @@ func (c *Collector) emit(ctx context.Context, site string, cands []Candidate, ou
 			continue
 		}
 		// Blocking send: dropping candidates here directly hurts list
-		// completeness under load.
+		// completeness under load. The wait is measured: a persistently full
+		// channel is the collector starved by a slow checker, which used to
+		// be invisible because the cycle counters only move after wg.Wait.
+		t0 := time.Now()
 		select {
 		case out <- cands[i]:
+			if d := time.Since(t0); d >= emitBlockedMin {
+				Stats.CollectorEmitBlocked.Add(1)
+				Stats.CollectorEmitWaitNS.Add(int64(d))
+			}
 			// Mark seen only after the send lands: recording first made a
 			// send abandoned on ctx.Done() hide the candidate for the whole
 			// window without it ever reaching the pipeline.
 			c.markSeen(cands[i])
 			emitted++
 		case <-ctx.Done():
+			if d := time.Since(t0); d >= emitBlockedMin {
+				Stats.CollectorEmitBlocked.Add(1)
+				Stats.CollectorEmitWaitNS.Add(int64(d))
+			}
 			return emitted
 		}
 	}
@@ -384,6 +399,11 @@ const (
 	seenCap           = 100000
 	seenWindow        = 10 * time.Minute
 	seenSweepInterval = 1 * time.Minute
+
+	// emitBlockedMin is the wait above which an emit send counts as blocked.
+	// Sub-millisecond waits are scheduling noise; a real backpressure event
+	// is the checker draining the channel slower than the collector fills it.
+	emitBlockedMin = 1 * time.Millisecond
 )
 
 // seenRecently skips candidates already pushed inside seenWindow.

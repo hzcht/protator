@@ -67,6 +67,19 @@ HTTPS/HTTP/SOCKS5-соединения. Ротация = каждый запро
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
+> **Не оборачивай этот запуск в пайп** (`| Out-File`, `Tee-Object`) и не гоняй
+> его из фоновой оболочки с таймаутом: `main.exe` унаследует stdout пайпа,
+> оболочка тогда никогда не завершится, и по таймауту её убьют **вместе с
+> демоном**. Симптом — процесс пропал молча: ни строки `stop.ps1` в логе, ни
+> паники в `instance_err.log`, последняя запись обрывается на минуту смерти.
+> Запускай отсоединённо:
+>
+> ```powershell
+> Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','I:\proj\protator\main\start.ps1' `
+>     -WorkingDirectory 'I:\proj\protator' -WindowStyle Hidden `
+>     -RedirectStandardOutput "$env:TEMP\ps-start-out.txt" -RedirectStandardError "$env:TEMP\ps-start-err.txt"
+> ```
+
 Что происходит: скрипт **убивает старый инстанс, если он есть** (это не баг,
 это «рестарт»), потом стартует `main.exe` в фоне с `instance_err.log` на
 перехвате ошибок. Проверка запуска:
@@ -533,6 +546,76 @@ queue: CRITICAL empty for 2+ minutes - proxy is unusable; waking collector
 `debug_proxies.txt` — до 50 URL свежих принятых прокси. Вынь строку оттуда,
 суй в браузер. Если через неё всё работает, а через систему — нет, значит
 проблема в нашей логике, а не в пуле. Самый ценный файл для дебага.
+
+### 5.6 «`collector_stale: true`, а `queue_live` не падает»
+
+Коллектор не делает ни одного цикла, хотя процесс живой. Признаки разом:
+
+```powershell
+(Invoke-RestMethod http://127.0.0.1:9090/health).beats   # collector_stale: true
+Invoke-RestMethod "http://127.0.0.1:9090/api/metrics?format=text" | Select-String collector_
+```
+
+`collector_site_dones_total` стоит колом — значит завис конкретный сайт, а не
+цикл целиком (счётчик двигается внутри цикла именно для этого). Дальше:
+
+```powershell
+# кто крутится: одна горутина на 100% ядра = виновник
+Invoke-WebRequest "http://127.0.0.1:9090/debug/pprof/goroutine?debug=1" -OutFile gor.txt
+Invoke-WebRequest "http://127.0.0.1:9090/debug/pprof/profile?seconds=8" -OutFile cpu.pprof
+go tool pprof -top cpu.pprof
+```
+
+`regexp.(*machine).match` наверху и стек `findAtQuadTokens` → это была
+одна из таких зависших страниц (см. problems.md §30.1); в текущей сборке
+бюджет окна на паттерн не даёт ей повториться. Если виновник другой —
+`cycle` всё равно стоит в `wg.Wait`, поэтому лечится перезапуском
+(`main/stop.ps1`, `main/start.ps1`), а причину ищи в `collector.log`
+(последняя запись = момент зависания).
+
+Чекер от этого страдает молча: `checks_total` не растёт, зато растёт
+`checks_failed_total` (идут только ревалидации), а `candidate_channel.len`
+висит на нуле.
+
+### 5.7 «Через прокси HTTPS отдаёт ошибку сертификата, а HTTP работает»
+
+Так и должно быть на текущем пуле: **примерно 9 из 10 бесплатных выходов
+подменяют TLS-сертификат**. Проверяется за минуту:
+
+```powershell
+# 1) как выглядит сертификат напрямую и через наш туннель
+curl.exe -s -m 15 -v https://api.ipify.org -o NUL 2>&1 | Select-String 'issuer:'
+curl.exe -s -m 15 -k -v -x http://127.0.0.1:8888 https://api.ipify.org -o NUL 2>&1 | Select-String 'issuer:'
+# 2) доля честных выходов (exit 60 = подмена)
+1..10 | ForEach-Object { curl.exe -s -m 12 -x http://127.0.0.1:8888 https://api.ipify.org -o NUL; "try $_ exit=$LASTEXITCODE" }
+```
+
+Напрямую issuer — настоящий (`Google Trust Services` и подобные), через туннель —
+`O="None, LLC"`. Это **не наш** сертификат: http-фронт TLS вообще не терминирует
+(`ConnectHijack` гоняет байты как есть), а `proxy/tlsutil.go` делает только
+самоподписанный сертификат **для прослушивания** https-фронта.
+
+Как это читать:
+
+- `curl -k` через прокси отдаёт 200 и настоящий ответ → **туннель чистый**,
+  проблема только в том, чей сертификат на том конце.
+- Наши счётчики при этом честные: `served_ok` растёт, `serve_failures` стоит.
+  `served_ok` считает **нашу** отдачу, а успех TLS на клиенте — качество пула.
+- Клиенту, который проверяет сертификаты (браузер, `curl` без `-k`), придётся
+  либо ходить по HTTP, либо переключиться на честные выходы. Честность теперь
+  измеряется самой системой: чекер после валидации сверяет цепочку для
+  `checker.tls_probe_host` (по умолчанию `api.ipify.org:443`), счётчики
+  `check_tls_honest_total` / `check_tls_forged_total` /
+  `check_tls_inconclusive_total` в `/api/metrics` — доля честных выходов в
+  пуле, а пикер при равной свежести предпочитает честного (пока только
+  предпочтение, ничего не выбрасывается).
+
+`--proxy-insecure` **не** помогает: он снимает проверку только у сертификата
+самого прокси, а не у цели. Нужен именно `-k`/`--insecure`.
+
+Для замеров: `servertest/stress.ps1` ставит `-k` на всех трёх фронтах. Раньше
+ветка `http` была единственной без него — и её «success rate» мерил не наш
+прокси, а сертификаты выходов (0% при `served_ok +60`).
 
 ---
 

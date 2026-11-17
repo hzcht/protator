@@ -155,8 +155,10 @@ idle_timeout = "5m"
 # Services that return the caller's public IP. Used to (a) learn our own IP
 # and (b) verify a proxy is not transparent.
 # Kept short on purpose: every URL here is a TLS handshake (the https ones)
-# plus a full response parse, and the checker is CPU-bound at 100% with the
-# old list of 5. Two cheap http services race for the anonymity verdict; the
+# plus a full response parse, and the checker is LATENCY-bound, not
+# CPU-bound (measured 2026-11: 5.4 checks/s on 600 workers = 112 s per check
+# at 6% of one core), so each extra URL is a serial round trip paid per
+# candidate. Two cheap http services race for the anonymity verdict; the
 # one https service is what proves CONNECT tunnelling works (viaConnect).
 self_ip_urls = [
   "http://checkip.amazonaws.com/",
@@ -169,10 +171,33 @@ workers = 600
 channel_size = 10000
 connect_timeout = "30s"
 # Fast TCP pre-dial before the expensive HTTP checks (rejects dead hosts).
+# It runs ONCE per candidate, not once per protocol: the socket is the same
+# whichever protocol turns out to be right. Measured 2026-11: 3.25 dials per
+# check before that, 1.77s per dial, and zero SYN timeouts — so this is a
+# ceiling, not the bottleneck.
 tcp_timeout = "34s"
 tls_handshake_timeout = "30s"
 response_timeout = "60s"
-total_timeout = "230s"
+# Per-ATTEMPT ceiling: one protocol attempt may spend this much. Kept at 60s
+# (was 230s) because a proxy that needs more than a minute to answer a
+# self-IP probe cannot serve a 25s request either — the old 230s is what let
+# the proven tier fill with proxies that are dead by serving standards.
+total_timeout = "60s"
+# Whole-CANDIDATE ceiling: the pre-dial plus every protocol attempt together.
+# Without it a candidate without a schema got a fresh total_timeout for each
+# of probe_order's four protocols: 4x(34s + 60s) worst case, and 17043 of
+# 26921 checks measured in the 60-230s band at 5.4 checks/s. 90s allows the
+# protocol fallback (a mislabeled list still gets a second attempt) while
+# keeping one candidate's cost bounded. Set 0 to disable (per-attempt clock
+# only, the pre-budget behaviour).
+check_budget = "90s"
+# Serve-grade gate (off by default): a validation whose first answer through
+# the proxy took longer than this still enters the queue, but the picker ranks
+# it as stale instead of warm — the proven tier stays servable by construction.
+# Enable only when check_duration_le_*s_total shows where the split belongs;
+# a threshold inside the serving budget (serve_total_timeout = 25s) is the
+# sane starting point.
+#proven_latency_max = "25s"
 # Protocols probed for candidates found without an explicit protocol.
 # vless/trojan are deliberately absent: without their credentials (UUID,
 # password) a probe can never validate, so they only enter through explicit
@@ -187,6 +212,13 @@ require_stable_exit = true
 # Final acceptance probe: tunnel through the exact serving dial path
 # (dialProxy) and carry a real GET before accepting the proxy. Off by default.
 e2e_probe = true
+# Exit-honesty probe: after a pass, tunnel a TLS handshake to this host and
+# verify the presented chain against the system roots. ~90% of free exits
+# forge certificates (right CN, untrusted issuer), which every verifying
+# client rejects; the result is recorded as evidence only — the picker ranks
+# honest (1) above unknown (0) above forged (-1), nothing is dropped.
+# "host:port", a bare host (port 443), or "off" to disable.
+tls_probe_host = "api.ipify.org:443"
 # GeoIP databases (MaxMind) for country/ASN lookup on each validated proxy's
 # exit IP. Two separate files: the City database provides the country, the ASN
 # database provides "AS12345 Provider". Either, both, or neither may be set;
@@ -225,11 +257,13 @@ max_candidates = 200000
 # re-emits up to pool_retry_batch candidates (oldest first) for another pass.
 # Dead-at-probe-time proxies often come up later, so nothing is ever lost.
 #
-# The rate has to fit inside the checker's throughput. A full check costs ~12
-# requests through the proxy, so 300 workers manage only ~10 candidates/sec;
-# 20k every 3m is 11x that and simply fills the channel, starving the
-# collector's fresh candidates. 1000 every 3m (~5.5/sec) leaves room for the
-# collector while still cycling a 200k pool in ~10h.
+# The rate has to fit inside the checker's throughput, and that throughput is
+# latency-bound: measured 2026-11, 600 workers moved 5.4 candidates/s
+# (~19k/hour) total, of which every source competes. 1000 every 3m is 5.5/s —
+# i.e. the whole measured pipeline, which is why the candidate channel sat at
+# 10000/10000 and the collector's fresh finds waited behind re-probes.
+# Re-tune against the live check_duration_* buckets after the check_budget
+# change: they, not a request-count estimate, say what a check costs now.
 pool_retry_batch = 1000
 pool_retry_interval = "3m"
 # Cap candidates emitted per site per cycle (0 = no cap). Huge auto-generated
@@ -237,9 +271,12 @@ pool_retry_interval = "3m"
 # uniform sample keeps every source's share fair. The pool retry loop re-visits
 # the rest, so nothing is permanently lost.
 #
-# 1000, not 5000: the checker is CPU-bound (~72k candidates/hour), so 60 sites
-# x 5000 = 300k per cycle is 4x the checker's capacity and just fills the
-# channel. 1000 keeps a cycle inside what the checker can actually churn.
+# 1000, not 5000: measured 2026-11, the checker moved ~19k candidates/hour
+# (5.4/s, latency-bound), so even 60 sites x 1000 = up to 60k per cycle is
+# 3x the hourly capacity — which is exactly what happened: the channel sat at
+# 10000/10000, emit() blocked, and collector_cycles_total stayed 0 for 50
+# minutes. The cap bounds one site's share, it does NOT make a cycle fit the
+# pipeline; that needs the emit counters (collector_emit_*) to be read first.
 max_candidates_per_site = 1000
 # Cap how many sites are fetched per cycle (0 = all of sites.txt). The
 # collector walks sites in priority order: sources that recently produced live

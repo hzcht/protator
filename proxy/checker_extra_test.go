@@ -51,18 +51,18 @@ func TestLeakCheckRejectsForwardedIP(t *testing.T) {
 	defer client.Transport.(*http.Transport).CloseIdleConnections()
 
 	c.cfg.Checker.LeakProbeURLs = []string{leaky.URL}
-	if err := c.leakCheck(client); err == nil {
+	if err := c.leakCheck(client, c.cfg.Checker.TotalT.Duration); err == nil {
 		t.Fatal("leaky endpoint accepted")
 	}
 
 	c.cfg.Checker.LeakProbeURLs = []string{clean.URL}
-	if err := c.leakCheck(client); err != nil {
+	if err := c.leakCheck(client, c.cfg.Checker.TotalT.Duration); err != nil {
 		t.Fatalf("clean endpoint rejected: %v", err)
 	}
 
 	// Disabled config: stage must be skipped entirely.
 	c.cfg.Checker.LeakProbeURLs = nil
-	if err := c.leakCheck(client); err != nil {
+	if err := c.leakCheck(client, c.cfg.Checker.TotalT.Duration); err != nil {
 		t.Fatalf("disabled leak stage failed: %v", err)
 	}
 }
@@ -111,16 +111,16 @@ func TestE2EProbe(t *testing.T) {
 	c := checkerThroughProxy(t, []string{svc.URL}, "9.9.9.9", good)
 	c.cfg.Checker.E2EProbe = true
 
-	if err := c.e2eProbe(good); err != nil {
+	if err := c.e2eProbe(good, c.cfg.Checker.TotalT.Duration); err != nil {
 		t.Fatalf("e2e through working proxy failed: %v", err)
 	}
-	if err := c.e2eProbe(bad); err == nil {
+	if err := c.e2eProbe(bad, c.cfg.Checker.TotalT.Duration); err == nil {
 		t.Fatal("e2e through dead proxy succeeded")
 	}
 
 	// Gated off: must never fail even on a dead proxy.
 	c.cfg.Checker.E2EProbe = false
-	if err := c.e2eProbe(bad); err != nil {
+	if err := c.e2eProbe(bad, c.cfg.Checker.TotalT.Duration); err != nil {
 		t.Fatalf("disabled e2e stage failed: %v", err)
 	}
 }

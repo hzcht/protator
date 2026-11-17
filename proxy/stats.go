@@ -79,11 +79,57 @@ type Registry struct {
 	ChecksPassed atomic.Int64
 	ChecksFailed atomic.Int64
 
+	// Validation cost. The checker is the pipeline's only real bottleneck, and
+	// it used to be tuned from assumptions a live box disproved: the config
+	// claimed "CPU-bound at 100%" while 600 workers ran at 6% of one core with
+	// ~112s per check. These counters are what turns "a check is slow" into
+	// "the SYN timeouts are slow" or "the far side is a blackhole".
+	//
+	// Failure stage of one failed Check: exactly one stage wins per failure.
+	CheckFailPredial atomic.Int64 // rejected before any request: TCP pre-dial failed
+	CheckFailIP      atomic.Int64 // first request through the proxy failed
+	CheckFailLeak    atomic.Int64 // header-echo probe failed
+	CheckFailE2E     atomic.Int64 // serving-path tunnel probe failed
+	CheckFailContent atomic.Int64 // content/exit-confirmation stage failed
+	CheckFailConnect atomic.Int64 // an http(s) proxy could not tunnel at all
+	CheckFailBudget  atomic.Int64 // the candidate ran out of check_budget
+	// Duration of one full Check (every stage, every protocol attempt),
+	// bucketed. Cumulative: a histogram is read as deltas between snapshots.
+	CheckDurLE1   atomic.Int64
+	CheckDurLE5   atomic.Int64
+	CheckDurLE15  atomic.Int64
+	CheckDurLE60  atomic.Int64
+	CheckDurLE230 atomic.Int64
+	CheckDurGT230 atomic.Int64
+	// The TCP pre-dial stage on its own: a dead host costs one SYN timeout per
+	// attempt, and until this existed nobody could tell that cost apart from
+	// the far side stalling after a successful connect.
+	CheckTCPNanos    atomic.Int64 // total time spent inside pre-dials
+	CheckTCPDials    atomic.Int64 // pre-dials attempted
+	CheckTCPTimeouts atomic.Int64 // pre-dials that timed out
+	// Exit honesty (checker.tls_probe_host): a forge is a proxy that answered
+	// our TLS probe with a chain no verifier accepts. It is evidence, not a
+	// rejection — such an exit still serves plain HTTP, it just loses to an
+	// honest one in the picker.
+	CheckTLSHonest       atomic.Int64 // the exit presented a chain that verified
+	CheckTLSForged       atomic.Int64 // the exit presented a chain that did not
+	CheckTLSInconclusive atomic.Int64 // timeout/reset/missing target: no verdict
+
 	// Collector.
 	CollectorCycles      atomic.Int64
 	CollectorSitesOK     atomic.Int64
 	CollectorSitesFailed atomic.Int64
 	CandidatesEmitted    atomic.Int64
+	// Progress heartbeat: site fetches completed (ok or failed), stamped even
+	// when the cycle as a whole never finishes. The collector beat follows
+	// this, not CollectorCycles — a cycle blocked in emit used to leave the
+	// watchdog shouting collector_stale for a collector that was alive.
+	CollectorSiteDones atomic.Int64
+	// Backpressure of the blocking emit: sends that had to wait for channel
+	// space (>= emitBlockedMin) and their total wait. "Candidates emitted" is
+	// a volume number; this pair is the starvation signal.
+	CollectorEmitBlocked atomic.Int64
+	CollectorEmitWaitNS  atomic.Int64
 	// CollectorZeroYield is a gauge, not a counter: the number of sources
 	// that have been fetched at least collector.site_zero_yield_cycles times,
 	// have never emitted a candidate, and are not cooling. Set by the stats
@@ -170,10 +216,32 @@ func (r *Registry) Reset() {
 	r.Checks.Store(0)
 	r.ChecksPassed.Store(0)
 	r.ChecksFailed.Store(0)
+	r.CheckFailPredial.Store(0)
+	r.CheckFailIP.Store(0)
+	r.CheckFailLeak.Store(0)
+	r.CheckFailE2E.Store(0)
+	r.CheckFailContent.Store(0)
+	r.CheckFailConnect.Store(0)
+	r.CheckFailBudget.Store(0)
+	r.CheckDurLE1.Store(0)
+	r.CheckDurLE5.Store(0)
+	r.CheckDurLE15.Store(0)
+	r.CheckDurLE60.Store(0)
+	r.CheckDurLE230.Store(0)
+	r.CheckDurGT230.Store(0)
+	r.CheckTCPNanos.Store(0)
+	r.CheckTCPDials.Store(0)
+	r.CheckTCPTimeouts.Store(0)
+	r.CheckTLSHonest.Store(0)
+	r.CheckTLSForged.Store(0)
+	r.CheckTLSInconclusive.Store(0)
 	r.CollectorCycles.Store(0)
 	r.CollectorSitesOK.Store(0)
 	r.CollectorSitesFailed.Store(0)
 	r.CandidatesEmitted.Store(0)
+	r.CollectorSiteDones.Store(0)
+	r.CollectorEmitBlocked.Store(0)
+	r.CollectorEmitWaitNS.Store(0)
 	r.CollectorZeroYield.Store(0)
 	r.RevalPasses.Store(0)
 	r.RevalLoopDone.Store(0)
@@ -237,10 +305,32 @@ func (r *Registry) Snapshot() map[string]int64 {
 		"checks_total":                 r.Checks.Load(),
 		"checks_passed_total":          r.ChecksPassed.Load(),
 		"checks_failed_total":          r.ChecksFailed.Load(),
+		"check_fail_predial_total":     r.CheckFailPredial.Load(),
+		"check_fail_ip_total":          r.CheckFailIP.Load(),
+		"check_fail_leak_total":        r.CheckFailLeak.Load(),
+		"check_fail_e2e_total":         r.CheckFailE2E.Load(),
+		"check_fail_content_total":     r.CheckFailContent.Load(),
+		"check_fail_connect_total":     r.CheckFailConnect.Load(),
+		"check_fail_budget_total":      r.CheckFailBudget.Load(),
+		"check_tls_honest_total":       r.CheckTLSHonest.Load(),
+		"check_tls_forged_total":       r.CheckTLSForged.Load(),
+		"check_tls_inconclusive_total": r.CheckTLSInconclusive.Load(),
+		"check_duration_le_1s_total":   r.CheckDurLE1.Load(),
+		"check_duration_le_5s_total":   r.CheckDurLE5.Load(),
+		"check_duration_le_15s_total":  r.CheckDurLE15.Load(),
+		"check_duration_le_60s_total":  r.CheckDurLE60.Load(),
+		"check_duration_le_230s_total": r.CheckDurLE230.Load(),
+		"check_duration_gt_230s_total": r.CheckDurGT230.Load(),
+		"check_tcp_ns_total":           r.CheckTCPNanos.Load(),
+		"check_tcp_dials_total":        r.CheckTCPDials.Load(),
+		"check_tcp_timeouts_total":     r.CheckTCPTimeouts.Load(),
 		"collector_cycles_total":       r.CollectorCycles.Load(),
 		"collector_sites_ok_total":     r.CollectorSitesOK.Load(),
 		"collector_sites_failed_total": r.CollectorSitesFailed.Load(),
 		"candidates_emitted_total":     r.CandidatesEmitted.Load(),
+		"collector_site_dones_total":   r.CollectorSiteDones.Load(),
+		"collector_emit_blocked_total": r.CollectorEmitBlocked.Load(),
+		"collector_emit_wait_ns_total": r.CollectorEmitWaitNS.Load(),
 		"collector_zero_yield_sources": r.CollectorZeroYield.Load(),
 		"reval_passes_total":           r.RevalPasses.Load(),
 		"reval_loop_done_total":        r.RevalLoopDone.Load(),
