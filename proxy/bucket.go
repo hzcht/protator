@@ -533,6 +533,18 @@ func (b *Bucket) waitQueue(ctx context.Context, timer *time.Timer) error {
 func (b *Bucket) Random(ctx context.Context) (*Proxy, error) {
 	timer := time.NewTimer(emptyQueuePoll)
 	defer timer.Stop()
+	var (
+		waited bool
+		waitAt time.Time
+	)
+	// One increment per request that ever had to wait, and one total for the
+	// time it spent blocked: the 500 ms safety poll would otherwise turn a
+	// single ten-second wait into twenty "waits" and make the rate useless.
+	defer func() {
+		if waited {
+			Stats.ServeQueueWaitNanos.Add(int64(time.Since(waitAt)))
+		}
+	}()
 	for {
 		b.mu.RLock()
 		n := len(b.proxies)
@@ -543,6 +555,11 @@ func (b *Bucket) Random(ctx context.Context) (*Proxy, error) {
 		}
 		b.mu.RUnlock()
 
+		if !waited {
+			waited = true
+			waitAt = time.Now()
+			Stats.ServeQueueWaits.Add(1)
+		}
 		if err := b.waitQueue(ctx, timer); err != nil {
 			return nil, err
 		}
@@ -569,6 +586,17 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 	}
 	timer := time.NewTimer(emptyQueuePoll)
 	defer timer.Stop()
+	var (
+		waited bool
+		waitAt time.Time
+	)
+	// Same contract as Random: one increment per waiting request, one total
+	// for the blocked time (see the comment there).
+	defer func() {
+		if waited {
+			Stats.ServeQueueWaitNanos.Add(int64(time.Since(waitAt)))
+		}
+	}()
 	for {
 		// Read the proven pool BEFORE taking mu: freshPool takes mu.RLock
 		// itself while rebuilding, and a nested RLock is how a serving pick
@@ -582,6 +610,11 @@ func (b *Bucket) PickHealthy(ctx context.Context, probes int, skip map[string]st
 		// gone (both are read before/outside the rebuild interval).
 		if len(b.proxies) == 0 {
 			b.mu.RUnlock()
+			if !waited {
+				waited = true
+				waitAt = time.Now()
+				Stats.ServeQueueWaits.Add(1)
+			}
 			if err := b.waitQueue(ctx, timer); err != nil {
 				return nil, err
 			}

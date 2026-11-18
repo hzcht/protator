@@ -54,6 +54,24 @@ nobody can find.
   and keeps its place in the rotation. Only `x509.UnknownAuthorityError` and
   `x509.HostnameError` count as "forged" — clock skew or a missing system root
   store must not sentence the pool.
+- **The serving path has a clock.** The funnel counters say *where* a request
+  failed; `serve_dial_*` and `serve_ttfb_*` (`DurationBands`: ≤100 ms, ≤500 ms,
+  ≤1 s, ≤3 s, ≤10 s, >10 s) say where the time goes when nothing fails — time
+  until the upstream connection is established (the whole TTFB on the
+  CONNECT/SOCKS5 fronts, most of it on plain HTTP) and, for plain HTTP, request
+  start to response headers including retries and block-page failover.
+  `serve_attempts_1_total` … `serve_attempts_4plus_total` bucket each
+  successful dial call by how many of `serve_retries` it burned, and
+  `serve_queue_waits_total` / `serve_queue_wait_ns_total` count requests that
+  found the queue empty (once per request, not per 500 ms poll) and the time
+  they spent blocked — the one delay that is not the exit's fault.
+- **The queue has a trend watchdog.** `statsLoop` keeps an hour of
+  once-a-minute samples (a fixed 61-entry ring, no growth with uptime) and logs
+  one line an hour when `queue_live` lost ≥25% against its size an hour ago
+  from a base of ≥200, together with the `checks_passed` / `reval_dropped`
+  deltas that explain the loss; `queue_shrink_warnings_total` counts the
+  shouts. The empty-queue alarm only fires at zero — which is why a 4000 → 1325
+  slide over four and a half hours went unnoticed.
 
 - **The audit trail is capped and its seed is bounded** — `good_proxies.last`
   grew with every validated proxy (20 MB / 500k lines on the author's box) and

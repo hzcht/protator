@@ -132,6 +132,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// what the client asked for. requests_total in Snapshot sums this with
 	// the CONNECT and SOCKS5 units.
 	Stats.HTTPRequests.Add(1)
+	reqStart := time.Now()
 	ctx := req.Context()
 	if t.totalT > 0 {
 		var cancel context.CancelFunc
@@ -256,6 +257,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					lastErr = errors.New("upstream answered like a device, not a proxy")
 					continue
 				}
+				Stats.ServeTTFB.Observe(time.Since(reqStart))
 				return resp, nil
 			}
 			if p, ok := st.proxyUsed(); p != nil && ok {
@@ -265,6 +267,7 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					t.fwd.bucket.Promote(p)
 				}
 			}
+			Stats.ServeTTFB.Observe(time.Since(reqStart))
 			return resp, nil
 		}
 		if err == nil {

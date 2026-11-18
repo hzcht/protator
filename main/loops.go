@@ -73,6 +73,8 @@ func statsLoop(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, poo
 	badMinutes := 0
 	prev := proxy.Stats.Snapshot()
 	lastZeroYieldLog := time.Time{}
+	trend := newQueueTrend(queueTrendMinutes)
+	lastShrinkLog := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -94,6 +96,27 @@ func statsLoop(ctx context.Context, cfg *proxy.Config, bucket *proxy.Bucket, poo
 				perSec(cur["checks_passed_total"], prev["checks_passed_total"]),
 				runtime.NumGoroutine(),
 			)
+			sample := queueSample{
+				live:         live,
+				checksPassed: cur["checks_passed_total"],
+				revalDropped: cur["reval_dropped_total"],
+			}
+			trend.add(sample)
+			if before, ok := trend.hourAgo(); ok && queueShrinking(before, sample) && time.Since(lastShrinkLog) >= time.Hour {
+				// One line an hour, with the intake numbers that explain the
+				// loss: checks_passed climbing while live falls means the queue
+				// is leaking entries between validation and admission;
+				// reval_dropped climbing means revalidation is simply eating
+				// faster than the collector feeds it.
+				log.Printf("queue: shrunk %.0f%% in the last hour (live %d -> %d; checks_passed +%d, reval_dropped +%d, hot=%d, proven=%d) - intake is not keeping up",
+					float64(before.live-sample.live)*100/float64(before.live),
+					before.live, sample.live,
+					sample.checksPassed-before.checksPassed,
+					sample.revalDropped-before.revalDropped,
+					bucket.HotLen(), bucket.ProvenCount())
+				proxy.Stats.QueueShrinkWarnings.Add(1)
+				lastShrinkLog = time.Now()
+			}
 			prev = cur
 			// Zero-yield visibility: a source fetched N times with nothing to
 			// show is burning a fetch slot and a worker, but scoring only
@@ -165,6 +188,76 @@ const (
 	alertFailRatio    = 0.5
 	alertMinReqPerSec = 1.0
 )
+
+// Queue-contraction watchdog (see statsLoop). queue_live falling 4000 -> 1325
+// over four and a half hours was invisible: the empty-queue alarm only fires
+// at zero, and every other counter watches what arrives, not what leaves.
+//
+// The window is 61 samples so the oldest one is exactly an hour old when the
+// ring is full; a smaller ring would compare against 59 minutes and quietly
+// change its own definition of "an hour".
+const (
+	queueTrendMinutes   = 61
+	queueShrinkMinBase  = 200
+	queueShrinkFraction = 0.25
+)
+
+// queueSample is one minute of the queue's life: its size and the two counters
+// that explain where the losses went.
+type queueSample struct {
+	live         int
+	checksPassed int64
+	revalDropped int64
+}
+
+// queueTrend is a fixed ring of once-a-minute samples, sized just wide enough
+// to answer "how big was the queue an hour ago". A ring, not a slice: the stats
+// loop runs for weeks, and the watchdog must not grow a minute of history per
+// minute of uptime.
+type queueTrend struct {
+	samples []queueSample
+	head    int
+	n       int
+}
+
+func newQueueTrend(minutes int) *queueTrend {
+	if minutes < 1 {
+		minutes = 1
+	}
+	return &queueTrend{samples: make([]queueSample, minutes)}
+}
+
+// add records the newest sample, evicting the oldest when the ring is full.
+func (t *queueTrend) add(s queueSample) {
+	if t.n < len(t.samples) {
+		t.samples[(t.head+t.n)%len(t.samples)] = s
+		t.n++
+		return
+	}
+	t.samples[t.head] = s
+	t.head = (t.head + 1) % len(t.samples)
+}
+
+// hourAgo returns the oldest sample once the ring has been fed for a full
+// hour. Before that the watchdog has nothing to compare against and stays
+// silent: a restart must not look like a collapse.
+func (t *queueTrend) hourAgo() (queueSample, bool) {
+	if t.n < len(t.samples) {
+		return queueSample{}, false
+	}
+	return t.samples[t.head], true
+}
+
+// queueShrinking is the watchdog's verdict: a quarter of the queue is gone
+// within an hour, from a base large enough for the percentage to mean
+// something. Deliberately a rate, not an absolute floor: a healthy pool may
+// legitimately run small, and an empty queue already has its own alarm.
+func queueShrinking(prev, now queueSample) bool {
+	if prev.live < queueShrinkMinBase || now.live >= prev.live {
+		return false
+	}
+	return float64(prev.live-now.live) >= float64(prev.live)*queueShrinkFraction
+}
 
 // perSec is the per-second delta between two counter samples taken a minute
 // apart. It is the shape every rate in this program takes.

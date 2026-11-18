@@ -149,6 +149,21 @@ count means the checks are flaky (throttled test server, bad uplink), not that
 the pool is dead; the entry keeps its slot, loses its freshness, and is retried
 by the next pass because it is now the stalest thing in the queue.
 
+The funnel above says *where* a request died, not *how long* a healthy one
+took. Two histograms cover that, both read as deltas between snapshots:
+`serve_dial_le_100ms_total` … `serve_dial_gt_10s_total` is the time until the
+upstream connection is established — the whole time-to-first-byte of the
+CONNECT and SOCKS5 fronts, and the dominant part of plain HTTP — while
+`serve_ttfb_le_100ms_total` … `serve_ttfb_gt_10s_total` is plain HTTP's own
+request-start-to-response-headers, retries and block-page failover included.
+`serve_attempts_1_total` … `serve_attempts_4plus_total` bucket each
+*successful* dial call by how many of `serve_retries` it burned; a rising 4+
+share is a retry storm visible before `served_ok` starts to fall.
+`serve_queue_waits_total` counts requests that found the queue empty (once per
+request, not once per 500 ms poll) and `serve_queue_wait_ns_total` is the time
+they spent blocked — the one delay that is not the exit's fault, and the one
+that used to look exactly like a dead pool from the client side.
+
 ## 3. Validation of one candidate
 
 ```mermaid
@@ -345,7 +360,7 @@ never been proven. `Bucket.LiveList` implements the same scopes for code.
 | Loop | File | Interval | Purpose |
 |------|------|----------|---------|
 | `saveLoop` | `main/loops.go` | `storage.save_interval` (1m) | Atomic rewrite of `proxy.lst`, only while the queue is dirty (the dirty flag is set by `Add`/`Remove`). |
-| `statsLoop` | `main/loops.go` | 1 min | Log the queue counts **and** the per-second rates (serve, dial-fail, eviction, checks) from `proxy.Stats`. After 2 empty minutes → emergency collector wake. |
+| `statsLoop` | `main/loops.go` | 1 min | Log the queue counts **and** the per-second rates (serve, dial-fail, eviction, checks) from `proxy.Stats`. After 2 empty minutes → emergency collector wake. Also watches the queue **trend**: a 25% drop against the size an hour ago (base ≥200) logs one line an hour and bumps `queue_shrink_warnings_total` — the empty-queue alarm only fires at zero, which is far too late. |
 | `PoolReprobeLoop` | `proxy/poolloop.go` | `collector.pool_retry_interval` (3m) | Emit up to `collector.pool_retry_batch` candidates (1000 in the shipped config) from the pool, non-blocking, with an adaptive room check. |
 | `RevalidateLoop` | `proxy/revalidate.go` | `storage.revalidate_interval` (15m) | Stale-first revalidation of bucket, capped at `revalidate_max_per_pass` (30k). Skips recently-served (`revalidate_fresh_servers`). |
 | `statsRecorder` (admin) | `main/adminapi.go` | 1 min | Ring buffer of 1440 samples (queue counts + rates) for `/api/stats/history`, the 24h graph and the WebSocket state message. |

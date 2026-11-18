@@ -179,6 +179,10 @@ func (d *ForwardDialer) DialContext(ctx context.Context, network, addr string) (
 	// now counts its own unit at its own entry point (HTTPRequests in
 	// RoundTrip, SOCKS5Sessions in handle); counting here again would double.
 	var lastErr error
+	// The call's own clock: on the CONNECT and SOCKS5 fronts this is the
+	// client-visible time to first byte, and on plain HTTP it is the part of
+	// the request that happens before the upstream is even asked anything.
+	dialStart := time.Now()
 	for attempt := 0; attempt < d.serveRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -206,6 +210,8 @@ func (d *ForwardDialer) DialContext(ctx context.Context, network, addr string) (
 			continue
 		}
 		Stats.DialOK.Add(1)
+		Stats.ServeDial.Observe(time.Since(dialStart))
+		Stats.observeServeAttempts(attempt + 1)
 		st.setConnOK()
 		if pinKey != "" {
 			d.pins.Set(pinKey, p)
@@ -388,6 +394,11 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 	// tunnel), so without this the majority of real traffic - every HTTPS
 	// request a browser makes - is invisible to the metrics.
 	Stats.ConnectRequests.Add(1)
+	// The client's own clock for this tunnel: from the moment the request
+	// arrived to the moment it is told the tunnel is up. On this front that is
+	// the whole time-to-first-byte — the far side has not been asked anything
+	// yet.
+	funnelStart := time.Now()
 
 	// Session stickiness for tunnels: the non-CONNECT front pins via
 	// WithConnKey on the request context, and the config promises the same
@@ -449,6 +460,8 @@ func (d *ForwardDialer) ServeConnect(ctx context.Context, client net.Conn, netwo
 			}
 			sent200 = true
 			Stats.TunnelsEstablished.Add(1)
+			Stats.ServeDial.Observe(time.Since(funnelStart))
+			Stats.observeServeAttempts(attempt + 1)
 		}
 
 		if d.connectProbe > 0 {

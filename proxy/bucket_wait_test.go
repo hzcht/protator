@@ -164,3 +164,58 @@ func TestRandomCancelLeavesNoWaiter(t *testing.T) {
 		t.Fatalf("Random after Add = %+v, want the seeded entry", p)
 	}
 }
+
+// The queue-wait counter is the only thing that separates "the queue was empty
+// for a moment" from "the pool is dead" when a client complains, so it must
+// fire exactly once per waiting request — not once per 500 ms safety poll — and
+// a request served immediately must not be counted at all.
+func TestPickHealthyCountsQueueWaits(t *testing.T) {
+	b := NewBucket(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	waitsBefore := Stats.ServeQueueWaits.Load()
+	nsBefore := Stats.ServeQueueWaitNanos.Load()
+
+	type result struct {
+		p   *Proxy
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		p, err := b.PickHealthy(ctx, 1, nil)
+		done <- result{p, err}
+	}()
+
+	// Park it on the empty queue long enough for at least one safety poll, then
+	// satisfy it. Two polls must still read as one wait.
+	time.Sleep(emptyQueuePoll + 50*time.Millisecond)
+	if got := Stats.ServeQueueWaits.Load(); got != waitsBefore+1 {
+		t.Fatalf("ServeQueueWaits = %d while parked, want %d", got, waitsBefore+1)
+	}
+	b.Add(&Proxy{Schema: "http", Host: "192.0.2.11", Port: 8080})
+
+	select {
+	case r := <-done:
+		if r.err != nil || r.p == nil || r.p.Host != "192.0.2.11" {
+			t.Fatalf("PickHealthy = %+v, %v; want the seeded entry", r.p, r.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("PickHealthy did not return after the queue was filled")
+	}
+	if got := Stats.ServeQueueWaits.Load(); got != waitsBefore+1 {
+		t.Fatalf("ServeQueueWaits = %d after one wait, want %d", got, waitsBefore+1)
+	}
+	if got := Stats.ServeQueueWaitNanos.Load(); got <= nsBefore {
+		t.Fatalf("ServeQueueWaitNanos = %d, want > %d", got, nsBefore)
+	}
+
+	// A request that never waits is not counted.
+	b.Add(&Proxy{Schema: "http", Host: "192.0.2.12", Port: 8080})
+	if _, err := b.PickHealthy(context.Background(), 1, nil); err != nil {
+		t.Fatalf("PickHealthy on a non-empty queue: %v", err)
+	}
+	if got := Stats.ServeQueueWaits.Load(); got != waitsBefore+1 {
+		t.Fatalf("ServeQueueWaits = %d after an immediate pick, want %d", got, waitsBefore+1)
+	}
+}

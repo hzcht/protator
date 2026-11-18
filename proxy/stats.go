@@ -1,6 +1,79 @@
 package proxy
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
+
+// DurationBands is a fixed-bucket histogram for a serving latency. Every
+// observation lands in exactly one bucket, so an operator reads deltas between
+// two snapshots the same way as with check_duration_*.
+//
+// It is a struct rather than twelve flat fields because the registry already
+// has two latencies with identical bounds, and more fields would bury the
+// counters that name a failure stage. The atomics inside must never be copied:
+// pass *DurationBands.
+type DurationBands struct {
+	LE100 atomic.Int64
+	LE500 atomic.Int64
+	LE1s  atomic.Int64
+	LE3s  atomic.Int64
+	LE10s atomic.Int64
+	GT10s atomic.Int64
+}
+
+// Observe adds one sample.
+func (b *DurationBands) Observe(d time.Duration) {
+	switch {
+	case d <= 100*time.Millisecond:
+		b.LE100.Add(1)
+	case d <= 500*time.Millisecond:
+		b.LE500.Add(1)
+	case d <= time.Second:
+		b.LE1s.Add(1)
+	case d <= 3*time.Second:
+		b.LE3s.Add(1)
+	case d <= 10*time.Second:
+		b.LE10s.Add(1)
+	default:
+		b.GT10s.Add(1)
+	}
+}
+
+func (b *DurationBands) reset() {
+	b.LE100.Store(0)
+	b.LE500.Store(0)
+	b.LE1s.Store(0)
+	b.LE3s.Store(0)
+	b.LE10s.Store(0)
+	b.GT10s.Store(0)
+}
+
+// snapshot writes the buckets as prefix_le_100ms_total ... prefix_gt_10s_total.
+func (b *DurationBands) snapshot(m map[string]int64, prefix string) {
+	m[prefix+"_le_100ms_total"] = b.LE100.Load()
+	m[prefix+"_le_500ms_total"] = b.LE500.Load()
+	m[prefix+"_le_1s_total"] = b.LE1s.Load()
+	m[prefix+"_le_3s_total"] = b.LE3s.Load()
+	m[prefix+"_le_10s_total"] = b.LE10s.Load()
+	m[prefix+"_gt_10s_total"] = b.GT10s.Load()
+}
+
+// observeServeAttempts buckets one successful dial call by how many proxies it
+// burned. Success path only: a failed call has no "attempts to success", and
+// every one of its attempts is already counted by DialAttempts/DialFailures.
+func (r *Registry) observeServeAttempts(n int) {
+	switch {
+	case n <= 1:
+		r.ServeAttempts1.Add(1)
+	case n == 2:
+		r.ServeAttempts2.Add(1)
+	case n == 3:
+		r.ServeAttempts3.Add(1)
+	default:
+		r.ServeAttempts4Plus.Add(1)
+	}
+}
 
 // Registry holds the process-wide counters every long-running component feeds.
 //
@@ -47,6 +120,29 @@ type Registry struct {
 	DialOK             atomic.Int64 // dials the upstream accepted
 	TunnelsEstablished atomic.Int64 // CONNECT: "200 Connection established" written
 	FirstByteOK        atomic.Int64 // CONNECT: the far target produced its first byte
+	// Serve funnel timing. The stage counters above say which hop failed; these
+	// say where the time goes when nothing fails — a request that took eight
+	// seconds is indistinguishable from a fast one in served_ok_total.
+	//
+	// ServeDial is the time until the upstream connection is established: the
+	// whole TTFB of the CONNECT and SOCKS5 fronts, and the dominant part of
+	// plain HTTP. ServeTTFB is the plain-HTTP front's own measure, request
+	// start to response headers, retries and block-page failover included.
+	ServeDial DurationBands
+	ServeTTFB DurationBands
+	// Which of serve_retries a dial call actually burned before it got a
+	// connection. Counted per dial call, not per client request (a plain-HTTP
+	// request can dial again after a transport-level retry). A rising 4+ bucket
+	// is what a retry storm looks like before served_ok starts to fall.
+	ServeAttempts1     atomic.Int64
+	ServeAttempts2     atomic.Int64
+	ServeAttempts3     atomic.Int64
+	ServeAttempts4Plus atomic.Int64
+	// Requests that found the queue empty and had to wait. This is the one
+	// delay that is not the exit's fault, and it used to be invisible: an empty
+	// queue and a dead pool look identical from the client side.
+	ServeQueueWaits     atomic.Int64
+	ServeQueueWaitNanos atomic.Int64
 	// Dial failure classes (each dial failure increments the total and exactly
 	// one class).
 	DialTimeout atomic.Int64
@@ -137,6 +233,11 @@ type Registry struct {
 	// a worker while producing nothing — visible now instead of only in
 	// /api/sources after somebody thought to look.
 	CollectorZeroYield atomic.Int64
+	// QueueShrinkWarnings counts the times the trend watchdog shouted that the
+	// live queue lost a large share of its size within an hour while the intake
+	// did not cover the losses. It is throttled with the log line (at most one
+	// an hour), so it counts shouts, not minutes of shrinkage.
+	QueueShrinkWarnings atomic.Int64
 
 	// Revalidation.
 	RevalPasses   atomic.Int64 // periodic passes started
@@ -196,6 +297,14 @@ func (r *Registry) Reset() {
 	r.DialOK.Store(0)
 	r.TunnelsEstablished.Store(0)
 	r.FirstByteOK.Store(0)
+	r.ServeDial.reset()
+	r.ServeTTFB.reset()
+	r.ServeAttempts1.Store(0)
+	r.ServeAttempts2.Store(0)
+	r.ServeAttempts3.Store(0)
+	r.ServeAttempts4Plus.Store(0)
+	r.ServeQueueWaits.Store(0)
+	r.ServeQueueWaitNanos.Store(0)
 	r.DialTimeout.Store(0)
 	r.DialRefused.Store(0)
 	r.DialTLS.Store(0)
@@ -243,6 +352,7 @@ func (r *Registry) Reset() {
 	r.CollectorEmitBlocked.Store(0)
 	r.CollectorEmitWaitNS.Store(0)
 	r.CollectorZeroYield.Store(0)
+	r.QueueShrinkWarnings.Store(0)
 	r.RevalPasses.Store(0)
 	r.RevalLoopDone.Store(0)
 	r.RevalChecked.Store(0)
@@ -273,7 +383,7 @@ func (r *Registry) Snapshot() map[string]int64 {
 	httpReq := r.HTTPRequests.Load()
 	connReq := r.ConnectRequests.Load()
 	socksReq := r.SOCKS5Sessions.Load()
-	return map[string]int64{
+	m := map[string]int64{
 		// requests_total stays the sum of the three fronts so every existing
 		// ratio, graph and the watchdog keep working unchanged (P47).
 		"requests_total":               httpReq + connReq + socksReq,
@@ -353,5 +463,15 @@ func (r *Registry) Snapshot() map[string]int64 {
 		"export_proxies_served_total":  r.ExportProxiesServed.Load(),
 		"export_list_rebuilds_total":   r.ExportListRebuilds.Load(),
 		"recovered_panics_total":       r.RecoverPanics.Load(),
+		"serve_attempts_1_total":       r.ServeAttempts1.Load(),
+		"serve_attempts_2_total":       r.ServeAttempts2.Load(),
+		"serve_attempts_3_total":       r.ServeAttempts3.Load(),
+		"serve_attempts_4plus_total":   r.ServeAttempts4Plus.Load(),
+		"serve_queue_waits_total":      r.ServeQueueWaits.Load(),
+		"serve_queue_wait_ns_total":    r.ServeQueueWaitNanos.Load(),
+		"queue_shrink_warnings_total":  r.QueueShrinkWarnings.Load(),
 	}
+	r.ServeDial.snapshot(m, "serve_dial")
+	r.ServeTTFB.snapshot(m, "serve_ttfb")
+	return m
 }

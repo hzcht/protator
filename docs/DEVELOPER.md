@@ -313,6 +313,25 @@ Adding a stage: give it a `checkStage` constant, wrap the error with
 `check_fail_*_total` to `stats.go` (`Snapshot` **and** `Reset` both — a
 counter missing from `Reset` survives across tests).
 
+### Reading the serving funnel
+
+The validation funnel says why a *candidate* was rejected; the serving funnel
+(`proxy/stats.go`, written by `proxy/upstream.go` and `proxy/transport.go`)
+says what a *served request* cost.
+
+| What you see | What it means |
+| --- | --- |
+| `serve_dial_le_*` … `serve_dial_gt_10s_total` | time until the upstream connection is established — the full TTFB on the CONNECT and SOCKS5 fronts, most of it on plain HTTP |
+| `serve_ttfb_le_*` … `serve_ttfb_gt_10s_total` | plain HTTP only: request start to response headers, retries and block-page failover included |
+| `serve_attempts_1_total` … `serve_attempts_4plus_total` | successful dial calls bucketed by how many of `serve_retries` they burned; a fat 4+ bucket is a retry storm before `served_ok` starts to fall |
+| `serve_queue_waits_total` / `serve_queue_wait_ns_total` | requests that found the queue empty and the time they spent blocked (one increment per request, not per 500 ms poll) |
+
+Both latencies use the same absolute buckets (100 ms, 500 ms, 1 s, 3 s, 10 s,
++∞) implemented by `DurationBands`; they are cumulative counters, so read them
+as deltas between two snapshots. `serve_dial` is observed once per dial call,
+except `ServeConnect`, which observes once per client request when the 200 goes
+out — that is the number the client actually waited for.
+
 ### Profiling
 ```powershell
 # CPU profile, 30s (pprof is served on the admin port, behind admin_token)
