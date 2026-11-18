@@ -220,6 +220,13 @@ nobody can find.
 
 ### Fixed
 
+- **CI's `build-windows` job was red from its first run and looked like a code
+  failure.** It failed on the gofmt gate alone — `go build` and `go vet` passed
+  — because a Windows checkout inherits `core.autocrlf=true`, every file
+  arrives CRLF, and `gofmt` always prints LF, so it reported all 106 Go files as
+  unformatted. `.gitattributes` now pins `* text=auto eol=lf` (verified by
+  reproducing the runner's checkout: 106 listed → 0), and the gofmt step prints
+  the offending files instead of swallowing them inside `test -z`.
 - **`servertest/stress.ps1` no longer measures the exit pool's certificates.**
   The `http` branch was the only one built without `-k`, so `-Front http`
   verified the *target's* chain — and with ~90% of free exits forging TLS

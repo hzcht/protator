@@ -198,7 +198,15 @@ every push to master and every PR:
   automatically on every change; the WSL workflow above is for local
   iterations only.
 - **windows** — the local gate verbatim: `go build ./...`, `go vet ./...`,
-  `gofmt -l main proxy util` (must stay silent).
+  `gofmt -l main proxy util` (must stay silent). The gofmt step prints the
+  offending files instead of failing on a bare `test -z` — it failed for months
+  without a readable reason before that change.
+
+Checkout EOL is pinned by `.gitattributes` (`* text=auto eol=lf`). Without it
+the windows-latest runner inherits `core.autocrlf=true`, writes every file as
+CRLF, and `gofmt` — which always prints LF — reports all of `main proxy util`
+as unformatted while `build` and `vet` (both CRLF-tolerant) pass. That was the
+whole content of the first six red builds.
 
 Baseline as of this pass: 221 test/benchmark/fuzz functions; `go test
 -cover` reports `protator/proxy` 73.1%, `protator/main` 50.0%. The largest
@@ -262,6 +270,7 @@ max_candidates_per_site = 1000
 | Let the connection key outrank the session key | `X-Sticky-Session` is read, then silently ignored: every front sets a connection key on every request, so the header never reaches `PinPool` | `pinKeyFrom` prefers the session; a named session is the only key that survives connection churn |
 | Forward a client `X-Proxy-*` header | It names the tool (and the session id) in the target's own logs | `stripControlHeaders` removes the whole family before the request is forwarded, on both the plain and the CONNECT path |
 | Hardcode ports in tests | Flaky on CI | Use `net.Listen("tcp", "127.0.0.1:0")` |
+| Let a Windows checkout pick its own EOL (`core.autocrlf=true`) | Files land as CRLF, `gofmt -l` lists every Go file, the CI `build-windows` gofmt gate goes red while `build`/`vet` stay green | `.gitattributes` pins `* text=auto eol=lf`; never give Go files `eol=crlf` |
 | Launch `start.ps1` through a pipe (`\| Out-File`, `Tee-Object`) from a background shell | The daemon inherits the pipe's stdout, so the shell never exits; when the harness kills it on timeout it takes `main.exe` with it — a silent hard kill with **no** `stop.ps1` line and nothing in `instance_err.log` | Detach the launcher: `Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','main\start.ps1' -WindowStyle Hidden -RedirectStandardOutput <file> -RedirectStandardError <file>` |
 
 ## 9. Debugging

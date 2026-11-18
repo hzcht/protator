@@ -39,4 +39,14 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
-      - run: test -z "$(gofmt -l main proxy util)"
+      # Name the offenders instead of failing on a bare `test -z`: this gate
+      # once failed for months with no visible reason (CRLF checkout, see
+      # .gitattributes) because the list was swallowed by the -z test.
+      - name: gofmt
+        run: |
+          files=$(gofmt -l main proxy util)
+          if [ -n "$files" ]; then
+            echo "gofmt wants to rewrite:"
+            echo "$files"
+            exit 1
+          fi

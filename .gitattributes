@@ -1,0 +1,9 @@
+# Text files are stored and checked out with LF, on every platform.
+#
+# Without this a Windows checkout inherits core.autocrlf=true (the Git for
+# Windows default, and the windows-latest runner default) and every file lands
+# as CRLF. gofmt prints LF, so it then reports *every* Go file as unformatted:
+# the CI build-windows job failed on its formatting gate from its very first
+# run while build and vet — both CRLF-tolerant — passed. Pinning the checkout
+# EOL here fixes the cause instead of loosening the gate.
+* text=auto eol=lf
